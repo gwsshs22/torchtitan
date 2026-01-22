@@ -8,9 +8,12 @@ import dataclasses
 import importlib
 import json
 import os
+import random
 import time
 from datetime import timedelta
 from typing import Any, Iterable
+
+import numpy as np
 
 # [Leto] Initialize measurements dict
 _measurements = {
@@ -744,11 +747,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.step < self.job_config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+        state = {
+            "step": self.step,
+            "ntokens_seen": self.ntokens_seen,
+            # RNG states for reproducibility
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+        }
+        # Save DTensor RNG tracker state if available
+        rng_tracker = dtensor_random._rng_tracker
+        if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
+            state["dtensor_rng_state"] = rng_tracker._get_device_state()
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
+        # Restore RNG states if present (for backward compatibility)
+        if "torch_rng_state" in state_dict:
+            torch.set_rng_state(state_dict["torch_rng_state"])
+        if "cuda_rng_state" in state_dict:
+            torch.cuda.set_rng_state(state_dict["cuda_rng_state"], self.device)
+        if "numpy_rng_state" in state_dict:
+            np.random.set_state(state_dict["numpy_rng_state"])
+        if "python_rng_state" in state_dict:
+            random.setstate(state_dict["python_rng_state"])
+        # Restore DTensor RNG tracker state if available
+        if "dtensor_rng_state" in state_dict:
+            rng_tracker = dtensor_random._rng_tracker
+            if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
+                rng_tracker._set_device_state(state_dict["dtensor_rng_state"])
 
     def _calculate_sizes(self) -> None:
         """Calculate model and optimizer state sizes for measurements."""
