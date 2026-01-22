@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchtitan.tools.leto import get_measurements
+
 import dataclasses
 import importlib
 import json
@@ -14,19 +16,6 @@ from datetime import timedelta
 from typing import Any, Iterable
 
 import numpy as np
-
-# [Leto] Initialize measurements dict
-_measurements = {
-    "process_start_time": time.time(),
-    "weight_allocation_init_time_sec": 0.0,
-    "checkpoint_load_time_sec": 0.0,
-    "time_to_train_start_sec": 0.0,
-    "iteration_times_sec": [],
-    "model_size_bytes": 0,
-    "optimizer_state_size_bytes": 0,
-    "total_checkpoint_size_bytes": 0,
-}
-
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint.stateful
@@ -284,7 +273,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model_parts = [model]
 
         # [Leto] Record weight allocation and init time
-        _measurements["weight_allocation_init_time_sec"] = time.time() - _weight_alloc_start
+        get_measurements().record_weight_allocation_time(time.time() - _weight_alloc_start)
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -634,17 +623,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        # [Leto] Record time from init start to now (before first iteration)
-        _measurements["time_to_train_start_sec"] = (
-            time.time() - _measurements["process_start_time"]
-        )
-
-        logger.info(f'Time to train start sec = {_measurements["time_to_train_start_sec"]}')
+        get_measurements().record_time_to_train_start()
 
         # [Leto] Time checkpoint loading
         _ckpt_load_start = time.time()
         self.checkpointer.load(step=job_config.checkpoint.load_step)
-        _measurements["checkpoint_load_time_sec"] = time.time() - _ckpt_load_start
+        get_measurements().record_checkpoint_load_time(time.time() - _ckpt_load_start)
 
         # [Leto] Calculate model and optimizer sizes after checkpoint load
         self._calculate_sizes()
@@ -721,10 +705,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if memory_profiler:
                     memory_profiler.step()
 
-                # [Leto] Record iteration time and loss
-                _iter_time = time.time() - _iter_start
-                _measurements["iteration_times_sec"].append(_iter_time)
-
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)
                 if self.step == 1:
@@ -735,8 +715,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         parallel_dims=self.parallel_dims,
                     )
 
+                # [Leto] Record iteration time and loss
+                _iter_time = time.time() - _iter_start
+                get_measurements().record_iteration_time(_iter_time)
+
+
+        # [Leto] Wait for any pending checkpoint tracking to complete
+        if hasattr(self, "checkpointer") and self.checkpointer:
+            self.checkpointer.wait_for_tracking()
+
         # [Leto] Write measurements to JSON file
-        self._write_measurements()
+        get_measurements().write()
 
         if dist.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
@@ -783,65 +772,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def _calculate_sizes(self) -> None:
         """Calculate model and optimizer state sizes for measurements."""
-        # Calculate model parameter size (in bytes, assuming current dtype)
-        model_size = 0
-        for m in self.model_parts:
-            for p in m.parameters():
-                model_size += p.numel() * p.element_size()
-        _measurements["model_size_bytes"] = model_size
-
-        # Calculate optimizer state size
-        # For Adam/AdamW, optimizer states include: exp_avg (momentum) and exp_avg_sq (variance)
-        # Each is the same size as parameters, so roughly 2x model size
-        # But we need to account for the actual state after first step
-        optimizer_state_size = 0
-        for opt in self.optimizers:
-            for param_group in opt.param_groups:
-                for p in param_group["params"]:
-                    if p in opt.state:
-                        state = opt.state[p]
-                        for key, val in state.items():
-                            if isinstance(val, torch.Tensor):
-                                optimizer_state_size += val.numel() * val.element_size()
-                    else:
-                        # If state not yet initialized, estimate based on Adam
-                        # (2 tensors: exp_avg and exp_avg_sq, each same size as param, in fp32)
-                        optimizer_state_size += p.numel() * 4 * 2  # 4 bytes for fp32, 2 buffers
-
-        _measurements["optimizer_state_size_bytes"] = optimizer_state_size
-
-        # Total checkpoint size = model (fp32) + optimizer states
-        # Note: checkpoints are typically saved in fp32
-        model_fp32_size = sum(
-            p.numel() * 4 for m in self.model_parts for p in m.parameters()
-        )
-        _measurements["total_checkpoint_size_bytes"] = (
-            model_fp32_size + optimizer_state_size
-        )
-
-        logger.info(
-            f"[Leto] Model size: {model_size / 1e9:.2f} GB, "
-            f"Optimizer state size: {optimizer_state_size / 1e9:.2f} GB, "
-            f"Total checkpoint size: {_measurements['total_checkpoint_size_bytes'] / 1e9:.2f} GB"
-        )
-
-    def _write_measurements(self) -> None:
-        """Write measurements to JSON file."""
-        # Get logs directory from environment variable set by leto launcher
-        logs_dir = os.environ.get("LETO_LOGS_DIR", "")
-        if not logs_dir:
-            logger.debug("[Leto] LETO_LOGS_DIR not set, skipping measurements output")
-            return
-
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        output_file = os.path.join(logs_dir, f"measure_rank_{rank:02d}.json")
-        try:
-            os.makedirs(logs_dir, exist_ok=True)
-            with open(output_file, "w") as f:
-                json.dump(_measurements, f, indent=2)
-            logger.info(f"[Leto] Measurements written to {output_file}")
-        except Exception as e:
-            logger.warning(f"[Leto] Failed to write measurements to {output_file}: {e}")
+        get_measurements().calculate_sizes(self.model_parts, list(self.optimizers))
 
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:

@@ -43,6 +43,7 @@ from torchtitan.config import Checkpoint as CheckpointConfig, TORCH_DTYPE_MAP
 from torchtitan.protocols import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.leto import get_measurements, IterationRecord
 
 
 MODEL = "model"
@@ -312,6 +313,9 @@ class CheckpointManager:
         self.mp = None
         self.staging_future = None
         self.save_future = None
+        self._tracking_queue: queue.Queue = queue.Queue()
+        self._tracking_thread = threading.Thread(target=self._tracking_worker, daemon=True)
+        self._tracking_thread.start()
         if async_mode == AsyncMode.DISABLED:
             self.async_mode = AsyncMode.DISABLED
         elif async_mode == AsyncMode.ASYNC:
@@ -342,6 +346,14 @@ class CheckpointManager:
             ):
                 self.purge_queue.put(Terminate())
                 self.purge_thread.join()
+
+            if (
+                hasattr(self, "_tracking_thread")
+                and self._tracking_thread
+                and self._tracking_thread.is_alive()
+            ):
+                self._tracking_queue.put(None)  # Signal worker to stop
+                self._tracking_thread.join()
 
             if self.stager is not None:
                 self.stager.close()
@@ -494,11 +506,11 @@ class CheckpointManager:
         Returns:
             None
         """
-
         if self.enable_ft_dataloader_checkpoints:
             self._ft_save(curr_step)
 
         if not self._should_save(curr_step, last_step):
+            get_measurements().report_checkpoint_start(False)
             return
 
         begin = time.monotonic()
@@ -513,10 +525,14 @@ class CheckpointManager:
             # This GC is called for async checkpoint as it is useless to do
             # GC right after async_save -- the CPU memory is not able to be
             # freed until _async_wait()
+
+            # Create iteration record for timing measurements
+            record = get_measurements().report_checkpoint_start(True)
+
             if last_step:
                 self._save_last_step(curr_step)
+                record.set_checkpoint_done()
                 return
-
             states = self._flattened_model_states_sd()
             if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
@@ -533,12 +549,16 @@ class CheckpointManager:
                 # pyrefly: ignore [missing-attribute]
                 self.staging_future = result.staging_completion
                 self.staging = True
+                self._track_staging_and_save(self.staging_future, self.save_future, record)
             elif self.async_mode == AsyncMode.ASYNC:
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
                 # pyrefly: ignore[bad-assignment]
                 self.save_future = self.dcp_save(
                     states, checkpoint_id=checkpoint_id, async_mode=self.async_mode
                 )
+                # For ASYNC mode, staging happens synchronously inside dcp.async_save()
+                record.set_staging_done()
+                self._track_staging_and_save(None, self.save_future, record)
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
             else:
                 self.dcp_save(
@@ -547,6 +567,8 @@ class CheckpointManager:
                     async_mode=AsyncMode.DISABLED,
                     enable_garbage_collection=True,
                 )
+                # For synchronous mode, both staging and save are done
+                record.set_checkpoint_done()
             self._purge_stale_checkpoints()
 
             logger.info(
@@ -555,11 +577,46 @@ class CheckpointManager:
             )
         elif self.enable_ft_dataloader_checkpoints:
             assert self.ft_manager is not None
+            # This replica doesn't save checkpoint, but we still need a record
+            get_measurements().report_checkpoint_start(False)
             logger.info(
                 "Replica %d doesn't save checkpoint.",
                 # pyrefly: ignore [missing-attribute]
                 self.ft_manager.participating_rank(),
             )
+
+    def _tracking_worker(self):
+        """Worker thread that processes tracking tasks from the queue."""
+        while True:
+            task = self._tracking_queue.get()
+            if task is None:  # Shutdown signal
+                self._tracking_queue.task_done()
+                break
+            staging_future, save_future, record = task
+            try:
+                if staging_future is not None:
+                    staging_future.result()
+                    record.set_staging_done()
+                if save_future is not None:
+                    save_future.result()
+                    record.set_checkpoint_done()
+            except Exception as e:
+                logger.warning(f"Error in tracking worker: {e}")
+            finally:
+                self._tracking_queue.task_done()
+
+    def _track_staging_and_save(self, staging_future, save_future, record: IterationRecord):
+        """Queue a task to track staging and save completion."""
+        self._tracking_queue.put((staging_future, save_future, record))
+
+    def wait_for_tracking(self) -> None:
+        """Wait for all pending tracking tasks to complete.
+
+        This should be called before writing measurements to ensure all
+        checkpoint timing data has been recorded.
+        """
+        if hasattr(self, "_tracking_queue"):
+            self._tracking_queue.join()
 
     @torch.no_grad()
     def load(self, step: int = -1) -> bool:
