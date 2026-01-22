@@ -20,9 +20,8 @@ _measurements = {
     "process_start_time": time.time(),
     "weight_allocation_init_time_sec": 0.0,
     "checkpoint_load_time_sec": 0.0,
-    "time_to_start_iterations_sec": 0.0,
+    "time_to_train_start_sec": 0.0,
     "iteration_times_sec": [],
-    "losses": [],
     "model_size_bytes": 0,
     "optimizer_state_size_bytes": 0,
     "total_checkpoint_size_bytes": 0,
@@ -640,6 +639,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             time.time() - _measurements["process_start_time"]
         )
 
+        logger.info(f'Time to train start sec = {_measurements["time_to_train_start_sec"]}')
+
         # [Leto] Time checkpoint loading
         _ckpt_load_start = time.time()
         self.checkpointer.load(step=job_config.checkpoint.load_step)
@@ -834,32 +835,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         output_file = os.path.join(logs_dir, f"measure_rank_{rank:02d}.json")
-
-        # Add some derived metrics
-        measurements = _measurements.copy()
-        measurements["rank"] = rank
-        measurements["world_size"] = dist.get_world_size() if dist.is_initialized() else 1
-        measurements["total_steps"] = len(measurements["iteration_times_sec"])
-
-        if measurements["iteration_times_sec"]:
-            measurements["avg_iteration_time_sec"] = (
-                sum(measurements["iteration_times_sec"])
-                / len(measurements["iteration_times_sec"])
-            )
-            # Skip first iteration for steady-state average (includes compilation)
-            if len(measurements["iteration_times_sec"]) > 1:
-                measurements["avg_iteration_time_sec_excluding_first"] = (
-                    sum(measurements["iteration_times_sec"][1:])
-                    / len(measurements["iteration_times_sec"][1:])
-                )
-
-        # Remove process_start_time as it's not useful externally
-        measurements.pop("process_start_time", None)
-
         try:
             os.makedirs(logs_dir, exist_ok=True)
             with open(output_file, "w") as f:
-                json.dump(measurements, f, indent=2)
+                json.dump(_measurements, f, indent=2)
             logger.info(f"[Leto] Measurements written to {output_file}")
         except Exception as e:
             logger.warning(f"[Leto] Failed to write measurements to {output_file}: {e}")

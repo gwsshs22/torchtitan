@@ -270,6 +270,7 @@ class CheckpointManager:
         self.initial_load_in_hf_quantized = (
             checkpoint_config.initial_load_in_hf_quantized
         )
+        self.skip_last_save = checkpoint_config.skip_last_save
         self.last_save_model_only = checkpoint_config.last_save_model_only
         self.last_save_in_hf = checkpoint_config.last_save_in_hf
         if self.last_save_in_hf:
@@ -822,6 +823,9 @@ class CheckpointManager:
             return True
 
         if last_step:
+            # Skip last save if configured
+            if self.skip_last_save:
+                return False
             return True
 
         if curr_step % self.interval == 0:
