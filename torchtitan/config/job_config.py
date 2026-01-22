@@ -555,6 +555,13 @@ class Checkpoint:
     this parameter, the model need to define proper HuggingFaceStorageReader to perform dequantize.
     """
 
+    skip_last_save: bool = False
+    """
+    When skip_last_save=True, the final checkpoint at the end of training will be skipped.
+    This is useful when you only want intermediate checkpoints and don't need the final model.
+    The default value is False.
+    """
+
     last_save_model_only: bool = True
     """
     When last_save_model_only=True, only the model will be saved at the end of training,

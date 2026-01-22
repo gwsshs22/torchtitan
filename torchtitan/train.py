@@ -4,16 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchtitan.tools.leto import get_measurements
+
 import dataclasses
 import importlib
 import json
 import os
+import random
 import time
 from datetime import timedelta
 from typing import Any, Iterable
 
+import numpy as np
 import torch
 import torch.distributed.checkpoint.stateful
+import torch.distributed.tensor._random as dtensor_random
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
@@ -90,6 +95,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
+        logger.info(f"Init distributed.")
 
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
@@ -214,6 +220,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         # apply parallelisms and initialization
+        # [Leto] Start timing weight allocation and init
+        _weight_alloc_start = time.time()
+
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
                 raise RuntimeError(
@@ -261,6 +270,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model.train()
 
             self.model_parts = [model]
+
+        # [Leto] Record weight allocation and init time
+        get_measurements().record_weight_allocation_time(time.time() - _weight_alloc_start)
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -610,8 +622,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+        get_measurements().record_time_to_train_start()
 
+        # [Leto] Time checkpoint loading
+        _ckpt_load_start = time.time()
         self.checkpointer.load(step=job_config.checkpoint.load_step)
+        get_measurements().record_checkpoint_load_time(time.time() - _ckpt_load_start)
+
+        # [Leto] Calculate model and optimizer sizes after checkpoint load
+        self._calculate_sizes()
+
         logger.info(f"Training starts at step {self.step + 1}")
 
         leaf_folder = (
@@ -653,6 +673,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # pyrefly: ignore [bad-argument-type]
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
+                # [Leto] Time each iteration
+                _iter_start = time.time()
+
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
@@ -691,6 +714,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         parallel_dims=self.parallel_dims,
                     )
 
+                # [Leto] Record iteration time and loss
+                _iter_time = time.time() - _iter_start
+                get_measurements().record_iteration_time(_iter_time)
+
+
+        # [Leto] Wait for any pending checkpoint tracking to complete
+        if hasattr(self, "checkpointer") and self.checkpointer:
+            self.checkpointer.wait_for_tracking()
+
+        # [Leto] Write measurements to JSON file
+        get_measurements().write()
+
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
@@ -701,11 +736,42 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.step < self.job_config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+        state = {
+            "step": self.step,
+            "ntokens_seen": self.ntokens_seen,
+            # RNG states for reproducibility
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+        }
+        # Save DTensor RNG tracker state if available
+        rng_tracker = dtensor_random._rng_tracker
+        if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
+            state["dtensor_rng_state"] = rng_tracker._get_device_state()
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
+        # Restore RNG states if present (for backward compatibility)
+        if "torch_rng_state" in state_dict:
+            torch.set_rng_state(state_dict["torch_rng_state"])
+        if "cuda_rng_state" in state_dict:
+            torch.cuda.set_rng_state(state_dict["cuda_rng_state"], self.device)
+        if "numpy_rng_state" in state_dict:
+            np.random.set_state(state_dict["numpy_rng_state"])
+        if "python_rng_state" in state_dict:
+            random.setstate(state_dict["python_rng_state"])
+        # Restore DTensor RNG tracker state if available
+        if "dtensor_rng_state" in state_dict:
+            rng_tracker = dtensor_random._rng_tracker
+            if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
+                rng_tracker._set_device_state(state_dict["dtensor_rng_state"])
+
+    def _calculate_sizes(self) -> None:
+        """Calculate model and optimizer state sizes for measurements."""
+        get_measurements().calculate_sizes(self.model_parts, list(self.optimizers))
 
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:
