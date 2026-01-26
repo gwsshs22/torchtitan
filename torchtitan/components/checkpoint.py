@@ -619,7 +619,7 @@ class CheckpointManager:
             self._tracking_queue.join()
 
     @torch.no_grad()
-    def start_step(self, curr_step: int, last_step: bool = False) -> None:
+    def begin_step(self, curr_step: int, last_step: bool = False) -> None:
         return
 
     @torch.no_grad()

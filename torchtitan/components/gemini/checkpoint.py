@@ -10,22 +10,28 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
 )
 import torch.nn as nn
 
-from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.components.checkpoint import (
+    ModelWrapper,
+    DATALOADER,
+    LR_SCHEDULER,
+)
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.ft import FTManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Checkpoint as CheckpointConfig, TORCH_DTYPE_MAP
+from torchtitan.distributed import ParallelDims
 from torchtitan.protocols import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
+from torchtitan.components.gemini.snapshot_executor import SnapshotExecutor
 from torchtitan.components.gemini.snapshot_profiler import SnapshotProfiler
 
 class GeminiAllGather(DefaultAllGather):
-    def __init__(self, profiler):
+    def __init__(self, callback):
         super().__init__()
-        self._profiler = profiler
+        self._callback = callback
 
     def __call__(
         self,
@@ -34,20 +40,20 @@ class GeminiAllGather(DefaultAllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.Work | None:
-        self._profiler.maybe_profile_gap_begin()
+        self._callback.begin_collective()
         handle = super().__call__(
             output_tensor,
             input_tensor,
             group=group,
             async_op=async_op,
         )
-        self._profiler.maybe_profile_gap_end(async_op, handle)
+        self._callback.end_collective(async_op, handle)
 
 class GeminiReduceScatter(DefaultReduceScatter):
 
-    def __init__(self, profiler):
+    def __init__(self, callback):
         super().__init__()
-        self._profiler = profiler
+        self._callback = callback
 
     def __call__(
         self,
@@ -57,7 +63,7 @@ class GeminiReduceScatter(DefaultReduceScatter):
         op: Any,
         async_op: bool = False,
     ) -> dist.Work:
-        self._profiler.maybe_profile_gap_begin()
+        self._callback.begin_collective()
         handle = super().__call__(
             output_tensor=output_tensor,
             input_tensor=input_tensor,
@@ -65,7 +71,7 @@ class GeminiReduceScatter(DefaultReduceScatter):
             op=op,
             async_op=async_op,
         )
-        self._profiler.maybe_profile_gap_end(async_op, handle)
+        self._callback.end_collective(async_op, handle)
 
 class GeminiCheckpointManager:
     def __init__(
@@ -79,22 +85,53 @@ class GeminiCheckpointManager:
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
         ft_manager: FTManager | None = None,
+        parallel_dims: ParallelDims | None = None,
     ) -> None:
-        self.folder = os.path.join(base_folder, checkpoint_config.folder)
         self.interval = checkpoint_config.interval
         self.enable = checkpoint_config.enable
+        self.skip_last_save = checkpoint_config.skip_last_save
 
-        # Setup profiler with config
+        self.model_wrapper = ModelWrapper(model_parts)
+        self.optimizers = optimizers
+        self.states = states
+        self.states.update({
+            DATALOADER: dataloader,
+            LR_SCHEDULER: lr_schedulers
+        })
+
         comm_gaps_folder = os.path.join(
             base_folder, checkpoint_config.gemini_comm_gaps_folder
         )
+
+        # Get FSDP process group from parallel_dims
+        fsdp_pg = None
+        if parallel_dims is not None:
+            fsdp_mesh = parallel_dims.get_optional_mesh("fsdp")
+            if fsdp_mesh is not None:
+                fsdp_pg = fsdp_mesh.get_group()
+
         self._profiler = SnapshotProfiler(
             enable=checkpoint_config.gemini_profile_comm_gaps,
             skip_first_k=checkpoint_config.gemini_skip_first_k,
             output_folder=comm_gaps_folder,
+            fsdp_process_group=fsdp_pg,
         )
-        self._gemini_all_gather = GeminiAllGather(self._profiler)
-        self._gemini_reduce_scatter = GeminiReduceScatter(self._profiler)
+        self._executor = SnapshotExecutor(
+            enable=not checkpoint_config.gemini_profile_comm_gaps,
+            states=self.states,
+            model_wrapper=self.model_wrapper,
+            optimizers=self.optimizers,
+            comm_gaps_folder=comm_gaps_folder,
+            fsdp_process_group=fsdp_pg,
+            mem_fs_folder=checkpoint_config.gemini_mem_fs_folder
+        )
+
+        if checkpoint_config.gemini_profile_comm_gaps:
+            self._gemini_all_gather = GeminiAllGather(self._profiler)
+            self._gemini_reduce_scatter = GeminiReduceScatter(self._profiler)
+        else:
+            self._gemini_all_gather = GeminiAllGather(self._executor)
+            self._gemini_reduce_scatter = GeminiReduceScatter(self._executor)
         self._register_collectives(model_parts)
 
     def _register_collectives(self, model_parts):
@@ -105,21 +142,37 @@ class GeminiCheckpointManager:
                     module.set_custom_reduce_scatter(self._gemini_reduce_scatter)
 
     @torch.no_grad()
-    def start_step(self, curr_step: int, last_step: bool = False) -> None:
-        self._profiler.start_step()
-        return
+    def begin_step(self, curr_step: int, last_step: bool = False) -> None:
+        self._profiler.begin_step()
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> None:
-        return
+        if not self._should_save(curr_step, last_step):
+            return
+        self._executor.snapshot()
+
+    def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
+        if not self.enable:
+            return False
+
+        if last_step:
+            # Skip last save if configured
+            if self.skip_last_save:
+                return False
+            return True
+
+        if curr_step % self.interval == 0:
+            return True
+
+        return False
 
     @torch.no_grad()
     def load(self, step: int = -1) -> bool:
-        return False
+        return self._executor.load(step)
 
     def maybe_wait_for_staging(self) -> None:
-        self._profiler.start_optimizer()
-        return
+        self._profiler.begin_optimizer()
+        self._executor.maybe_wait_for_staging()
 
     def wait_for_tracking(self) -> None:
         return

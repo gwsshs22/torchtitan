@@ -656,6 +656,8 @@ class Checkpoint:
     gemini_comm_gaps_folder: str = "gemini_comm_gaps"
     """Folder to save communication gap profiles (relative to dump_folder)"""
 
+    gemini_mem_fs_folder: str = ""
+
 
 @dataclass
 class ActivationCheckpoint:

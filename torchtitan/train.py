@@ -316,6 +316,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ckpt_cls = GeminiCheckpointManager
             assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
 
+        ckpt_extra_kwargs = {}
+        if job_config.checkpoint.use_gemini:
+            ckpt_extra_kwargs["parallel_dims"] = parallel_dims
+
         self.checkpointer = ckpt_cls(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
@@ -333,6 +337,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ),
             base_folder=job_config.job.dump_folder,
             ft_manager=self.ft_manager,
+            **ckpt_extra_kwargs,
         )
 
         loss_parallel_enabled = (
@@ -684,7 +689,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 self.step += 1
                 self.gc_handler.run(self.step)
-                self.checkpointer.start_step(
+                self.checkpointer.begin_step(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
                 try:
@@ -757,7 +762,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Save DTensor RNG tracker state if available
         rng_tracker = dtensor_random._rng_tracker
         if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
-            state["dtensor_rng_state"] = rng_tracker._get_device_state()
+            state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
@@ -776,7 +781,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if "dtensor_rng_state" in state_dict:
             rng_tracker = dtensor_random._rng_tracker
             if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
-                rng_tracker._set_device_state(state_dict["dtensor_rng_state"])
+                rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
     def _calculate_sizes(self) -> None:
         """Calculate model and optimizer state sizes for measurements."""
