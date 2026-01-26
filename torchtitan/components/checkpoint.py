@@ -619,6 +619,10 @@ class CheckpointManager:
             self._tracking_queue.join()
 
     @torch.no_grad()
+    def start_step(self, curr_step: int, last_step: bool = False) -> None:
+        return
+
+    @torch.no_grad()
     def load(self, step: int = -1) -> bool:
         """Load the checkpoint for the given step.
 

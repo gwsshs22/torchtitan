@@ -25,6 +25,7 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
+from torchtitan.components.gemini.checkpoint import GeminiCheckpointManager
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor,
@@ -310,7 +311,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.step = 0
         self.ntokens_seen = 0
 
-        self.checkpointer = CheckpointManager(
+        ckpt_cls = CheckpointManager
+        if job_config.checkpoint.use_gemini:
+            ckpt_cls = GeminiCheckpointManager
+            assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
+
+        self.checkpointer = ckpt_cls(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
@@ -678,6 +684,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 self.step += 1
                 self.gc_handler.run(self.step)
+                self.checkpointer.start_step(
+                    self.step, last_step=(self.step == job_config.training.steps)
+                )
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:

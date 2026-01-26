@@ -645,6 +645,17 @@ class Checkpoint:
     without saving any during the training.
     """
 
+    use_gemini: bool = False
+
+    gemini_profile_comm_gaps: bool = False
+    """Whether to profile communication gaps for Gemini checkpointing"""
+
+    gemini_skip_first_k: int = 5
+    """Number of initial iterations to skip when profiling communication gaps (warmup)"""
+
+    gemini_comm_gaps_folder: str = "gemini_comm_gaps"
+    """Folder to save communication gap profiles (relative to dump_folder)"""
+
 
 @dataclass
 class ActivationCheckpoint:
