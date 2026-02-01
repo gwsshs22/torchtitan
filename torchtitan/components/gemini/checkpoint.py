@@ -149,7 +149,7 @@ class GeminiCheckpointManager:
     def save(self, curr_step: int, last_step: bool = False) -> None:
         if not self._should_save(curr_step, last_step):
             return
-        self._executor.snapshot()
+        self._executor.snapshot(curr_step)
 
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
         if not self.enable:
@@ -182,4 +182,5 @@ class GeminiCheckpointManager:
 
     def close(self):
         self._profiler.compute_gaps()
+        self._executor.close()
 

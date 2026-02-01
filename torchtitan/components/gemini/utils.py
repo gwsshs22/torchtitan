@@ -1,3 +1,4 @@
+from enum import Enum, auto
 from typing import Any
 
 import torch
@@ -27,3 +28,7 @@ def state_dict_to_stateful(
             elem.load_state_dict(state_dict[key])
         else:
             states[key] = state_dict[key]
+
+class InMemStateType(Enum):
+    LOCAL = auto()
+    REMOTE = auto()

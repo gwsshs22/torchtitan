@@ -7,12 +7,14 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
-from torchtitan.components.gemini.in_mem_state import InMemState, InMemStateType
+from torchtitan.components.gemini.in_mem_state import InMemState
+from torchtitan.components.gemini.snapshot_container import SnapshotContainer
 from torchtitan.components.gemini.snapshot_group import (
     SnapshotGroup,
     CheckpointLoadAction
 )
 from torchtitan.components.gemini.snapshot_strategy import get_snapshot_strategy
+from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
 
 # InMemState types
@@ -45,6 +47,7 @@ class SnapshotExecutor:
         if not self.enable:
             return
         assert mem_fs_folder != ""
+        self.optimizers = optimizers
         self.states = states
         self.block_size = block_size
         self.comm_gaps_folder = comm_gaps_folder
@@ -63,6 +66,13 @@ class SnapshotExecutor:
         self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_local.pt"
         self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_remote.pt"
         self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_tmp.pt"
+        self.container_log_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_log.txt"
+
+        self.snapshot_container = SnapshotContainer(
+            self.local_checkpoint_path,
+            self.remote_checkpoint_path,
+            self.container_log_path
+        )
 
         self.has_checkpoint = os.path.exists(self.local_checkpoint_path) and os.path.exists(
             self.remote_checkpoint_path
@@ -75,11 +85,13 @@ class SnapshotExecutor:
         self.in_mem_states: list[list[InMemState]] = [
             [
                 InMemState(
+                    state_id,
                     model_wrapper,
                     optimizers,
                     states,
-                    state_type
-                ) for _ in range(2)
+                    state_type,
+                    self.snapshot_container
+                ) for state_id in range(2)
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
 
@@ -204,11 +216,12 @@ class SnapshotExecutor:
         with torch.cuda.stream(self._p2p_stream):
             self._sendrecv_tensor(self._gpu_buffers[0], self._gpu_buffers[1])
 
-    def snapshot(self):
+    def snapshot(self, curr_step):
         if not self.enable:
             return
 
         self._is_snapshot_step = True
+        self._snapshot_step = curr_step
         self._reset_for_new_step()
 
         cpu_metadata_state_dict = self.local_curr.snapshot_cpu_metadata_state()
@@ -296,8 +309,12 @@ class SnapshotExecutor:
             curr_stream.wait_event(self._local_copy_event)
             curr_stream.synchronize()
 
+            self.snapshot_container.commit(self._curr_version, self._snapshot_step)
             # Mark snapshot step as complete
             self._is_snapshot_step = False
 
     def close(self):
-        pass
+        if not self.enable:
+            return
+
+        self.snapshot_container.close()
