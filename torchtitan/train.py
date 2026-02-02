@@ -816,6 +816,13 @@ def main(trainer_class: type[Trainer]) -> None:
     try:
         trainer = trainer_class(config)
 
+        # Register training process with leto worker controller for fault injection
+        try:
+            from leto.launch.worker_controller_client import register_training_process
+            register_training_process(rank=torch.distributed.get_rank())
+        except ImportError:
+            pass  # leto package not available
+
         # TODO(local_tensor): Remove this special case once LocalTensor supports
         # init_weights() and foreach_allgather. In local tensor mode, skip
         # training/checkpointing as the # model is not fully initialized
