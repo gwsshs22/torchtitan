@@ -43,7 +43,32 @@ from torchtitan.config import Checkpoint as CheckpointConfig, TORCH_DTYPE_MAP
 from torchtitan.protocols import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
-from torchtitan.tools.leto import get_measurements, IterationRecord
+
+# Optional leto integration for measurements
+try:
+    from leto.launch.worker_controller_client import (
+        report_duration,
+        DURATION_CHECKPOINT_STAGING,
+        DURATION_CHECKPOINT_PERSISTING,
+    )
+    _LETO_AVAILABLE = True
+except ImportError:
+    _LETO_AVAILABLE = False
+
+
+class CheckpointTiming:
+    """Tracks checkpoint timing for leto measurements."""
+    def __init__(self, should_save: bool):
+        self.should_save = should_save
+        self.start_time = time.time() if should_save else 0.0
+
+    def set_staging_done(self) -> None:
+        if self.should_save and _LETO_AVAILABLE:
+            report_duration(DURATION_CHECKPOINT_STAGING, time.time() - self.start_time)
+
+    def set_checkpoint_done(self) -> None:
+        if self.should_save and _LETO_AVAILABLE:
+            report_duration(DURATION_CHECKPOINT_PERSISTING, time.time() - self.start_time)
 
 
 MODEL = "model"
@@ -510,7 +535,6 @@ class CheckpointManager:
             self._ft_save(curr_step)
 
         if not self._should_save(curr_step, last_step):
-            get_measurements().report_checkpoint_start(False)
             return
 
         begin = time.monotonic()
@@ -526,8 +550,8 @@ class CheckpointManager:
             # GC right after async_save -- the CPU memory is not able to be
             # freed until _async_wait()
 
-            # Create iteration record for timing measurements
-            record = get_measurements().report_checkpoint_start(True)
+            # Create timing record for leto measurements
+            record = CheckpointTiming(True)
 
             if last_step:
                 self._save_last_step(curr_step)
@@ -577,8 +601,6 @@ class CheckpointManager:
             )
         elif self.enable_ft_dataloader_checkpoints:
             assert self.ft_manager is not None
-            # This replica doesn't save checkpoint, but we still need a record
-            get_measurements().report_checkpoint_start(False)
             logger.info(
                 "Replica %d doesn't save checkpoint.",
                 # pyrefly: ignore [missing-attribute]
@@ -605,7 +627,7 @@ class CheckpointManager:
             finally:
                 self._tracking_queue.task_done()
 
-    def _track_staging_and_save(self, staging_future, save_future, record: IterationRecord):
+    def _track_staging_and_save(self, staging_future, save_future, record: CheckpointTiming):
         """Queue a task to track staging and save completion."""
         self._tracking_queue.put((staging_future, save_future, record))
 

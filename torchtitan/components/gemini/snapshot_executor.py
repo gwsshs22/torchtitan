@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from typing import Any
 
 import torch
@@ -16,6 +17,16 @@ from torchtitan.components.gemini.snapshot_group import (
 from torchtitan.components.gemini.snapshot_strategy import get_snapshot_strategy
 from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
+
+# Leto integration for checkpoint timing reporting
+try:
+    from leto.launch.worker_controller_client import (
+        report_duration,
+        DURATION_CHECKPOINT_STAGING,
+    )
+    _LETO_AVAILABLE = True
+except ImportError:
+    _LETO_AVAILABLE = False
 
 # InMemState types
 LOCAL = 0
@@ -71,7 +82,8 @@ class SnapshotExecutor:
         self.snapshot_container = SnapshotContainer(
             self.local_checkpoint_path,
             self.remote_checkpoint_path,
-            self.container_log_path
+            self.container_log_path,
+            self.snapshot_group._global_rank
         )
 
         self.has_checkpoint = os.path.exists(self.local_checkpoint_path) and os.path.exists(
@@ -168,7 +180,7 @@ class SnapshotExecutor:
             raise ValueError(f"Unknown load action: {load_action}")
         if loaded:
             loaded_step = self.states["train_state"].step
-            logger.info(f"Loaded checkpoint at step {loaded_step}")
+            logger.info(f"Loaded checkpoint at step {loaded_step}, load_action={load_action}")
             self.snapshot_group.validate_steps(loaded_step)
 
         self.local_prev.init_cpu_tensors()
@@ -222,6 +234,7 @@ class SnapshotExecutor:
 
         self._is_snapshot_step = True
         self._snapshot_step = curr_step
+        self._staging_start_time = time.time()  # Track staging start time
         self._reset_for_new_step()
 
         cpu_metadata_state_dict = self.local_curr.snapshot_cpu_metadata_state()
@@ -310,6 +323,12 @@ class SnapshotExecutor:
             curr_stream.synchronize()
 
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
+
+            # Report staging duration to leto
+            if _LETO_AVAILABLE:
+                staging_duration = time.time() - self._staging_start_time
+                report_duration(DURATION_CHECKPOINT_STAGING, staging_duration, self._snapshot_step)
+
             # Mark snapshot step as complete
             self._is_snapshot_step = False
 

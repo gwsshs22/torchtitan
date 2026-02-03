@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.tools.leto import get_measurements
-
 import dataclasses
 import importlib
 import json
@@ -41,6 +39,25 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
+
+# Optional leto integration for measurements
+try:
+    from leto.launch.worker_controller_client import (
+        get_client as get_leto_client,
+        report_event,
+        report_duration,
+        register_training_process,
+        get_checkpoint_loading_type,
+        EVENT_TRAINING_STARTED,
+        EVENT_CHECKPOINT_LOADING_DONE,
+        EVENT_STEP_DONE,
+        DURATION_CHECKPOINT_LOADING,
+        DURATION_ITERATION,
+        DURATION_WEIGHT_ALLOCATION,
+    )
+    _LETO_AVAILABLE = True
+except ImportError:
+    _LETO_AVAILABLE = False
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -273,7 +290,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model_parts = [model]
 
         # [Leto] Record weight allocation and init time
-        get_measurements().record_weight_allocation_time(time.time() - _weight_alloc_start)
+        if _LETO_AVAILABLE:
+            report_duration(DURATION_WEIGHT_ALLOCATION, time.time() - _weight_alloc_start)
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -633,15 +651,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        get_measurements().record_time_to_train_start()
+
+        # [Leto] Report training started event
+        if _LETO_AVAILABLE:
+            report_event(EVENT_TRAINING_STARTED)
 
         # [Leto] Time checkpoint loading
         _ckpt_load_start = time.time()
         self.checkpointer.load(step=job_config.checkpoint.load_step)
-        get_measurements().record_checkpoint_load_time(time.time() - _ckpt_load_start)
-
-        # [Leto] Calculate model and optimizer sizes after checkpoint load
-        self._calculate_sizes()
+        if _LETO_AVAILABLE:
+            _ckpt_loading_type = get_checkpoint_loading_type()
+            report_duration(DURATION_CHECKPOINT_LOADING, time.time() - _ckpt_load_start,
+                            checkpoint_loading_type=_ckpt_loading_type)
+            report_event(EVENT_CHECKPOINT_LOADING_DONE)
 
         logger.info(f"Training starts at step {self.step + 1}")
 
@@ -728,17 +750,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         parallel_dims=self.parallel_dims,
                     )
 
-                # [Leto] Record iteration time and loss
+                # [Leto] Record iteration time and report step done
                 _iter_time = time.time() - _iter_start
-                get_measurements().record_iteration_time(_iter_time)
+                if _LETO_AVAILABLE:
+                    report_duration(DURATION_ITERATION, _iter_time, step=self.step)
+                    report_event(EVENT_STEP_DONE, step=self.step)
 
 
         # [Leto] Wait for any pending checkpoint tracking to complete
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.wait_for_tracking()
-
-        # [Leto] Write measurements to JSON file
-        get_measurements().write()
 
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
@@ -783,10 +804,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
                 rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
-    def _calculate_sizes(self) -> None:
-        """Calculate model and optimizer state sizes for measurements."""
-        get_measurements().calculate_sizes(self.model_parts, list(self.optimizers))
-
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
@@ -801,7 +818,6 @@ def main(trainer_class: type[Trainer]) -> None:
         trainer_class: The trainer class to instantiate (e.g., Trainer, FluxTrainer, TorchCommsTrainer)
     """
     init_logger()
-
     import torchtitan
 
     logger.info(
@@ -816,12 +832,9 @@ def main(trainer_class: type[Trainer]) -> None:
     try:
         trainer = trainer_class(config)
 
-        # Register training process with leto worker controller for fault injection
-        try:
-            from leto.launch.worker_controller_client import register_training_process
+        # Register training process with leto worker controller for fault injection and metrics
+        if _LETO_AVAILABLE:
             register_training_process(rank=torch.distributed.get_rank())
-        except ImportError:
-            pass  # leto package not available
 
         # TODO(local_tensor): Remove this special case once LocalTensor supports
         # init_weights() and foreach_allgather. In local tensor mode, skip

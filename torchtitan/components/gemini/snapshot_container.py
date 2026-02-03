@@ -11,6 +11,20 @@ import torch.multiprocessing as mp
 
 from torchtitan.components.gemini.utils import InMemStateType
 
+# Leto integration for checkpoint timing reporting
+try:
+    from leto.launch.worker_controller_client import (
+        register_service_process,
+        report_duration,
+        DURATION_CHECKPOINT_PERSISTING,
+    )
+    _LETO_AVAILABLE = True
+except ImportError:
+    _LETO_AVAILABLE = False
+    register_service_process = None
+    report_duration = None
+    DURATION_CHECKPOINT_PERSISTING = None
+
 _process_states = None
 
 class InMemStateView:
@@ -89,6 +103,7 @@ class SnapshotContainer:
         local_checkpoint_path: str,
         remote_checkpoint_path: str,
         log_file_path: str,
+        rank: int
     ):
         self.ctx = mp.get_context("spawn")
         self.closed = False
@@ -100,6 +115,7 @@ class SnapshotContainer:
                 local_checkpoint_path,
                 remote_checkpoint_path,
                 log_file_path,
+                rank,
                 child_pipe),
         )
         self.process.start()
@@ -205,13 +221,15 @@ class SnapshotContainer:
         local_checkpoint_path: str,
         remote_checkpoint_path: str,
         log_file_path: str,
+        rank: int,
         pipe):
         """Subprocess entry point with command handling and orphan detection"""
         # Redirect stdout/stderr to a temporary file for debugging
         global _process_states
 
         _process_states = {
-            "in_mem_states": {}
+            "in_mem_states": {},
+            "rank": rank
         }
         _process_states["local_checkpoint_path"] = local_checkpoint_path
         _process_states["remote_checkpoint_path"] = remote_checkpoint_path
@@ -224,10 +242,9 @@ class SnapshotContainer:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
         # Register with WorkerController for graceful shutdown coordination
-        try:
-            from leto.launch.worker_controller_client import register_service_process
-            register_service_process()
-        except ImportError:
+        if _LETO_AVAILABLE:
+            register_service_process(_process_states["rank"])
+        else:
             print("leto package not available, skipping WorkerController registration", flush=True)
 
         parent_pid = os.getppid()
@@ -294,6 +311,8 @@ class SnapshotContainer:
             return
         snapshot_step = _process_states['snapshot_step']
         print(f"Start dumping step={snapshot_step}", flush=True)
+        persist_start_time = time.time()
+
         commited_state_id = _process_states['commited_state_id']
         local_state_view = _process_states["in_mem_states"][(commited_state_id, InMemStateType.LOCAL)]
         remote_state_view = _process_states["in_mem_states"][(commited_state_id, InMemStateType.REMOTE)]
@@ -301,4 +320,11 @@ class SnapshotContainer:
         gc.collect()
         local_state_view.dump(_process_states["local_checkpoint_path"])
         remote_state_view.dump(_process_states["remote_checkpoint_path"])
+
+        # Report persisting duration to leto
+        if _LETO_AVAILABLE:
+            persist_duration = time.time() - persist_start_time
+            report_duration(DURATION_CHECKPOINT_PERSISTING, persist_duration, snapshot_step)
+            print(f"Persist took {persist_duration:.2f} seconds.", flush=True)
+
         print(f"End dumping step={snapshot_step}", flush=True)
