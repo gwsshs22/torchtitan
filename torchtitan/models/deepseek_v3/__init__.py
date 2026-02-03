@@ -75,18 +75,18 @@ deepseekv3_args = {
         attn_type="flex",
         attn_mask_type="block_causal",
     ),
-    "4B": DeepSeekV3ModelArgs(
+    "1B": DeepSeekV3ModelArgs(
         vocab_size=102400,
         dim=2048,
         inter_dim=10944,
         moe_inter_dim=1408,
-        n_layers=13,
+        n_layers=7,
         n_dense_layers=1,
         n_heads=16,
         moe_args=MoEArgs(
-            num_experts=32,
+            num_experts=16,
             num_shared_experts=2,
-            top_k=6,
+            top_k=4,
             score_func="softmax",
             route_norm=False,
             score_before_experts=False,
