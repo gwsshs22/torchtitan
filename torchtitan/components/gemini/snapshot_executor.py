@@ -50,10 +50,9 @@ class SnapshotExecutor:
         fsdp_process_group: dist.ProcessGroup | None = None,
         mem_fs_folder: str = "",
         # Strategy computation parameters
-        bandwidth_gbps: float = 100.0,  # Network bandwidth in Gbps
+        bandwidth_gbps: float = 50.0,  # Per-GPU Network bandwidth in Gbps
         gap_threshold_ms: float = 3.0,  # Minimum gap to consider (ms)
-        alpha: float = 0.8,  # Utilization factor
-        max_blocks_per_gap: int = 1024 * 1024,  # Max blocks to send per gap
+        min_p2p_time_ms: float = 0.2
     ):
         self.enable = enable
         if not self.enable:
@@ -69,14 +68,10 @@ class SnapshotExecutor:
         # Strategy parameters
         self._bandwidth_gbps = bandwidth_gbps
         self._gap_threshold_ms = gap_threshold_ms
-        self._alpha = alpha
-        self._max_blocks_per_gap = max_blocks_per_gap
+        self._min_p2p_time_ms = min_p2p_time_ms
 
         self._fsdp_pg = fsdp_process_group
         self.snapshot_group = SnapshotGroup(self._fsdp_pg)
-
-        #TODO: create a new group for p2p based on self._fdsp_pg
-        self.p2p_pg = None
 
         self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_local.pt"
         self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_remote.pt"
@@ -217,8 +212,7 @@ class SnapshotExecutor:
                 self._dtype_size,
                 self._bandwidth_gbps,
                 self._gap_threshold_ms,
-                self._alpha,
-                self._max_blocks_per_gap,
+                self._min_p2p_time_ms,
             )
 
             logger.info(

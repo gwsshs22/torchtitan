@@ -4,26 +4,8 @@ def get_snapshot_strategy(
     dtype_size: int,
     bandwidth_gbps: float,
     gap_threshold_ms: float,
-    alpha: float,
-    max_blocks_per_gap: int,
+    min_p2p_time_ms: float,
 ) -> dict[int, int]:
-    """Compute snapshot strategy from gap times using actual block sizes.
-
-    Gemini's algorithm (snapshot_strategy.py:get_snapshot_strategy):
-    For each gap, compute how many blocks can fit based on bandwidth and gap duration.
-
-    Args:
-        gap_times: Map of gap_id -> minimum gap time in ms.
-        block_sizes: Actual size of each block in elements.
-        dtype_size: Element size in bytes.
-        bandwidth_gbps: Network bandwidth in Gbps.
-        gap_threshold_ms: Minimum gap to consider (ms).
-        alpha: Utilization factor.
-        max_blocks_per_gap: Cap on blocks per gap.
-
-    Returns:
-        Strategy map: gap_id -> number of blocks to snapshot.
-    """
     # Filter gaps above threshold (Gemini: get_valid_comm_idle_time)
     valid_gaps = {
         k: v for k, v in gap_times.items() if v > gap_threshold_ms and k > 0
@@ -33,36 +15,56 @@ def get_snapshot_strategy(
     cur_block_id = 0
     total_blocks = len(block_sizes)
 
+    def get_alpha_for_block_size(block_bytes: int) -> float:
+        """Get alpha based on block size thresholds."""
+        # Small messages can use less effective BW in p2p kernels.
+        if block_bytes <= 64 * 1024 * 1024:  # 64 MiB
+            return 0.4
+        if block_bytes <= 128 * 1024 * 1024:  # 128 MiB
+            return 0.5
+        elif block_bytes <= 256 * 1024 * 1024:  # 256 MiB
+            return 0.6
+        elif block_bytes <= 1024 * 1024 * 1024:  # 512 MiB
+            return 0.7
+        else:
+            return 0.8
+
+    def estimate_p2p_time_ms(block_bytes: int, bandwidth_gbps: float, alpha: float, min_p2p_time_ms: float) -> float:
+        """
+        Estimate P2P transfer time for a block.
+
+        The estimated time is adjusted by 1/alpha to account for overhead.
+        The function ensures that the mean estimated time equals min_p2p_time_ms.
+        """
+        # Base transfer time: bytes / (bandwidth_gbps * 1e9 / 8) * 1000 to get ms
+        base_time_ms = block_bytes / (bandwidth_gbps * 1e9 / 8) * 1000
+        # Adjust by 1/alpha for overhead
+        adjusted_time_ms = base_time_ms / alpha
+        # Scale to ensure mean equals min_p2p_time_ms
+        return max(adjusted_time_ms, min_p2p_time_ms)
+
     for gap_id, gap_ms in sorted(valid_gaps.items()):
-        # Compute max elements that can be transferred in this gap
-        # Formula: gap_time_sec * bandwidth_bytes_per_sec / dtype_size * alpha
-        # Note: Gemini divides by local_rank_size for intra-node NVLink sharing,
-        # but FSDP P2P may span nodes, so we don't divide by fsdp_size here.
-        # User can adjust bandwidth_gbps to account for shared bandwidth if needed.
-        max_elements = (
-            gap_ms / 1000
-            * bandwidth_gbps
-            * 1e9
-            / 8
-            / dtype_size
-            * alpha
-        )
-
         blocks = 0
-        cur_elements = 0
+        total_time_ms = 0.0
 
-        # Gemini: while cur_block_id < total_blocks_num and
-        # cur_comm_size + block_sizes[cur_block_id] <= max_comm_size
+        # Fit blocks into the gap based on per-block P2P time estimates
         while cur_block_id < total_blocks:
             block_size = block_sizes[cur_block_id]
-            if cur_elements + block_size > max_elements:
+            block_bytes = block_size * dtype_size
+
+            # Get adaptive alpha based on block size
+            alpha = get_alpha_for_block_size(block_bytes)
+
+            # Estimate P2P time for this block
+            p2p_time_ms = estimate_p2p_time_ms(block_bytes, bandwidth_gbps, alpha, min_p2p_time_ms)
+
+            # Check if this block fits in the remaining gap time
+            if total_time_ms + p2p_time_ms > gap_ms:
                 break
-            cur_elements += block_size
+
+            total_time_ms += p2p_time_ms
             cur_block_id += 1
             blocks += 1
-            # Gemini: if blocks >= max_blocks: break
-            if blocks >= max_blocks_per_gap:
-                break
 
         if blocks > 0:
             strategy[gap_id] = blocks
@@ -75,5 +77,30 @@ def get_snapshot_strategy(
     if cur_block_id < total_blocks:
         last_gap_id = len(gap_times) - 1  # Gemini uses len(self.get_comm_idle_time())
         strategy[last_gap_id] = -1  # -1 means "all remaining"
+
+    # print(f"bandwidth_gbps={bandwidth_gbps}, gap_threshold_ms={gap_threshold_ms}")
+
+    # # Print per gap what block size (in bytes) are scheduled
+    # print("Snapshot strategy per gap:")
+    # block_start = 0
+    # for gap_id in sorted(strategy.keys()):
+    #     num_blocks = strategy[gap_id]
+    #     if num_blocks == -1:
+    #         # All remaining blocks
+    #         remaining_blocks = block_sizes[block_start:]
+    #         block_bytes = [size * dtype_size for size in remaining_blocks]
+    #         total_bytes = sum(block_bytes)
+    #         print(f"  Gap {gap_id}: {len(remaining_blocks)} blocks (remaining), total {total_bytes:,} bytes ({total_bytes / 1e9:.3f} GB)")
+    #         for i, bytes_val in enumerate(block_bytes):
+    #             print(f"    Block {block_start + i}: {bytes_val:,} bytes ({bytes_val / 1e9:.3f} GB)")
+    #     else:
+    #         # Specific number of blocks
+    #         scheduled_blocks = block_sizes[block_start:block_start + num_blocks]
+    #         block_bytes = [size * dtype_size for size in scheduled_blocks]
+    #         total_bytes = sum(block_bytes)
+    #         print(f"  Gap {gap_id}: {num_blocks} blocks, total {total_bytes:,} bytes ({total_bytes / 1e9:.3f} GB)")
+    #         for i, bytes_val in enumerate(block_bytes):
+    #             print(f"    Block {block_start + i}: {bytes_val:,} bytes ({bytes_val / 1e9:.3f} GB)")
+    #         block_start += num_blocks
 
     return strategy
