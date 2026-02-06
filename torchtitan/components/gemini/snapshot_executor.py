@@ -75,6 +75,9 @@ class SnapshotExecutor:
         self._fsdp_pg = fsdp_process_group
         self.snapshot_group = SnapshotGroup(self._fsdp_pg)
 
+        #TODO: create a new group for p2p based on self._fdsp_pg
+        self.p2p_pg = None
+
         self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_local.pt"
         self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_remote.pt"
         self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_tmp.pt"
@@ -231,7 +234,7 @@ class SnapshotExecutor:
 
     def _init_sendrecv(self):
         with torch.cuda.stream(self._p2p_stream):
-            self._sendrecv_tensor(self._gpu_buffers[0], self._gpu_buffers[1])
+            self.snapshot_group.sendrecv_tensor(self._gpu_buffers[0], self._gpu_buffers[1])
 
     def _snapshot_background(self, cpu_metadata_state_dict):
         """Background thread: GPU→CPU copy + Gloo metadata exchange."""
@@ -302,7 +305,7 @@ class SnapshotExecutor:
 
         output_tensor = self._gpu_buffers[self._gpu_buffer_id][:block_size]
         self._gpu_buffer_id = 1 - self._gpu_buffer_id
-        self._sendrecv_tensor(gpu_block, output_tensor)
+        self.snapshot_group.sendrecv_tensor(gpu_block, output_tensor)
 
         with torch.cuda.stream(self._copy_stream):
             cpu_block = self.remote_curr.get_block(block_id)

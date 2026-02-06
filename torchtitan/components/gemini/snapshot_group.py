@@ -43,8 +43,10 @@ class SnapshotGroup:
         # Initialize Gloo process group for object exchange
         # Gloo backend is required for send/recv_object_list
         self._gloo_pg = None
+        self._p2p_pg = None
         if dist.is_initialized():
             self._gloo_pg = dist.new_group(backend="gloo")
+            self._p2p_pg = dist.new_group()
 
     @property
     def global_rank(self) -> int:
@@ -99,6 +101,15 @@ class SnapshotGroup:
             )
 
         return recv_objs[0]
+
+    def sendrecv_tensor(self, input_tensor, output_tensor):
+        ops = [
+            dist.P2POp(dist.isend, input_tensor, self.peer_global_rank, group=self._p2p_pg),
+            dist.P2POp(dist.irecv, output_tensor, self.peer_global_rank, group=self._p2p_pg),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
     def send_checkpoint(self, checkpoint_path):
         file_size = os.path.getsize(checkpoint_path)
