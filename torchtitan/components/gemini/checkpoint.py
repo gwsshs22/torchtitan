@@ -48,6 +48,7 @@ class GeminiAllGather(DefaultAllGather):
             async_op=async_op,
         )
         self._callback.end_collective(async_op, handle)
+        return handle
 
 class GeminiReduceScatter(DefaultReduceScatter):
 
@@ -72,6 +73,7 @@ class GeminiReduceScatter(DefaultReduceScatter):
             async_op=async_op,
         )
         self._callback.end_collective(async_op, handle)
+        return handle
 
 class GeminiCheckpointManager:
     def __init__(

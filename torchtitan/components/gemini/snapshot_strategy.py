@@ -43,7 +43,10 @@ def get_snapshot_strategy(
         # Scale to ensure mean equals min_p2p_time_ms
         return max(adjusted_time_ms, min_p2p_time_ms)
 
-    for gap_id, gap_ms in sorted(valid_gaps.items()):
+    # Fill gaps from end to beginning to avoid CPU P2P overhead causing GPU stalls
+    # at the beginning of training steps
+    for gap_id in sorted(valid_gaps.keys(), reverse=True):
+        gap_ms = valid_gaps[gap_id]
         blocks = 0
         total_time_ms = 0.0
 
@@ -75,7 +78,7 @@ def get_snapshot_strategy(
     # If not all blocks fit, mark last gap to snapshot remaining
     # Gemini: strategy[last_gap] = -1
     if cur_block_id < total_blocks:
-        last_gap_id = len(gap_times) - 1  # Gemini uses len(self.get_comm_idle_time())
+        last_gap_id = len(gap_times) - 1
         strategy[last_gap_id] = -1  # -1 means "all remaining"
 
     # print(f"bandwidth_gbps={bandwidth_gbps}, gap_threshold_ms={gap_threshold_ms}")
