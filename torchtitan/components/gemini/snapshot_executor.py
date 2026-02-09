@@ -122,6 +122,7 @@ class SnapshotExecutor:
         self._local_copy_stream = torch.cuda.Stream()
         self._copy_stream = torch.cuda.Stream()
         self._p2p_stream = torch.cuda.Stream()
+        self._local_copy_event = torch.cuda.Event()  # Reusable event for local GPU→CPU copy
 
         # Distributed setup - compute ranks within FSDP group
         self._peer_global_rank = self.snapshot_group.peer_global_rank
@@ -232,14 +233,12 @@ class SnapshotExecutor:
 
     def _snapshot_background(self, cpu_metadata_state_dict):
         """Background thread: GPU→CPU copy + Gloo metadata exchange."""
-        local_copy_event = torch.cuda.Event()
         with torch.cuda.stream(self._local_copy_stream):
             self.local_curr.snapshot_gpu_state()
-            local_copy_event.record()
+            self._local_copy_event.record()
 
         remote_cpu_metadata_state_dict = self.snapshot_group.exchange_object(cpu_metadata_state_dict)
         self.remote_curr.set_cpu_metadata_state_dict(remote_cpu_metadata_state_dict)
-        return local_copy_event
 
     def snapshot(self, curr_step):
         if not self.enable:
@@ -325,13 +324,13 @@ class SnapshotExecutor:
             assert self._cur_block_id == self._total_blocks
 
             # Wait for background thread (Gloo exchange + local copy launch)
-            local_copy_event = self._snapshot_future.result()
+            self._snapshot_future.result()
 
             # Sync streams to ensure all copies are done
             curr_stream = torch.cuda.current_stream()
             curr_stream.wait_stream(self._copy_stream)
             curr_stream.wait_stream(self._p2p_stream)
-            curr_stream.wait_event(local_copy_event)
+            curr_stream.wait_event(self._local_copy_event)
             curr_stream.synchronize()
 
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
