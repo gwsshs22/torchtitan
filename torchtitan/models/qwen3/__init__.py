@@ -11,6 +11,7 @@ from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.optimizer import build_optimizers
 from torchtitan.components.tokenizer import build_hf_tokenizer
 from torchtitan.components.validate import build_validator
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.models.moe import MoEArgs
 from torchtitan.protocols.train_spec import TrainSpec
@@ -196,7 +197,7 @@ def get_train_spec() -> TrainSpec:
         model_cls=Qwen3Model,
         model_args=qwen3_args,  # Change from dict to Mapping
         parallelize_fn=parallelize_qwen3,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_llm,
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_text_dataloader,

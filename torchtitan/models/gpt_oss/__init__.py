@@ -8,6 +8,7 @@ from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.optimizer import build_optimizers_with_moe_load_balancing
 from torchtitan.components.tokenizer import build_hf_tokenizer
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.models.moe import MoEArgs
 
@@ -79,7 +80,7 @@ def get_train_spec() -> TrainSpec:
         model_cls=GptOssModel,
         model_args=gptoss_configs,
         parallelize_fn=parallelize_gptoss,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_llm,
         build_optimizers_fn=build_optimizers_with_moe_load_balancing,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_text_dataloader,

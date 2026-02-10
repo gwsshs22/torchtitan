@@ -184,11 +184,12 @@ def parallelize_qwen3(
             enable_compile=model_compile_enabled,
         )
 
-    # Enable weight tying after applying parallelisms
+    # Enable weight tying after applying parallelisms (skip if PP split model)
     # pyrefly: ignore [missing-attribute]
     if model.model_args.enable_weight_tying:
         # pyrefly: ignore [missing-attribute]
-        model.output.weight = model.tok_embeddings.weight
+        if model.output is not None and model.tok_embeddings is not None:
+            model.output.weight = model.tok_embeddings.weight
 
     return model
 
