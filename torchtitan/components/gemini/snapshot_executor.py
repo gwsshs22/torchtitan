@@ -185,7 +185,9 @@ class SnapshotExecutor:
         if loaded:
             loaded_step = self.states["train_state"].step
             logger.info(f"Loaded checkpoint at step {loaded_step}, load_action={load_action}")
-            self.snapshot_group.validate_steps(loaded_step)
+        else:
+            loaded_step = 1
+        self.snapshot_group.validate_steps(loaded_step)
 
         self.local_prev.init_cpu_tensors()
         self.remote_curr.init_cpu_tensors()
