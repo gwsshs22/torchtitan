@@ -29,6 +29,7 @@ from .job_config import (
     Quantize,
     Training,
     Validation,
+    Leto,
 )
 from .manager import ConfigManager
 
@@ -51,4 +52,5 @@ __all__ = [
     "Training",
     "Validation",
     "Debug",
+    "Leto"
 ]

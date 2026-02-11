@@ -22,6 +22,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.components.eager_init import maybe_eager_init
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.gemini.checkpoint import GeminiCheckpointManager
 from torchtitan.components.loss import rescale_accumulated_loss
@@ -651,6 +652,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+
+        maybe_eager_init(job_config.leto.eager_init_list, self.parallel_dims, self.device)
 
         # [Leto] Report training started event
         if _LETO_AVAILABLE:

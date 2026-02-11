@@ -1007,6 +1007,12 @@ class Debug:
     moe_force_load_balance: bool = False
     """If True, we force each experts to get the same amount of tokens via round-robin. This option is for debugging usage only."""
 
+@dataclass
+class Leto:
+    eager_init_list: list[str] = field(default_factory=list)
+    """
+        all, none, nccl
+    """
 
 @dataclass
 class JobConfig:
@@ -1034,6 +1040,7 @@ class JobConfig:
     experimental: Experimental = field(default_factory=Experimental)
     validation: Validation = field(default_factory=Validation)
     debug: Debug = field(default_factory=Debug)
+    leto: Leto = field(default_factory=Leto)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
