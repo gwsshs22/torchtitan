@@ -1014,6 +1014,15 @@ class Leto:
         all, none, nccl
     """
 
+    enable_stage_input_record: bool = False
+    """Record stage inputs during first training iteration for later warmup replay"""
+
+    enable_stage_warmup: bool = False
+    """Warmup stages with recorded inputs before training starts (after checkpoint loading)"""
+
+    stage_inputs_folder: str = "stage_inputs"
+    """Folder to save/load recorded stage input metadata (relative to dump_folder)"""
+
 @dataclass
 class JobConfig:
     """

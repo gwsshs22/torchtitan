@@ -30,6 +30,10 @@ from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
+from torchtitan.components.stage_warmup import (
+    maybe_record_stage_inputs,
+    maybe_warmup_stages,
+)
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
@@ -93,6 +97,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # additional training states
     step: int
     ntokens_seen: int
+
+    # stage warmup recorder (for recording stage inputs)
+    stage_input_recorder: Any = None
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -668,6 +675,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             checkpoint_loading_type=_ckpt_loading_type)
             report_event(EVENT_CHECKPOINT_LOADING_DONE)
 
+        # Warmup stages with recorded inputs (after checkpoint loading)
+        maybe_warmup_stages(
+            self.model_parts,
+            job_config,
+            loss_fn=self.loss_fn,
+            pp_has_last_stage=self.pp_has_last_stage,
+        )
+
         logger.info(f"Training starts at step {self.step + 1}")
 
         leaf_folder = (
@@ -713,6 +728,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 _iter_start = time.time()
 
                 self.step += 1
+
+                # Handle stage input recording (before/after first iteration)
+                self.stage_input_recorder = maybe_record_stage_inputs(
+                    self.model_parts,
+                    job_config,
+                    self.step,
+                    self.stage_input_recorder,
+                    loss_fn=self.loss_fn,
+                    pp_has_last_stage=self.pp_has_last_stage,
+                )
+
                 self.gc_handler.run(self.step)
                 self.checkpointer.begin_step(
                     self.step, last_step=(self.step == job_config.training.steps)
