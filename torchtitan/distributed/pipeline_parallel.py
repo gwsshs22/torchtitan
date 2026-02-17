@@ -10,6 +10,7 @@ import os
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
@@ -26,6 +27,7 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.components.loss import LossFunction, rescale_accumulated_loss
+from torchtitan.components.skip_shape_infer import maybe_load_stage_shapes
 from torchtitan.config import JobConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.dual_pipe_v import overlap_callback
@@ -128,6 +130,7 @@ def pipeline_llm(
         job_config.parallelism.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
+        job_config=job_config,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -350,6 +353,7 @@ def pipeline_module_split(
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
+    job_config: JobConfig | None = None,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
@@ -387,7 +391,11 @@ def pipeline_module_split(
     pp_degree = pp_mesh.size()
 
     def _build_stage_from_modules(
-        stage_idx: int, module_names: list[str], num_stages: int
+        stage_idx: int,
+        module_names: list[str],
+        num_stages: int,
+        input_args: tuple[torch.Tensor, ...] | None = None,
+        output_args: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
 
@@ -436,6 +444,8 @@ def pipeline_module_split(
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
+            input_args=input_args,
+            output_args=output_args,
         )
         return stage, model
 
@@ -470,12 +480,35 @@ def pipeline_module_split(
         else:
             raise ValueError(f"Unknown style {style}")
 
-    for stage_idx in _get_stage_indices():
+    stage_indices = _get_stage_indices()
+    num_local_stages = len(stage_indices)
+
+    # Optionally load pre-recorded shapes to skip runtime _shape_inference.
+    # stage_shapes[i] = (input_meta_tensors, output_meta_tensors) for local stage i.
+    stage_shapes = (
+        maybe_load_stage_shapes(job_config, num_local_stages)
+        if job_config is not None
+        else None
+    )
+    if stage_shapes is not None:
+        logger.info(
+            f"PP rank {pp_rank}: skipping runtime shape inference "
+            f"for {num_local_stages} local stage(s)"
+        )
+
+    for local_idx, stage_idx in enumerate(stage_indices):
+        input_args = None
+        output_args = None
+        if stage_shapes is not None:
+            input_args, output_args = stage_shapes[local_idx]
+
         module_names = module_names_per_stage[stage_idx]
         stage, model_chunk = _build_stage_from_modules(
             stage_idx,
             module_names,
             num_stages,
+            input_args=input_args,
+            output_args=output_args,
         )
         logger.info(
             f"PP rank {pp_rank} is building stage_idx {stage_idx} "
