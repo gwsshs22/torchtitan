@@ -270,6 +270,9 @@ def maybe_load_stage_shapes(
     if not job_config.leto.enable_skip_shape_inference:
         return None
 
+    if job_config.parallelism.pipeline_parallel_degree <= 1:
+        return None
+
     rank = dist.get_rank() if dist.is_initialized() else 0
     record_path = os.path.join(
         job_config.job.dump_folder,
