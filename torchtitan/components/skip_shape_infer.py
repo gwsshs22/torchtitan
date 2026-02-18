@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from torchtitan.tools.logging import logger
 
@@ -57,17 +58,52 @@ def _metadata_to_tensor(metadata: dict[str, Any]) -> torch.Tensor:
     return tensor
 
 
+def _block_mask_to_metadata(mask: BlockMask) -> dict[str, Any]:
+    """Serialize a BlockMask to a JSON-compatible dict (shape + device only)."""
+    seq_len_q, seq_len_kv = mask.shape[-2], mask.shape[-1]
+    # Infer device from the first internal tensor.
+    device = str(mask.kv_num_blocks.device)
+    return {
+        "type": "BlockMask",
+        "seq_len_q": seq_len_q,
+        "seq_len_kv": seq_len_kv,
+        "device": device,
+    }
+
+
+def _metadata_to_block_mask(metadata: dict[str, Any]) -> BlockMask:
+    """Reconstruct a synthetic all-dense causal BlockMask from recorded metadata."""
+    seq_len_q = metadata["seq_len_q"]
+    seq_len_kv = metadata["seq_len_kv"]
+    device = metadata["device"]
+
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    return create_block_mask(
+        causal_mask,
+        B=None,
+        H=None,
+        Q_LEN=seq_len_q,
+        KV_LEN=seq_len_kv,
+        device=device,
+    )
+
+
+def _serialize_arg(arg: Any) -> Any:
+    """Serialize a single arg to JSON-compatible format."""
+    if isinstance(arg, torch.Tensor):
+        return _tensor_to_metadata(arg)
+    if isinstance(arg, BlockMask):
+        return _block_mask_to_metadata(arg)
+    return None
+
+
 def _serialize_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Serialize args and kwargs to JSON-compatible format."""
     return {
-        "args": [
-            _tensor_to_metadata(arg) if isinstance(arg, torch.Tensor) else None
-            for arg in args
-        ],
-        "kwargs": {
-            k: _tensor_to_metadata(v) if isinstance(v, torch.Tensor) else None
-            for k, v in kwargs.items()
-        },
+        "args": [_serialize_arg(arg) for arg in args],
+        "kwargs": {k: _serialize_arg(v) for k, v in kwargs.items()},
     }
 
 
@@ -105,16 +141,21 @@ def _deserialize_as_meta(metadata: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         if entry is not None
     )
 
+def _deserialize_arg(meta: Any) -> Any:
+    """Deserialize a single recorded arg back to a synthetic value."""
+    if meta is None:
+        return None
+    if isinstance(meta, dict) and meta.get("type") == "BlockMask":
+        return _metadata_to_block_mask(meta)
+    if isinstance(meta, dict):
+        return _metadata_to_tensor(meta)
+    return None
+
+
 def _deserialize_args(metadata: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Deserialize metadata to synthetic tensors."""
-    args = tuple(
-        _metadata_to_tensor(arg_meta) if arg_meta is not None else None
-        for arg_meta in metadata["args"]
-    )
-    kwargs = {
-        k: _metadata_to_tensor(v_meta) if v_meta is not None else None
-        for k, v_meta in metadata["kwargs"].items()
-    }
+    """Deserialize metadata to synthetic tensors/masks."""
+    args = tuple(_deserialize_arg(arg_meta) for arg_meta in metadata["args"])
+    kwargs = {k: _deserialize_arg(v_meta) for k, v_meta in metadata["kwargs"].items()}
     # Filter out None values
     args = tuple(arg for arg in args if arg is not None)
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
