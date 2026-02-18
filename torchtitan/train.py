@@ -30,7 +30,10 @@ from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
-from torchtitan.components.skip_shape_infer import maybe_record_stage_inputs
+from torchtitan.components.skip_shape_infer import (
+    maybe_record_stage_inputs,
+    maybe_warmup_stages
+)
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
@@ -671,6 +674,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             report_duration(DURATION_CHECKPOINT_LOADING, time.time() - _ckpt_load_start,
                             checkpoint_loading_type=_ckpt_loading_type)
             report_event(EVENT_CHECKPOINT_LOADING_DONE)
+
+        maybe_warmup_stages(
+            self.model_parts,
+            job_config
+        )
 
         logger.info(f"Training starts at step {self.step + 1}")
 

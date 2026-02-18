@@ -13,6 +13,7 @@ This module provides functionality to:
    runtime _shape_inference (which runs a full dummy forward pass across all ranks).
 """
 
+import gc
 import json
 import os
 import types
@@ -38,6 +39,22 @@ def _metadata_to_meta_tensor(metadata: dict[str, Any]) -> torch.Tensor:
     dtype_str = metadata["dtype"]
     dtype = getattr(torch, dtype_str.split(".")[-1])
     return torch.empty(metadata["shape"], dtype=dtype, device="meta")
+
+def _metadata_to_tensor(metadata: dict[str, Any]) -> torch.Tensor:
+    """Create a zero tensor from metadata."""
+    dtype_str = metadata["dtype"]
+    # Parse dtype string like "torch.float32" to actual dtype
+    dtype = getattr(torch, dtype_str.split(".")[-1])
+
+    device_str = metadata["device"]
+
+    # Use zeros to support all dtypes including integer types (e.g. torch.int64)
+    tensor = torch.zeros(metadata["shape"], dtype=dtype, device=device_str)
+    # Enable gradient tracking for compile warmup
+    if dtype.is_floating_point:
+        tensor.requires_grad = True
+
+    return tensor
 
 
 def _serialize_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -88,6 +105,21 @@ def _deserialize_as_meta(metadata: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         if entry is not None
     )
 
+def _deserialize_args(metadata: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Deserialize metadata to synthetic tensors."""
+    args = tuple(
+        _metadata_to_tensor(arg_meta) if arg_meta is not None else None
+        for arg_meta in metadata["args"]
+    )
+    kwargs = {
+        k: _metadata_to_tensor(v_meta) if v_meta is not None else None
+        for k, v_meta in metadata["kwargs"].items()
+    }
+    # Filter out None values
+    args = tuple(arg for arg in args if arg is not None)
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+    return args, kwargs
 
 class StageInputRecorder:
     """
@@ -304,3 +336,104 @@ def maybe_record_stage_inputs(
         return None
 
     return recorder
+
+
+def maybe_warmup_stages(
+    model_parts: list[torch.nn.Module],
+    job_config,
+) -> None:
+    """
+    Warmup stages with recorded inputs if enabled in config.
+
+    Also warms up the loss function if it is compiled and this rank holds
+    the last pipeline stage.
+
+    Args:
+        model_parts: List of model parts to warmup
+        job_config: Job configuration
+        loss_fn: Optional loss function to warmup; only used when
+            pp_has_last_stage=True and "loss" is in compile.components
+        pp_has_last_stage: Whether this rank holds the last pipeline stage
+    """
+    if not job_config.leto.enable_stage_warmup:
+        return
+
+    if job_config.parallelism.pipeline_parallel_degree <= 1:
+        return
+
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    record_folder = os.path.join(
+        job_config.job.dump_folder, job_config.leto.stage_inputs_folder
+    )
+    record_path = os.path.join(record_folder, f"rank_{rank}.json")
+
+    warmup_stages(
+        model_parts,
+        record_path
+    )
+
+def warmup_stages(
+    model_parts: list[torch.nn.Module],
+    record_path: str
+) -> None:
+    """
+    Warmup stages by running forward pass with recorded synthetic inputs.
+
+    This helps torch.compile create the backward graph during forward pass,
+    warming up both forward and backward compilation.
+
+    Args:
+        model_parts: List of model parts (stage submodules) to warmup
+        record_path: Path to the JSON file with recorded input metadata
+        loss_fn: Optional compiled loss function to warmup (only used on the
+            rank that owns the last PP stage)
+        pp_has_last_stage: Whether this rank holds the last pipeline stage
+    """
+    if not os.path.exists(record_path):
+        logger.warning(
+            f"Stage input record file not found at {record_path}, skipping warmup"
+        )
+        return
+
+    # Load recorded inputs
+    with open(record_path, "r") as f:
+        data = json.load(f)
+
+    recorded_stages = data["stages"]
+
+    if len(recorded_stages) != len(model_parts):
+        logger.warning(
+            f"Mismatch between recorded stages ({len(recorded_stages)}) "
+            f"and model_parts ({len(model_parts)}). This may happen if pipeline "
+            f"configuration changed. Skipping warmup."
+        )
+        return
+
+    logger.info(f"Starting stage warmup for {len(model_parts)} model_parts...")
+
+    for stage_idx, (model_part, stage_metadata) in enumerate(
+        zip(model_parts, recorded_stages)
+    ):
+        if stage_metadata is None:
+            logger.warning(f"No recorded inputs for stage {stage_idx}, skipping")
+            continue
+
+        synthetic_args, synthetic_kwargs = _deserialize_args(stage_metadata)
+        try:
+            output = model_part(*synthetic_args, **synthetic_kwargs)
+            # if isinstance(output, torch.Tensor) and output.requires_grad:
+            #     output.sum().backward()
+            del synthetic_args, synthetic_kwargs, output
+        except Exception as e:
+            logger.error(f"Failed grad warmup for stage {stage_idx}: {e}")
+            raise
+
+        # model_part.zero_grad(set_to_none=True)
+
+    torch.cuda.synchronize()
+    gc.collect()
+    # Final cleanup
+    torch.cuda.empty_cache()
+
+    logger.info("Stage warmup completed successfully")

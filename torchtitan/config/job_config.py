@@ -1025,6 +1025,9 @@ class Leto:
     (which runs a full dummy forward pass across all PP ranks on the first step).
     Requires a prior run with enable_stage_input_record=True."""
 
+    enable_stage_warmup: bool = False
+    """Warmup stages with recorded inputs before training starts"""
+
     stage_inputs_folder: str = "stage_inputs"
     """Folder to save/load recorded stage shape metadata (relative to dump_folder)."""
 
