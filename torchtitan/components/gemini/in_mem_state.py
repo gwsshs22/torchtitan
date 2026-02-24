@@ -8,31 +8,14 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
 from torchtitan.components.gemini.snapshot_container import SnapshotContainer
-from torchtitan.components.gemini.utils import (
-    InMemStateType,
+from torchtitan.components.gemini.utils import InMemStateType
+from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import (
+    _to_local_tensor,
+    _to_dtensor,
     stateful_to_state_dict,
     state_dict_to_stateful
 )
-from torchtitan.tools.logging import logger
-
-def _to_local_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
-    if isinstance(tensor, DTensor):
-        return tensor.to_local()
-    return tensor
-
-def _to_dtensor(
-    local_tensor: torch.Tensor,
-    reference_tensor: torch.Tensor | DTensor
-) -> torch.Tensor | DTensor:
-    if isinstance(reference_tensor, DTensor):
-        return DTensor.from_local(
-            local_tensor,
-            device_mesh=reference_tensor.device_mesh,
-            placements=reference_tensor.placements,
-            run_check=False  # Skip global shape checks for efficiency
-        )
-    else:
-        return local_tensor
 
 class InMemState:
 
@@ -189,10 +172,6 @@ class InMemState:
             cpu_metadata=self._cpu_metadata_state_dict,
         )
 
-        # for k, tensor in self._optimizers.state_dict().items():
-        #     if k.endswith(".step"):
-        #         print(f"{k}={tensor}")
-
     def get_block(self, block_id: int) -> torch.Tensor:
         """Get a tensor block by ID from the CPU tensor blocks."""
         assert self._tensor_blocks is not None, "Must call compute_tensor_blocks first"
@@ -222,13 +201,13 @@ class InMemState:
         # Manually setting "*.step" values to avoid handle such a small tensors.
         for k, tensor in optim_state_dict.items():
             if k.endswith(".step"):
-                cpu_tensor = torch.tensor(checkpointed_step + 1, dtype=tensor.dtype, device="cpu")
+                cpu_tensor = torch.tensor(checkpointed_step, dtype=tensor.dtype, device="cpu")
                 optim_new_state_dict[k] = _to_dtensor(cpu_tensor, tensor)
 
 
         for k, tensor in optim_state_dict.items():
             if k.endswith(".step"):
-                cpu_tensor = torch.tensor(checkpointed_step + 1, dtype=tensor.dtype, device="cpu")
+                cpu_tensor = torch.tensor(checkpointed_step, dtype=tensor.dtype, device="cpu")
                 optim_new_state_dict[k] = _to_dtensor(cpu_tensor, tensor)
 
         self._optimizers.load_state_dict(optim_new_state_dict)

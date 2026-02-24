@@ -10,12 +10,59 @@ import subprocess
 import time
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Generator, Optional
+from typing import Generator, Optional, Any
 
 import torch
 from torch._utils import _get_available_device_type, _get_device_module
+from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor
 
 from torchtitan.tools.logging import logger
+
+def _to_local_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+def _to_dtensor(
+    local_tensor: torch.Tensor,
+    reference_tensor: torch.Tensor | DTensor
+) -> torch.Tensor | DTensor:
+    if isinstance(reference_tensor, DTensor):
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=reference_tensor.device_mesh,
+            placements=reference_tensor.placements,
+            run_check=False  # Skip global shape checks for efficiency
+        )
+    else:
+        return local_tensor
+
+
+def stateful_to_state_dict(
+    states: dict[str, Any],
+) -> dict[str, Any]:
+    state_dict = {}
+    for key, elem in states.items():
+        if isinstance(elem, Stateful):
+            state_dict[key] = elem.state_dict()
+        else:
+            state_dict[key] = elem
+
+    return state_dict
+
+
+def state_dict_to_stateful(
+    states: dict[str, Any],
+    state_dict: dict[str, Any],
+) -> None:
+    for key, elem in states.items():
+        if key not in state_dict:
+            continue
+        if isinstance(elem, Stateful):
+            elem.load_state_dict(state_dict[key])
+        else:
+            states[key] = state_dict[key]
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:

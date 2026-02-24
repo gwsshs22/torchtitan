@@ -513,7 +513,10 @@ class Transformer(ModelProtocol):
         """
         buffer_device = buffer_device or self.freqs_cis.device
         with torch.device(buffer_device):
-            self.freqs_cis = self._precompute_freqs_cis()
+            if self.freqs_cis is not None: 
+                self.freqs_cis.copy_(self._precompute_freqs_cis())
+            else:
+                self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():

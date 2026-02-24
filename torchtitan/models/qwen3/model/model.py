@@ -482,7 +482,10 @@ class Qwen3Model(ModelProtocol):
         """
         buffer_device = buffer_device or self.rope_cache.device
         with torch.device(buffer_device):
-            self.rope_cache = self._precompute_rope_cache()
+            if self.rope_cache is not None:
+                self.rope_cache.copy_(self._precompute_rope_cache())
+            else:
+                self.rope_cache = self._precompute_rope_cache()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():

@@ -49,6 +49,7 @@ class SnapshotExecutor:
         block_size: int = 4 * 1024 * 1024,  # 4M elements default
         fsdp_process_group: dist.ProcessGroup | None = None,
         mem_fs_folder: str = "",
+        rmp_restored: bool = False,
         # Strategy computation parameters
         bandwidth_gbps: float = 50.0,  # Per-GPU Network bandwidth in Gbps
         gap_threshold_ms: float = 3.0,  # Minimum gap to consider (ms)
@@ -58,12 +59,15 @@ class SnapshotExecutor:
         if not self.enable:
             return
         assert mem_fs_folder != ""
+        self.model_wrapper = model_wrapper
         self.optimizers = optimizers
         self.states = states
         self.block_size = block_size
         self.comm_gaps_folder = comm_gaps_folder
         self.mem_fs_folder = mem_fs_folder
         os.makedirs(self.mem_fs_folder, exist_ok=True)
+
+        self.rmp_restored = rmp_restored
 
         # Strategy parameters
         self._bandwidth_gbps = bandwidth_gbps
@@ -161,9 +165,36 @@ class SnapshotExecutor:
     def load(self, step) -> bool:
         if not self.enable:
             return False
-        loaded = True
+        self.model_wrapper.reset_cached_state_dict()
+
 
         self.local_curr.init_cpu_tensors()
+
+        loaded = False
+        if not self.rmp_restored:
+            loaded = self._load_snapshot()
+            if not loaded:
+                # Manually reset .step values in the optimizer states if not loaded.
+                for k, v in self.optimizers.state_dict().items():
+                    if k.endswith(".step") and isinstance(v, torch.Tensor):
+                        assert v.numel() == 1, f"Expected .step to be a single scalar tensor, got {v.shape}"
+                        v.zero_()
+
+        self.local_prev.init_cpu_tensors()
+        self.remote_curr.init_cpu_tensors()
+        self.remote_prev.init_cpu_tensors()
+
+        self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)
+        self.remote_prev.compute_tensor_blocks(self.block_size)
+
+        self._total_blocks = len(self._gpu_blocks)
+        self._block_sizes = [t.numel() for t in self._gpu_blocks]
+        self._load_gaps_and_compute_strategy()
+        self._init_sendrecv() # Warmup
+        return loaded
+
+    def _load_snapshot(self):
+        loaded = True
         load_action = self.snapshot_group.get_checkpoint_load_action(self.has_checkpoint)
         if load_action == CheckpointLoadAction.NONE:
             loaded = False
@@ -188,18 +219,6 @@ class SnapshotExecutor:
         else:
             loaded_step = 1
         self.snapshot_group.validate_steps(loaded_step)
-
-        self.local_prev.init_cpu_tensors()
-        self.remote_curr.init_cpu_tensors()
-        self.remote_prev.init_cpu_tensors()
-
-        self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)
-        self.remote_prev.compute_tensor_blocks(self.block_size)
-
-        self._total_blocks = len(self._gpu_blocks)
-        self._block_sizes = [t.numel() for t in self._gpu_blocks]
-        self._load_gaps_and_compute_strategy()
-        self._init_sendrecv() # Warmup
         return loaded
 
     def _load_gaps_and_compute_strategy(self):
@@ -308,15 +327,6 @@ class SnapshotExecutor:
             cpu_block.copy_(output_tensor, non_blocking=True)
 
         self._cur_block_id += 1
-
-    def _sendrecv_tensor(self, input_tensor, output_tensor):
-        ops = [
-            dist.P2POp(dist.isend, input_tensor, self._peer_global_rank),
-            dist.P2POp(dist.irecv, output_tensor, self._peer_global_rank),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
 
     def maybe_wait_for_staging(self):
         if not self.enable:

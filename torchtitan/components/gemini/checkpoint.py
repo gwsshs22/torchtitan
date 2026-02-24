@@ -88,6 +88,7 @@ class GeminiCheckpointManager:
         base_folder: str = "",
         ft_manager: FTManager | None = None,
         parallel_dims: ParallelDims | None = None,
+        rmp_restored: bool = False,
     ) -> None:
         self.interval = checkpoint_config.interval
         self.enable = checkpoint_config.enable
@@ -125,7 +126,8 @@ class GeminiCheckpointManager:
             optimizers=self.optimizers,
             comm_gaps_folder=comm_gaps_folder,
             fsdp_process_group=fsdp_pg,
-            mem_fs_folder=checkpoint_config.gemini_mem_fs_folder
+            mem_fs_folder=checkpoint_config.gemini_mem_fs_folder,
+            rmp_restored=rmp_restored
         )
 
         if checkpoint_config.gemini_profile_comm_gaps:

@@ -30,6 +30,7 @@ from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
+from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.components.skip_shape_infer import (
     maybe_record_stage_inputs,
     maybe_warmup_stages
@@ -208,13 +209,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # move sharded model to CPU/GPU and initialize weights via DTensor
         if job_config.checkpoint.create_seed_checkpoint:
             init_device = "cpu"
-            buffer_device = None
+            self.buffer_device = None
         elif job_config.training.enable_cpu_offload:
             init_device = "cpu"
-            buffer_device = device_type
+            self.buffer_device = device_type
         else:
             init_device = device_type
-            buffer_device = None
+            self.buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(
             job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
@@ -275,12 +276,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # model_parts is used instead
             del model
 
-            for m in self.model_parts:
-                m.to_empty(device=init_device)
-                with torch.no_grad():
-                    # pyrefly: ignore [not-callable]
-                    m.init_weights(buffer_device=buffer_device)
-                m.train()
+            if not job_config.leto.enable_rmp:
+                for m in self.model_parts:
+                    m.to_empty(device=init_device)
+                    with torch.no_grad():
+                        # pyrefly: ignore [not-callable]
+                        m.init_weights(buffer_device=self.buffer_device)
+                    m.train()
 
             # confirm that user will be able to view loss metrics on the console
             # pyrefly: ignore [bad-argument-type]
@@ -289,11 +291,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
             model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
 
-            model.to_empty(device=init_device)
-            with torch.no_grad():
-                # pyrefly: ignore [not-callable]
-                model.init_weights(buffer_device=buffer_device)
-            model.train()
+            if not job_config.leto.enable_rmp:
+                model.to_empty(device=init_device)
+                with torch.no_grad():
+                    # pyrefly: ignore [not-callable]
+                    model.init_weights(buffer_device=self.buffer_device)
+                model.train()
 
             self.model_parts = [model]
 
@@ -321,6 +324,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
             self.optimizers, job_config.lr_scheduler, job_config.training.steps
         )
+
+        # Initialize trainer states that will be saved in checkpoint.
+        # These attributes must be initialized before checkpoint loading.
+        self.step = 0
+        self.ntokens_seen = 0
+
+        self.rmp_manager = RmpManager(
+            leto_config=job_config.leto,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            states={"train_state": self},
+            lr_schedulers=self.lr_schedulers,
+            dataloader=self.dataloader,
+            device=self.device,
+        )
+
+        self.rmp_restored = self.rmp_manager.maybe_init(self.buffer_device)
+
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
         # where it issues a single all-reduce for all parameters at once for better performance
@@ -332,10 +353,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
 
-        # Initialize trainer states that will be saved in checkpoint.
-        # These attributes must be initialized before checkpoint loading.
-        self.step = 0
-        self.ntokens_seen = 0
 
         ckpt_cls = CheckpointManager
         if job_config.checkpoint.use_gemini:
@@ -345,6 +362,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ckpt_extra_kwargs = {}
         if job_config.checkpoint.use_gemini:
             ckpt_extra_kwargs["parallel_dims"] = parallel_dims
+            ckpt_extra_kwargs["rmp_restored"] = self.rmp_restored
 
         self.checkpointer = ckpt_cls(
             dataloader=self.dataloader,
@@ -747,6 +765,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
+
+                self.rmp_manager.maybe_commit()
 
                 # Run validation if validator is available
                 if (

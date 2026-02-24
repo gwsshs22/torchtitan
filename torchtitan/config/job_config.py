@@ -1031,6 +1031,12 @@ class Leto:
     stage_inputs_folder: str = "stage_inputs"
     """Folder to save/load recorded stage shape metadata (relative to dump_folder)."""
 
+    enable_rmp: bool = False
+    """Enable RMP (Remote Memory Provider) for shared GPU memory across processes."""
+
+    rmp_server_port: int = 50051
+    """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
+
 @dataclass
 class JobConfig:
     """

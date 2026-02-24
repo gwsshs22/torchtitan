@@ -559,14 +559,20 @@ class MoE(nn.Module):
             self.shared_experts.init_weights(init_std)
 
         with torch.device(buffer_device):
-            self.tokens_per_expert = torch.zeros(
-                self.experts.num_experts, dtype=torch.float32
-            )
-            if self.load_balance_coeff is not None:
-                # pyrefly: ignore[bad-assignment]
-                self.expert_bias = torch.zeros(
+            if self.tokens_per_expert is not None:
+                self.tokens_per_expert.zero_()
+            else:
+                self.tokens_per_expert = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+            if self.load_balance_coeff is not None:
+                # pyrefly: ignore[bad-assignment]
+                if self.expert_bias is not None:
+                    self.expert_bias.zero_()
+                else:
+                    self.expert_bias = torch.zeros(
+                        self.experts.num_experts, dtype=torch.float32
+                    )
 
 
 def build_moe(

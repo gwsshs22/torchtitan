@@ -109,6 +109,8 @@ class ModelWrapper(Stateful):
         # we will need to reinitialize the cache_state_dict.
         self.cache_state_dict = self._get_state_dict()
 
+    def reset_cached_state_dict(self) -> None:
+        self.cache_state_dict = self._get_state_dict()
 
 class Terminate:
     pass
