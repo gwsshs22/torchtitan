@@ -6,6 +6,20 @@
 
 from importlib.metadata import version
 
+# Monkey-patch to support meta device in fused optimizer operations
+import torch.utils._foreach_utils as _foreach_utils
+import torch.optim.optimizer as _optimizer_module
+
+_orig_get_fused_kernels_supported_devices = _foreach_utils._get_fused_kernels_supported_devices
+
+def _patched_get_fused_kernels_supported_devices():
+    """Add 'meta' device support for fused optimizer operations."""
+    return _orig_get_fused_kernels_supported_devices() + ["meta"]
+
+# Patch both the source module and the optimizer module's imported reference
+_foreach_utils._get_fused_kernels_supported_devices = _patched_get_fused_kernels_supported_devices
+_optimizer_module._get_fused_kernels_supported_devices = _patched_get_fused_kernels_supported_devices
+
 # Import to register quantization modules.
 import torchtitan.components.quantization  # noqa: F401
 

@@ -1031,6 +1031,8 @@ class Leto:
     stage_inputs_folder: str = "stage_inputs"
     """Folder to save/load recorded stage shape metadata (relative to dump_folder)."""
 
+    enable_rmp: bool = False
+
 @dataclass
 class JobConfig:
     """

@@ -14,9 +14,28 @@ from typing import Generator, Optional
 
 import torch
 from torch._utils import _get_available_device_type, _get_device_module
+from torch.distributed.tensor import DTensor
 
 from torchtitan.tools.logging import logger
 
+def _to_local_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+def _to_dtensor(
+    local_tensor: torch.Tensor,
+    reference_tensor: torch.Tensor | DTensor
+) -> torch.Tensor | DTensor:
+    if isinstance(reference_tensor, DTensor):
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=reference_tensor.device_mesh,
+            placements=reference_tensor.placements,
+            run_check=False  # Skip global shape checks for efficiency
+        )
+    else:
+        return local_tensor
 
 def has_cuda_capability(major: int, minor: int) -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
