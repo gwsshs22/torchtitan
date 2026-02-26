@@ -165,14 +165,21 @@ class SnapshotExecutor:
     def load(self, step) -> bool:
         if not self.enable:
             return False
+
+        rank = self.snapshot_group._global_rank
+        load_start = time.monotonic()
+
         self.model_wrapper.reset_cached_state_dict()
 
-
+        t0 = time.monotonic()
         self.local_curr.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{rank}] local_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         loaded = False
         if not self.rmp_restored:
+            t0 = time.monotonic()
             loaded = self._load_snapshot()
+            logger.info(f"[Gemini Load R{rank}] _load_snapshot: {time.monotonic() - t0:.3f}s (loaded={loaded})")
             if not loaded:
                 # Manually reset .step values in the optimizer states if not loaded.
                 for k, v in self.optimizers.state_dict().items():
@@ -180,45 +187,83 @@ class SnapshotExecutor:
                         assert v.numel() == 1, f"Expected .step to be a single scalar tensor, got {v.shape}"
                         v.zero_()
 
+        t0 = time.monotonic()
         self.local_prev.init_cpu_tensors()
-        self.remote_curr.init_cpu_tensors()
-        self.remote_prev.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{rank}] local_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
+        t0 = time.monotonic()
+        self.remote_curr.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{rank}] remote_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
+        self.remote_prev.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{rank}] remote_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
         self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)
         self.remote_prev.compute_tensor_blocks(self.block_size)
+        logger.info(f"[Gemini Load R{rank}] compute_tensor_blocks: {time.monotonic() - t0:.3f}s")
 
         self._total_blocks = len(self._gpu_blocks)
         self._block_sizes = [t.numel() for t in self._gpu_blocks]
+
+        t0 = time.monotonic()
         self._load_gaps_and_compute_strategy()
+        logger.info(f"[Gemini Load R{rank}] _load_gaps_and_compute_strategy: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
         self._init_sendrecv() # Warmup
+        logger.info(f"[Gemini Load R{rank}] _init_sendrecv: {time.monotonic() - t0:.3f}s")
+
+        logger.info(f"[Gemini Load R{rank}] total load time: {time.monotonic() - load_start:.3f}s")
         return loaded
 
     def _load_snapshot(self):
+        rank = self.snapshot_group._global_rank
         loaded = True
+
+        t0 = time.monotonic()
         load_action = self.snapshot_group.get_checkpoint_load_action(self.has_checkpoint)
+        logger.info(f"[Gemini Load R{rank}] get_checkpoint_load_action: {time.monotonic() - t0:.3f}s, action={load_action}")
+
         if load_action == CheckpointLoadAction.NONE:
             loaded = False
         elif load_action == CheckpointLoadAction.LOCAL:
-            self.local_curr.load_state_dict(
-                torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
-            )
+            t0 = time.monotonic()
+            ckpt = torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
+            logger.info(f"[Gemini Load R{rank}] torch.load (LOCAL): {time.monotonic() - t0:.3f}s")
+            t0 = time.monotonic()
+            self.local_curr.load_state_dict(ckpt)
+            logger.info(f"[Gemini Load R{rank}] load_state_dict (LOCAL): {time.monotonic() - t0:.3f}s")
         elif load_action == CheckpointLoadAction.SEND:
-            self.local_curr.load_state_dict(
-                torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
-            )
+            t0 = time.monotonic()
+            ckpt = torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
+            logger.info(f"[Gemini Load R{rank}] torch.load (SEND): {time.monotonic() - t0:.3f}s")
+            t0 = time.monotonic()
+            self.local_curr.load_state_dict(ckpt)
+            logger.info(f"[Gemini Load R{rank}] load_state_dict (SEND): {time.monotonic() - t0:.3f}s")
+            t0 = time.monotonic()
             self.snapshot_group.send_checkpoint(self.remote_checkpoint_path)
+            logger.info(f"[Gemini Load R{rank}] send_checkpoint: {time.monotonic() - t0:.3f}s")
         elif load_action == CheckpointLoadAction.RECV:
-            self.local_curr.load_state_dict(
-                self.snapshot_group.recv_checkpoint(self.tmp_checkpoint_path)
-            )
+            t0 = time.monotonic()
+            ckpt = self.snapshot_group.recv_checkpoint(self.tmp_checkpoint_path)
+            logger.info(f"[Gemini Load R{rank}] recv_checkpoint: {time.monotonic() - t0:.3f}s")
+            t0 = time.monotonic()
+            self.local_curr.load_state_dict(ckpt)
+            logger.info(f"[Gemini Load R{rank}] load_state_dict (RECV): {time.monotonic() - t0:.3f}s")
         else:
             raise ValueError(f"Unknown load action: {load_action}")
+
         if loaded:
             loaded_step = self.states["train_state"].step
-            logger.info(f"Loaded checkpoint at step {loaded_step}, load_action={load_action}")
+            logger.info(f"[Gemini Load R{rank}] Loaded checkpoint at step {loaded_step}, load_action={load_action}")
         else:
             loaded_step = 1
+
+        t0 = time.monotonic()
         self.snapshot_group.validate_steps(loaded_step)
+        logger.info(f"[Gemini Load R{rank}] validate_steps: {time.monotonic() - t0:.3f}s")
         return loaded
 
     def _load_gaps_and_compute_strategy(self):
@@ -250,7 +295,8 @@ class SnapshotExecutor:
 
     def _init_sendrecv(self):
         with torch.cuda.stream(self._p2p_stream):
-            self.snapshot_group.sendrecv_tensor(self._gpu_buffers[0], self._gpu_buffers[1])
+            self.snapshot_group.warmup_p2p_pg(self._gpu_buffers[0], self._gpu_buffers[1])
+            torch.cuda.current_stream().synchronize()
 
     def _snapshot_background(self, cpu_metadata_state_dict):
         """Background thread: GPU→CPU copy + Gloo metadata exchange."""

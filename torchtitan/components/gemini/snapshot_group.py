@@ -44,9 +44,27 @@ class SnapshotGroup:
         # Gloo backend is required for send/recv_object_list
         self._gloo_pg = None
         self._p2p_pg = None
+        self._peer_p2p_rank = None
+
         if dist.is_initialized():
             self._gloo_pg = dist.new_group(backend="gloo")
-            self._p2p_pg = dist.new_group()
+
+            # Create 2-rank P2P subgroups (one per peer pair)
+            # All ranks must call new_group for every pair (it's a global collective)
+            my_pair = tuple(sorted([self._global_rank, self._peer_global_rank]))
+            all_pairs = [None] * self._global_world_size
+            dist.all_gather_object(all_pairs, my_pair, group=self._gloo_pg)
+            unique_pairs = sorted(set(all_pairs))
+
+            for pair in unique_pairs:
+                pg = dist.new_group(
+                    ranks=list(pair),
+                    device_id=torch.device("cuda", torch.cuda.current_device()),
+                )
+                if self._global_rank in pair:
+                    self._p2p_pg = pg
+
+            self._peer_p2p_rank = 1 - dist.get_rank(self._p2p_pg)
 
     @property
     def global_rank(self) -> int:
@@ -67,6 +85,9 @@ class SnapshotGroup:
     @property
     def peer_global_rank(self) -> int:
         return self._peer_global_rank
+
+    def warmup_p2p_pg(self, input_tensor, output_tensor):
+        self.sendrecv_tensor(input_tensor, output_tensor)
 
     def broadcast_strategy(self, strategy: dict) -> dict | None:
         strategy_list = [strategy]
@@ -104,8 +125,8 @@ class SnapshotGroup:
 
     def sendrecv_tensor(self, input_tensor, output_tensor):
         ops = [
-            dist.P2POp(dist.isend, input_tensor, self.peer_global_rank, group=self._p2p_pg),
-            dist.P2POp(dist.irecv, output_tensor, self.peer_global_rank, group=self._p2p_pg),
+            dist.P2POp(dist.isend, input_tensor, group_peer=self._peer_p2p_rank, group=self._p2p_pg),
+            dist.P2POp(dist.irecv, output_tensor, group_peer=self._peer_p2p_rank, group=self._p2p_pg),
         ]
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
