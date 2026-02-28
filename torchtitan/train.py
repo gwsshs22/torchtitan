@@ -737,7 +737,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ),
         ):
             # pyrefly: ignore [bad-argument-type]
-            data_iterator = self.batch_generator(self.dataloader)
+            self._data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 # [Leto] Time each iteration
                 _iter_start = time.time()
@@ -757,7 +757,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self._data_iterator)
                 except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
@@ -849,6 +849,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
     def close(self) -> None:
+        if hasattr(self, "_data_iterator") and self._data_iterator is not None:
+            self._data_iterator.close()
+            self._data_iterator = None
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:

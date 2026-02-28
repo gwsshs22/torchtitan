@@ -33,7 +33,7 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
 
 def _load_fineweb_dataset(dataset_path: str, split: str):
     """Load FineWeb dataset with default configuration."""
-    return load_dataset(dataset_path, name="sample-350BT", split="train", streaming=True)
+    return load_dataset(dataset_path, name="sample-10BT", split="train")
 
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
@@ -54,7 +54,7 @@ DATASETS = {
     ),
     "fineweb": DatasetConfig(
         path="HuggingFaceFW/fineweb",
-        loader=partial(_load_fineweb_dataset, split="validation"),
+        loader=partial(_load_fineweb_dataset, split="train"),
         sample_processor=_process_c4_text,
     ),
 }
