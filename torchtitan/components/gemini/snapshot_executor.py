@@ -300,6 +300,7 @@ class SnapshotExecutor:
 
     def _snapshot_background(self, cpu_metadata_state_dict):
         """Background thread: GPU→CPU copy + Gloo metadata exchange."""
+        torch.cuda.set_device(self._local_copy_stream.device)
         with torch.cuda.stream(self._local_copy_stream):
             self.local_curr.snapshot_gpu_state()
             self._local_copy_event.record()
