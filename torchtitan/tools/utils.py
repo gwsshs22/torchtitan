@@ -33,7 +33,9 @@ def _to_dtensor(
             local_tensor,
             device_mesh=reference_tensor.device_mesh,
             placements=reference_tensor.placements,
-            run_check=False  # Skip global shape checks for efficiency
+            run_check=False,  # Skip global shape checks for efficiency,
+            shape=reference_tensor.shape,    # <-- preserve original global shape
+            stride=reference_tensor.stride(), # <-- preserve original stride
         )
     else:
         return local_tensor
