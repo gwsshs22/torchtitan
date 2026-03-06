@@ -62,9 +62,9 @@ try:
         DURATION_WEIGHT_ALLOCATION,
     )
     _LETO_AVAILABLE = True
+    register_training_process(rank=int(os.environ["RANK"]))
 except ImportError:
     _LETO_AVAILABLE = False
-
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # core configs
@@ -152,6 +152,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
         model_args.update_from_config(job_config)
+
+        vocab_parallel_divisor = 128
+        if hasattr(model_args, 'vocab_size') and model_args.vocab_size % vocab_parallel_divisor != 0:
+            old_vocab_size = model_args.vocab_size
+            model_args.vocab_size = (
+                (old_vocab_size + vocab_parallel_divisor - 1) // vocab_parallel_divisor
+            ) * vocab_parallel_divisor
+            logger.info(
+                f"Padded vocab_size from {old_vocab_size} to {model_args.vocab_size} "
+                f"for even sharding (divisible by TP({parallel_dims.tp}) x FSDP({parallel_dims.dp_shard}))"
+            )
+
         self.model_args = model_args
 
         logger.info(
@@ -889,10 +901,6 @@ def main(trainer_class: type[Trainer]) -> None:
 
     try:
         trainer = trainer_class(config)
-
-        # Register training process with leto worker controller for fault injection and metrics
-        if _LETO_AVAILABLE:
-            register_training_process(rank=torch.distributed.get_rank())
 
         # TODO(local_tensor): Remove this special case once LocalTensor supports
         # init_weights() and foreach_allgather. In local tensor mode, skip
