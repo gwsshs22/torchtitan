@@ -359,6 +359,22 @@ class ParallelDims:
     def non_data_parallel_size(self):
         return self.cp * self.tp * self.pp
 
+    def get_batch_info(self, global_rank: int) -> tuple[int, int]:
+        """Compute batch_degree and batch_rank arithmetically without building meshes.
+
+        The dataloading mesh is unflattened from the world mesh as (pp, batch, cp, tp)
+        with last-dim-fastest (row-major) ordering, so:
+            batch_rank = (global_rank // (tp * cp)) % batch_degree
+
+        Returns:
+            (batch_degree, batch_rank)
+        """
+        batch_degree = self.dp_replicate * self.dp_shard
+        if batch_degree <= 1:
+            return 1, 0
+        batch_rank = (global_rank // (self.tp * self.cp)) % batch_degree
+        return batch_degree, batch_rank
+
     @property
     def seq_len_divisor(self):
         # Sequence Parallel requires that seq_len be divisible by TP degree.

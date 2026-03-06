@@ -114,39 +114,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.experimental.custom_import:
             importlib.import_module(job_config.experimental.custom_import)
 
+        # init distributed and build meshes
+        self.parallel_dims = parallel_dims = self.init_distributed()
+        global_rank = int(os.environ["RANK"])
+        
+        logger.info(f"Init distributed.")
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
-        # Device has to be set before creating TorchFT manager.
-        device_module.set_device(self.device)
-
-        # init distributed and build meshes
-        self.parallel_dims = parallel_dims = self.init_distributed()
-        logger.info(f"Init distributed.")
-
-        if parallel_dims.dp_enabled:
-            batch_mesh = parallel_dims.get_mesh("batch")
-            batch_degree, batch_rank = batch_mesh.size(), batch_mesh.get_local_rank()
-        else:
-            batch_degree, batch_rank = 1, 0
-
+        batch_degree, batch_rank = parallel_dims.get_batch_info(global_rank)
         # pyrefly: ignore [bad-argument-type]
         self.ft_manager = FTManager(job_config.fault_tolerance)
         batch_degree, batch_rank = self.ft_manager.get_dp_info(batch_degree, batch_rank)
-
+    
         # take control of garbage collection to avoid stragglers
         self.gc_handler = utils.GarbageCollection(
             gc_freq=job_config.training.gc_freq, debug=job_config.training.gc_debug
         )
 
-        # Set random seed, and maybe enable deterministic mode
-        # (mainly for debugging, expect perf loss).
-        dist_utils.set_determinism(
-            parallel_dims,
-            self.device,
-            job_config.debug,
-            distinct_seed_mesh_dims=["pp"],
-        )
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
         # build tokenizer and dataloader
@@ -206,17 +191,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
         )
 
-        # move sharded model to CPU/GPU and initialize weights via DTensor
-        if job_config.checkpoint.create_seed_checkpoint:
-            init_device = "cpu"
-            self.buffer_device = None
-        elif job_config.training.enable_cpu_offload:
-            init_device = "cpu"
-            self.buffer_device = device_type
-        else:
-            init_device = device_type
-            self.buffer_device = None
-
         self.loss_fn = self.train_spec.build_loss_fn(
             job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
         )
@@ -245,6 +219,53 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.loss_fn = rescale_accumulated_loss(
             self.loss_fn, self.gradient_accumulation_steps
         )
+
+        loss_parallel_enabled = (
+            parallel_dims.tp_enabled
+            and not job_config.parallelism.disable_loss_parallel
+        )
+        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
+        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
+            parallel_dims,
+            job_config.training.mixed_precision_param,
+            device_type,
+        )
+
+        if job_config.checkpoint.use_gemini:
+            self.checkpointer = GeminiCheckpointManager(
+                dataloader=self.dataloader,
+                states={"train_state": self},
+                checkpoint_config=job_config.checkpoint,
+                base_folder=job_config.job.dump_folder,
+            )
+
+        if job_config.leto.enable_standby:
+            self._init_standby_mode()
+            return
+
+        # Device has to be set before creating TorchFT manager.
+        device_module.set_device(self.device)
+
+        # Set random seed, and maybe enable deterministic mode
+        # (mainly for debugging, expect perf loss).
+        dist_utils.set_determinism(
+            parallel_dims,
+            self.device,
+            job_config.debug,
+            distinct_seed_mesh_dims=["pp"],
+        )
+
+
+        # move sharded model to CPU/GPU and initialize weights via DTensor
+        if job_config.checkpoint.create_seed_checkpoint:
+            init_device = "cpu"
+            self.buffer_device = None
+        elif job_config.training.enable_cpu_offload:
+            init_device = "cpu"
+            self.buffer_device = device_type
+        else:
+            init_device = device_type
+            self.buffer_device = None
 
         # apply parallelisms and initialization
         # [Leto] Start timing weight allocation and init
@@ -354,46 +375,33 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.metrics_processor.model_parts = self.model_parts
 
 
-        ckpt_cls = CheckpointManager
         if job_config.checkpoint.use_gemini:
-            ckpt_cls = GeminiCheckpointManager
-            assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
-
-        ckpt_extra_kwargs = {}
-        if job_config.checkpoint.use_gemini:
-            ckpt_extra_kwargs["parallel_dims"] = parallel_dims
-            ckpt_extra_kwargs["rmp_restored"] = self.rmp_restored
-
-        self.checkpointer = ckpt_cls(
-            dataloader=self.dataloader,
-            model_parts=self.model_parts,
-            optimizers=self.optimizers,
-            lr_schedulers=self.lr_schedulers,
-            states={"train_state": self},
-            checkpoint_config=job_config.checkpoint,
-            sd_adapter=(
-                # pyrefly: ignore[bad-instantiation]
-                self.train_spec.state_dict_adapter(
-                    model_args, job_config.model.hf_assets_path
-                )
-                if self.train_spec.state_dict_adapter
-                else None
-            ),
-            base_folder=job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
-            **ckpt_extra_kwargs,
-        )
-
-        loss_parallel_enabled = (
-            parallel_dims.tp_enabled
-            and not job_config.parallelism.disable_loss_parallel
-        )
-        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
-        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
-            parallel_dims,
-            job_config.training.mixed_precision_param,
-            device_type,
-        )
+            self.checkpointer.lazy_init(
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                rmp_restored=self.rmp_restored,
+                parallel_dims=self.parallel_dims
+            )
+        else:
+            self.checkpointer = CheckpointManager(
+                dataloader=self.dataloader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states={"train_state": self},
+                checkpoint_config=job_config.checkpoint,
+                sd_adapter=(
+                    # pyrefly: ignore[bad-instantiation]
+                    self.train_spec.state_dict_adapter(
+                        model_args, job_config.model.hf_assets_path
+                    )
+                    if self.train_spec.state_dict_adapter
+                    else None
+                ),
+                base_folder=job_config.job.dump_folder,
+                ft_manager=self.ft_manager,
+            )
 
         # Build validator if validation is configured
         if job_config.validation.enable:
@@ -433,6 +441,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"total steps {job_config.training.steps} "
             f"(warmup {job_config.lr_scheduler.warmup_steps})"
         )
+
+    def _init_standby_mode(self):
+        pass
 
     def init_distributed(self) -> ParallelDims:
         job_config = self.job_config

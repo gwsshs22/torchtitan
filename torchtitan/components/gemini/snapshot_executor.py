@@ -42,56 +42,79 @@ class SnapshotExecutor:
     def __init__(
         self,
         enable: bool,
-        states: dict,
-        model_wrapper,
-        optimizers,
         comm_gaps_folder: str,
         block_size: int = 4 * 1024 * 1024,  # 4M elements default
-        fsdp_process_group: dist.ProcessGroup | None = None,
         mem_fs_folder: str = "",
-        rmp_restored: bool = False,
         # Strategy computation parameters
         bandwidth_gbps: float = 50.0,  # Per-GPU Network bandwidth in Gbps
         gap_threshold_ms: float = 3.0,  # Minimum gap to consider (ms)
-        min_p2p_time_ms: float = 0.2
+        min_p2p_time_ms: float = 0.2,
     ):
         self.enable = enable
         if not self.enable:
             return
+
         assert mem_fs_folder != ""
-        self.model_wrapper = model_wrapper
-        self.optimizers = optimizers
-        self.states = states
         self.block_size = block_size
         self.comm_gaps_folder = comm_gaps_folder
         self.mem_fs_folder = mem_fs_folder
         os.makedirs(self.mem_fs_folder, exist_ok=True)
-
-        self.rmp_restored = rmp_restored
 
         # Strategy parameters
         self._bandwidth_gbps = bandwidth_gbps
         self._gap_threshold_ms = gap_threshold_ms
         self._min_p2p_time_ms = min_p2p_time_ms
 
-        self._fsdp_pg = fsdp_process_group
-        self.snapshot_group = SnapshotGroup(self._fsdp_pg)
+        self._curr_version = CURR
+        self._cur_block_id = 0
+        self._comm_gap_id = 0
 
-        self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_local.pt"
-        self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_remote.pt"
-        self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_tmp.pt"
-        self.container_log_path = f"{self.mem_fs_folder}/rank_{self.snapshot_group._global_rank}_log.txt"
+        self._snapshot_strategy: dict[int, int] = {}
+        self._have_strategy = False
+        self._gpu_buffer_id = 0
+
+        # Track if we're in a snapshot step
+        self._is_snapshot_step = False
+        self._snapshot_future: Future | None = None
+
+        self._global_rank = int(os.environ["RANK"])
+        self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_local.pt"
+        self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_remote.pt"
+        self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_tmp.pt"
+        self.container_log_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_log.txt"
+
+        self.has_checkpoint = os.path.exists(self.local_checkpoint_path) and os.path.exists(
+            self.remote_checkpoint_path
+        )
 
         self.snapshot_container = SnapshotContainer(
             self.local_checkpoint_path,
             self.remote_checkpoint_path,
             self.container_log_path,
-            self.snapshot_group._global_rank
+            self._global_rank,
         )
 
-        self.has_checkpoint = os.path.exists(self.local_checkpoint_path) and os.path.exists(
-            self.remote_checkpoint_path
-        )
+        self._snapshot_thread_pool = ThreadPoolExecutor(max_workers=1)
+        self._snapshot_thread_pool.submit(lambda: None).result()
+
+    def lazy_init(
+        self,
+        states: dict,
+        model_wrapper,
+        optimizers,
+        fsdp_process_group: dist.ProcessGroup | None = None,
+        rmp_restored: bool = False,
+    ) -> None:
+        if not self.enable:
+            return
+
+        self.model_wrapper = model_wrapper
+        self.optimizers = optimizers
+        self.states = states
+        self.rmp_restored = rmp_restored
+
+        self._fsdp_pg = fsdp_process_group
+        self.snapshot_group = SnapshotGroup(self._fsdp_pg)
 
         sample_tensor = next(iter(model_wrapper.state_dict().values()))
         self._dtype_size = sample_tensor.element_size()
@@ -105,23 +128,15 @@ class SnapshotExecutor:
                     optimizers,
                     states,
                     state_type,
-                    self.snapshot_container
+                    self.snapshot_container,
                 ) for state_id in range(2)
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
 
-        self._curr_version = CURR
-        self._cur_block_id = 0
-        self._comm_gap_id = 0
-
-        self._snapshot_strategy: dict[int, int] = {}
-        self._have_strategy = False
-
         self._gpu_buffers = [
-            torch.zeros(block_size, dtype=sample_tensor.dtype, device="cuda"),
-            torch.zeros(block_size, dtype=sample_tensor.dtype, device="cuda"),
+            torch.zeros(self.block_size, dtype=sample_tensor.dtype, device="cuda"),
+            torch.zeros(self.block_size, dtype=sample_tensor.dtype, device="cuda"),
         ]
-        self._gpu_buffer_id = 0
 
         self._local_copy_stream = torch.cuda.Stream()
         self._copy_stream = torch.cuda.Stream()
@@ -130,13 +145,6 @@ class SnapshotExecutor:
 
         # Distributed setup - compute ranks within FSDP group
         self._peer_global_rank = self.snapshot_group.peer_global_rank
-
-        # Thread pool for async snapshot operations (Gloo exchange)
-        self._snapshot_thread_pool = ThreadPoolExecutor(max_workers=1)
-        self._snapshot_future: Future | None = None
-
-        # Track if we're in a snapshot step
-        self._is_snapshot_step = False
 
     @property
     def local_curr(self) -> InMemState:

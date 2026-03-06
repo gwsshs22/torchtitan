@@ -24,19 +24,25 @@ class SnapshotProfiler:
         enable: bool = False,
         skip_first_k: int = 5,
         output_folder: str = "",
-        fsdp_process_group: dist.ProcessGroup | None = None,
     ):
         self._enable = enable
         self._skip_first_k = skip_first_k
         self._output_folder = output_folder
 
-        # FSDP group info
-        self._fsdp_pg = fsdp_process_group
+        # FSDP group info (set in lazy_init)
+        self._fsdp_pg: dist.ProcessGroup | None = None
 
         # Profiling state
         self._step_count = 0
-        self._profiling_stream = torch.cuda.Stream()
+        self._profiling_stream: torch.cuda.Stream | None = None
         self._events: list[list[torch.cuda.Event]] = []
+
+    def lazy_init(
+        self,
+        fsdp_process_group: dist.ProcessGroup | None = None,
+    ) -> None:
+        self._fsdp_pg = fsdp_process_group
+        self._profiling_stream = torch.cuda.Stream()
 
     def _is_profiling(self) -> bool:
         """Check if we should profile this step."""

@@ -1037,6 +1037,8 @@ class Leto:
     rmp_server_port: int = 50051
     """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
 
+    enable_standby: bool = False
+
 @dataclass
 class JobConfig:
     """

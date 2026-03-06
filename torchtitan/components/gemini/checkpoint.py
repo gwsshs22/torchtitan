@@ -16,14 +16,10 @@ from torchtitan.components.checkpoint import (
     LR_SCHEDULER,
 )
 from torchtitan.components.dataloader import BaseDataLoader
-from torchtitan.components.ft import FTManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import Checkpoint as CheckpointConfig, TORCH_DTYPE_MAP
+from torchtitan.config import Checkpoint as CheckpointConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.protocols import BaseStateDictAdapter
-from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import GarbageCollection
 
 from torchtitan.components.gemini.snapshot_executor import SnapshotExecutor
 from torchtitan.components.gemini.snapshot_profiler import SnapshotProfiler
@@ -79,32 +75,45 @@ class GeminiCheckpointManager:
     def __init__(
         self,
         dataloader: BaseDataLoader | None,
-        model_parts: list[nn.Module],
-        optimizers: OptimizersContainer,
-        lr_schedulers: LRSchedulersContainer,
         states: dict[str, Any],
         checkpoint_config: CheckpointConfig,
-        sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
-        ft_manager: FTManager | None = None,
-        parallel_dims: ParallelDims | None = None,
-        rmp_restored: bool = False,
     ) -> None:
         self.interval = checkpoint_config.interval
         self.enable = checkpoint_config.enable
         self.skip_last_save = checkpoint_config.skip_last_save
 
-        self.model_wrapper = ModelWrapper(model_parts)
-        self.optimizers = optimizers
         self.states = states
-        self.states.update({
-            DATALOADER: dataloader,
-            LR_SCHEDULER: lr_schedulers
-        })
+        self.states[DATALOADER] = dataloader
+
+        self._checkpoint_config = checkpoint_config
 
         comm_gaps_folder = os.path.join(
             base_folder, checkpoint_config.gemini_comm_gaps_folder
         )
+
+        self._profiler = SnapshotProfiler(
+            enable=checkpoint_config.gemini_profile_comm_gaps,
+            skip_first_k=checkpoint_config.gemini_skip_first_k,
+            output_folder=comm_gaps_folder,
+        )
+        self._executor = SnapshotExecutor(
+            enable=not checkpoint_config.gemini_profile_comm_gaps,
+            comm_gaps_folder=comm_gaps_folder,
+            mem_fs_folder=checkpoint_config.gemini_mem_fs_folder,
+        )
+
+    def lazy_init(
+        self,
+        model_parts: list[nn.Module],
+        optimizers: OptimizersContainer,
+        lr_schedulers: LRSchedulersContainer,
+        parallel_dims: ParallelDims | None = None,
+        rmp_restored: bool = False,
+    ) -> None:
+        self.model_wrapper = ModelWrapper(model_parts)
+        self.optimizers = optimizers
+        self.states[LR_SCHEDULER] = lr_schedulers
 
         # Get FSDP process group from parallel_dims
         fsdp_pg = None
@@ -113,23 +122,16 @@ class GeminiCheckpointManager:
             if fsdp_mesh is not None:
                 fsdp_pg = fsdp_mesh.get_group()
 
-        self._profiler = SnapshotProfiler(
-            enable=checkpoint_config.gemini_profile_comm_gaps,
-            skip_first_k=checkpoint_config.gemini_skip_first_k,
-            output_folder=comm_gaps_folder,
-            fsdp_process_group=fsdp_pg,
-        )
-        self._executor = SnapshotExecutor(
-            enable=not checkpoint_config.gemini_profile_comm_gaps,
+        self._profiler.lazy_init(fsdp_process_group=fsdp_pg)
+        self._executor.lazy_init(
             states=self.states,
             model_wrapper=self.model_wrapper,
             optimizers=self.optimizers,
-            comm_gaps_folder=comm_gaps_folder,
             fsdp_process_group=fsdp_pg,
-            mem_fs_folder=checkpoint_config.gemini_mem_fs_folder,
-            rmp_restored=rmp_restored
+            rmp_restored=rmp_restored,
         )
 
+        checkpoint_config = self._checkpoint_config
         if checkpoint_config.gemini_profile_comm_gaps:
             self._gemini_all_gather = GeminiAllGather(self._profiler)
             self._gemini_reduce_scatter = GeminiReduceScatter(self._profiler)
