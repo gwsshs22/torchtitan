@@ -54,15 +54,18 @@ try:
         report_duration,
         register_training_process,
         get_checkpoint_loading_type,
+        poll_standby_status,
+        is_standby as leto_is_standby,
         EVENT_TRAINING_STARTED,
         EVENT_CHECKPOINT_LOADING_DONE,
         EVENT_STEP_DONE,
         DURATION_CHECKPOINT_LOADING,
         DURATION_ITERATION,
         DURATION_WEIGHT_ALLOCATION,
+        STANDBY_ACTION_ACTIVATE,
+        STANDBY_ACTION_TERMINATE,
     )
     _LETO_AVAILABLE = True
-    register_training_process(rank=int(os.environ["RANK"]))
 except ImportError:
     _LETO_AVAILABLE = False
 
@@ -117,7 +120,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
         global_rank = int(os.environ["RANK"])
-        
+
         logger.info(f"Init distributed.")
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
@@ -251,9 +254,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 base_folder=job_config.job.dump_folder,
             )
 
-        if job_config.leto.enable_standby:
-            self._init_standby_mode()
-            return
+        self._maybe_wait_for_resuming()
 
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
@@ -454,8 +455,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"(warmup {job_config.lr_scheduler.warmup_steps})"
         )
 
-    def _init_standby_mode(self):
-        pass
+    def _maybe_wait_for_resuming(self):
+        if not _LETO_AVAILABLE:
+            return
+        if not leto_is_standby():
+            return
+
+        logger.info("Entering standby mode - polling for activation...")
+        poll_interval = self.job_config.leto.standby_poll_interval
+        while True:
+            action = poll_standby_status()
+            if action == STANDBY_ACTION_ACTIVATE:
+                logger.info("Standby activated - resuming initialization")
+                return
+            elif action == STANDBY_ACTION_TERMINATE:
+                logger.info("Standby terminated")
+                import sys
+                sys.exit(0)
+            time.sleep(poll_interval)
 
     def init_distributed(self) -> ParallelDims:
         job_config = self.job_config
@@ -932,4 +949,6 @@ def main(trainer_class: type[Trainer]) -> None:
 
 
 if __name__ == "__main__":
+    if _LETO_AVAILABLE:
+            register_training_process(rank=int(os.environ["RANK"]))
     main(Trainer)

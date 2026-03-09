@@ -1034,10 +1034,11 @@ class Leto:
     enable_rmp: bool = False
     """Enable RMP (Remote Memory Provider) for shared GPU memory across processes."""
 
-    rmp_server_port: int = 50051
+    rmp_server_port: int = 52051
     """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
 
-    enable_standby: bool = False
+    standby_poll_interval: float = 0.5
+    """Polling interval in seconds for standby processes checking activation status."""
 
 @dataclass
 class JobConfig:

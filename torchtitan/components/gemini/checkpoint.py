@@ -111,6 +111,8 @@ class GeminiCheckpointManager:
         parallel_dims: ParallelDims | None = None,
         rmp_restored: bool = False,
     ) -> None:
+        assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
+
         self.model_wrapper = ModelWrapper(model_parts)
         self.optimizers = optimizers
         self.states[LR_SCHEDULER] = lr_schedulers

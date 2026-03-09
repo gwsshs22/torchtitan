@@ -83,9 +83,7 @@ class SnapshotExecutor:
         self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_tmp.pt"
         self.container_log_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_log.txt"
 
-        self.has_checkpoint = os.path.exists(self.local_checkpoint_path) and os.path.exists(
-            self.remote_checkpoint_path
-        )
+        self.has_checkpoint = self._check_has_checkpoint()
 
         self.snapshot_container = SnapshotContainer(
             self.local_checkpoint_path,
@@ -162,6 +160,11 @@ class SnapshotExecutor:
     def remote_prev(self) -> InMemState:
         return self.in_mem_states[REMOTE][1 - self._curr_version]
 
+    def _check_has_checkpoint(self) -> bool:
+        return os.path.exists(self.local_checkpoint_path) and os.path.exists(
+            self.remote_checkpoint_path
+        )
+
     def _swap_buffers(self):
         self._curr_version = 1 - self._curr_version
 
@@ -173,6 +176,10 @@ class SnapshotExecutor:
     def load(self, step) -> bool:
         if not self.enable:
             return False
+
+        # Re-check for checkpoint files (may have appeared since init,
+        # e.g. standby activated after active's SnapshotContainer dumped state)
+        self.has_checkpoint = self._check_has_checkpoint()
 
         rank = self.snapshot_group._global_rank
         load_start = time.monotonic()
