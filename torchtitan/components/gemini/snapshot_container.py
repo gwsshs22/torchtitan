@@ -1,6 +1,7 @@
+import logging
 import os
 import sys
-from pathlib import Path
+import queue
 import signal
 import time
 import gc
@@ -16,16 +17,42 @@ try:
     from leto.launch.worker_controller_client import (
         register_service_process,
         report_duration,
+        poll_service_action,
+        get_process_group_id,
         DURATION_CHECKPOINT_PERSISTING,
+        SERVICE_ACTION_PERSIST,
+        SERVICE_ACTION_CLOSE,
+        SERVICE_ACTION_WORKING,
     )
     _LETO_AVAILABLE = True
 except ImportError:
     _LETO_AVAILABLE = False
     register_service_process = None
     report_duration = None
+    poll_service_action = None
+    get_process_group_id = None
     DURATION_CHECKPOINT_PERSISTING = None
+    SERVICE_ACTION_PERSIST = None
+    SERVICE_ACTION_CLOSE = None
+    SERVICE_ACTION_WORKING = None
 
 _process_states = None
+logger = logging.getLogger(__name__)
+
+
+def _setup_subprocess_logger(log_dir: str, rank: int) -> None:
+    """Configure logging for the subprocess, writing to a file in log_dir."""
+    group_id = get_process_group_id() if _LETO_AVAILABLE else 0
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"snapshot_container_rank{rank}_group{group_id}.log")
+    handler = logging.FileHandler(log_path, mode='w')
+    handler.setFormatter(logging.Formatter(
+        f'%(asctime)s [SnapshotContainer rank={rank} group={group_id}] %(levelname)s - %(message)s'
+    ))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+
 
 class InMemStateView:
     """Holds references to shared memory tensors in subprocess"""
@@ -56,7 +83,7 @@ class InMemStateView:
 
         # CPU metadata (set later via snapshot_cpu_metadata)
         self.cpu_metadata = None
-    
+
     def dump(self, path):
         model_cpu_tensors = []
         optim_cpu_tensors = []
@@ -102,27 +129,29 @@ class SnapshotContainer:
         self,
         local_checkpoint_path: str,
         remote_checkpoint_path: str,
-        log_file_path: str,
+        log_dir: str,
         rank: int
     ):
         self.ctx = mp.get_context("spawn")
         self.closed = False
-        self.parent_pipe, child_pipe = self.ctx.Pipe()
+        self.input_queue = self.ctx.Queue()   # parent -> child
+        self.output_queue = self.ctx.Queue()  # child -> parent
 
         self.process = self.ctx.Process(
             target=SnapshotContainer._subprocess_main,
             args=(
                 local_checkpoint_path,
                 remote_checkpoint_path,
-                log_file_path,
+                log_dir,
                 rank,
-                child_pipe),
+                self.input_queue,
+                self.output_queue,
+            ),
         )
         self.process.start()
-        child_pipe.close()
 
         # Wait for init
-        response = self.parent_pipe.recv()
+        response = self.output_queue.get()
         assert response == "INIT_COMPLETE"
 
     def register(
@@ -165,9 +194,9 @@ class SnapshotContainer:
                 'storage_offset': tensor.storage_offset(),
             }
 
-        # Send to subprocess via pipe
+        # Send to subprocess via queue
         # Shared memory references are preserved (no copy)
-        self.parent_pipe.send(('REGISTER', {
+        self.input_queue.put(('REGISTER', {
             'state_id': state_id,
             'state_type': in_mem_state_type,
             'model_keys': model_tensor_keys,
@@ -178,8 +207,8 @@ class SnapshotContainer:
             'optim_metadata': optim_metadata,
         }))
 
-        # Wait for acknowledgment (RPC-like)
-        response = self.parent_pipe.recv()
+        # Wait for acknowledgment
+        response = self.output_queue.get()
         assert response == ('REGISTER_DONE', state_id), f"Expected REGISTER_DONE, got {response}"
 
     def snapshot_cpu_metadata(
@@ -188,43 +217,40 @@ class SnapshotContainer:
         in_mem_state_type: InMemStateType,
         cpu_metadata: Any,
     ):
-        self.parent_pipe.send(('SNAPSHOT_METADATA', {
+        self.input_queue.put(('SNAPSHOT_METADATA', {
             'state_id': state_id,
             'state_type': in_mem_state_type,
             'cpu_metadata': cpu_metadata,  # This gets pickled and copied
         }))
 
-        response = self.parent_pipe.recv()
+        response = self.output_queue.get()
         assert response == ('SNAPSHOT_METADATA_DONE', state_id)
 
     def commit(self, state_id: int, snapshot_step: int):
-        self.parent_pipe.send(('COMMIT', {
+        self.input_queue.put(('COMMIT', {
             'state_id': state_id,
             'snapshot_step': snapshot_step
         }))
-        response = self.parent_pipe.recv()
+        response = self.output_queue.get()
         assert response == ('COMMIT', state_id)
 
     def close(self):
         if not self.closed:
             self.closed = True
-            self.parent_pipe.send(('CLOSE', {}))
-            response = self.parent_pipe.recv()
+            self.input_queue.put(('CLOSE', {}))
+            response = self.output_queue.get()
             assert response == 'CLOSE'
-
-    @staticmethod
-    def _signal_handler(signum, frame):
-        SnapshotContainer._dump_states()
 
     @staticmethod
     def _subprocess_main(
         local_checkpoint_path: str,
         remote_checkpoint_path: str,
-        log_file_path: str,
+        log_dir: str,
         rank: int,
-        pipe):
-        """Subprocess entry point with command handling and orphan detection"""
-        # Redirect stdout/stderr to a temporary file for debugging
+        input_queue,
+        output_queue,
+    ):
+        """Subprocess entry point with command handling and worker controller polling"""
         global _process_states
 
         _process_states = {
@@ -233,84 +259,113 @@ class SnapshotContainer:
         }
         _process_states["local_checkpoint_path"] = local_checkpoint_path
         _process_states["remote_checkpoint_path"] = remote_checkpoint_path
-        log_file = open(log_file_path, 'w')
-        sys.stdout = log_file
-        sys.stderr = log_file
 
-        # Ignore signals (we handle graceful shutdown via WorkerController)
-        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        _setup_subprocess_logger(log_dir, rank)
+
+        # Ignore SIGTERM (we handle graceful shutdown via WorkerController polling)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
         # Register with WorkerController for graceful shutdown coordination
         if _LETO_AVAILABLE:
             register_service_process(_process_states["rank"])
         else:
-            print("leto package not available, skipping WorkerController registration", flush=True)
+            logger.info("leto package not available, skipping WorkerController registration")
 
-        parent_pid = os.getppid()
-        pipe.send("INIT_COMPLETE")
+        output_queue.put("INIT_COMPLETE")
 
-        # Main loop
+        # Main loop: poll input queue with timeout, check worker controller on timeout
         while True:
-            # Check for commands from parent (with timeout)
-            if pipe.poll(timeout=1.0):
-                try:
-                    msg = pipe.recv()
-
-                    if not isinstance(msg, tuple) or len(msg) != 2:
-                        continue
-
-                    cmd, data = msg
-
-                    if cmd == 'REGISTER':
-                        # Create InMemStateView with shared memory references
-                        view = InMemStateView(
-                            state_id=data['state_id'],
-                            state_type=data['state_type'],
-                            model_keys=data['model_keys'],
-                            model_storages=data['model_storages'],
-                            model_metadata=data['model_metadata'],
-                            optim_keys=data['optim_keys'],
-                            optim_storages=data['optim_storages'],
-                            optim_metadata=data['optim_metadata'],
-                        )
-                        _process_states["in_mem_states"][(data['state_id'], data['state_type'])] = view
-                        pipe.send(('REGISTER_DONE', data['state_id']))
-                    elif cmd == 'SNAPSHOT_METADATA':
-                        state_id = data['state_id']
-                        state_type = data['state_type']
-                        _process_states["in_mem_states"][(state_id, state_type)].cpu_metadata = data['cpu_metadata']
-                        pipe.send(('SNAPSHOT_METADATA_DONE', state_id))
-                    elif cmd == 'COMMIT':
-                        state_id = data['state_id']
-                        snapshot_step = data['snapshot_step']
-                        _process_states['commited_state_id'] = state_id
-                        _process_states['snapshot_step'] = snapshot_step
-                        assert ((state_id, InMemStateType.LOCAL) in _process_states["in_mem_states"])
-                        assert ((state_id, InMemStateType.REMOTE) in _process_states["in_mem_states"])
-                        pipe.send(('COMMIT', state_id))
-                    elif cmd == 'CLOSE':
-                        pipe.send('CLOSE')
-                        print("Container process got CLOSE message", flush=True)
+            try:
+                msg = input_queue.get(timeout=0.5)
+            except queue.Empty:
+                # No command from training process — poll worker controller
+                if _LETO_AVAILABLE:
+                    action = poll_service_action()
+                    if action == SERVICE_ACTION_PERSIST:
+                        logger.info("Worker controller requested PERSIST")
+                        SnapshotContainer._dump_states()
                         break
-                except EOFError:
-                    # Pipe closed
-                    print("Pipe is unexpectedly closed.", flush=True)
-                    SnapshotContainer._dump_states()
-                    break
-                except Exception as e:
-                    # Ignore errors and continue
-                    print(f"Exception: {e}", flush=True)
+                    elif action == SERVICE_ACTION_CLOSE:
+                        logger.info("Worker controller requested CLOSE")
+                        break
+                # SERVICE_ACTION_WORKING or no leto — continue polling
+                continue
+            except Exception as e:
+                # Queue broken — training process likely dead
+                logger.warning(f"Queue exception (training process likely dead): {e}")
+                SnapshotContainer._poll_worker_controller_until_done()
+                break
 
+            if not isinstance(msg, tuple) or len(msg) != 2:
+                continue
+
+            cmd, data = msg
+
+            if cmd == 'REGISTER':
+                # Create InMemStateView with shared memory references
+                view = InMemStateView(
+                    state_id=data['state_id'],
+                    state_type=data['state_type'],
+                    model_keys=data['model_keys'],
+                    model_storages=data['model_storages'],
+                    model_metadata=data['model_metadata'],
+                    optim_keys=data['optim_keys'],
+                    optim_storages=data['optim_storages'],
+                    optim_metadata=data['optim_metadata'],
+                )
+                _process_states["in_mem_states"][(data['state_id'], data['state_type'])] = view
+                output_queue.put(('REGISTER_DONE', data['state_id']))
+            elif cmd == 'SNAPSHOT_METADATA':
+                state_id = data['state_id']
+                state_type = data['state_type']
+                _process_states["in_mem_states"][(state_id, state_type)].cpu_metadata = data['cpu_metadata']
+                output_queue.put(('SNAPSHOT_METADATA_DONE', state_id))
+            elif cmd == 'COMMIT':
+                state_id = data['state_id']
+                snapshot_step = data['snapshot_step']
+                _process_states['commited_state_id'] = state_id
+                _process_states['snapshot_step'] = snapshot_step
+                assert ((state_id, InMemStateType.LOCAL) in _process_states["in_mem_states"])
+                assert ((state_id, InMemStateType.REMOTE) in _process_states["in_mem_states"])
+                output_queue.put(('COMMIT', state_id))
+            elif cmd == 'CLOSE':
+                output_queue.put('CLOSE')
+                logger.info("Received CLOSE command")
+                break
+
+    @staticmethod
+    def _poll_worker_controller_until_done():
+        """Training process is gone. Poll worker controller for instructions."""
+        if not _LETO_AVAILABLE:
+            # No leto available — fallback: persist
+            logger.info("No leto available, persisting as fallback")
+            SnapshotContainer._dump_states()
+            return
+
+        while True:
+            try:
+                action = poll_service_action()
+            except:
+                logger.error("Error while polling worker controller, exiting")
+                return
+            if action == SERVICE_ACTION_PERSIST:
+                logger.info("Worker controller requested PERSIST (WC-only mode)")
+                SnapshotContainer._dump_states()
+                return
+            elif action == SERVICE_ACTION_CLOSE:
+                logger.info("Worker controller requested CLOSE (WC-only mode)")
+                return
+            # SERVICE_ACTION_WORKING — keep polling
+            time.sleep(0.5)
 
     @staticmethod
     def _dump_states():
         global _process_states
         if 'commited_state_id' not in _process_states:
-            print("Nothing to dump.", flush=True)
+            logger.info("Nothing to dump.")
             return
         snapshot_step = _process_states['snapshot_step']
-        print(f"Start dumping step={snapshot_step}", flush=True)
+        logger.info(f"Start dumping step={snapshot_step}")
         persist_start_time = time.time()
 
         commited_state_id = _process_states['commited_state_id']
@@ -325,6 +380,6 @@ class SnapshotContainer:
         if _LETO_AVAILABLE:
             persist_duration = time.time() - persist_start_time
             report_duration(DURATION_CHECKPOINT_PERSISTING, persist_duration, snapshot_step)
-            print(f"Persist took {persist_duration:.2f} seconds.", flush=True)
+            logger.info(f"Persist took {persist_duration:.2f} seconds.")
 
-        print(f"End dumping step={snapshot_step}", flush=True)
+        logger.info(f"End dumping step={snapshot_step}")

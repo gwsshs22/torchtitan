@@ -464,7 +464,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info("Entering standby mode - polling for activation...")
         poll_interval = self.job_config.leto.standby_poll_interval
         while True:
-            action = poll_standby_status()
+            try:
+                action = poll_standby_status()
+            except:
+                logger.warning("Error while polling standby status", exc_info=True)
+                import sys
+                sys.exit(0)
             if action == STANDBY_ACTION_ACTIVATE:
                 logger.info("Standby activated - resuming initialization")
                 return

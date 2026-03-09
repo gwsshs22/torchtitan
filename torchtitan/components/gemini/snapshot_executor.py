@@ -81,14 +81,14 @@ class SnapshotExecutor:
         self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_local.pt"
         self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_remote.pt"
         self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_tmp.pt"
-        self.container_log_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_log.txt"
+        self.container_log_dir = os.path.join(self.mem_fs_folder, "logs")
 
         self.has_checkpoint = self._check_has_checkpoint()
 
         self.snapshot_container = SnapshotContainer(
             self.local_checkpoint_path,
             self.remote_checkpoint_path,
-            self.container_log_path,
+            self.container_log_dir,
             self._global_rank,
         )
 
