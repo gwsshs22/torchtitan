@@ -110,6 +110,8 @@ class GeminiCheckpointManager:
         lr_schedulers: LRSchedulersContainer,
         parallel_dims: ParallelDims | None = None,
         rmp_restored: bool = False,
+        rmp_client=None,
+        enable_rmp_gemini: bool = False,
     ) -> None:
         assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
 
@@ -136,6 +138,8 @@ class GeminiCheckpointManager:
             fsdp_process_group=fsdp_pg,
             pp_process_group=pp_pg,
             rmp_restored=rmp_restored,
+            rmp_client=rmp_client,
+            enable_rmp_gemini=enable_rmp_gemini,
         )
 
         checkpoint_config = self._checkpoint_config

@@ -310,7 +310,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # model_parts is used instead
             del model
 
-            if not job_config.leto.enable_rmp:
+            if not job_config.leto.enable_rmp_gpu:
                 for m in self.model_parts:
                     m.to_empty(device=init_device)
                     with torch.no_grad():
@@ -325,7 +325,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
             model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
 
-            if not job_config.leto.enable_rmp:
+            if not job_config.leto.enable_rmp_gpu:
                 model.to_empty(device=init_device)
                 with torch.no_grad():
                     # pyrefly: ignore [not-callable]
@@ -389,12 +389,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
 
         if job_config.checkpoint.use_gemini:
+            rmp_client = (
+                self.rmp_manager.rmp_client
+                if job_config.leto.enable_rmp_gemini
+                else None
+            )
             self.checkpointer.lazy_init(
                 model_parts=self.model_parts,
                 optimizers=self.optimizers,
                 lr_schedulers=self.lr_schedulers,
                 rmp_restored=self.rmp_restored,
-                parallel_dims=self.parallel_dims
+                parallel_dims=self.parallel_dims,
+                rmp_client=rmp_client,
+                enable_rmp_gemini=job_config.leto.enable_rmp_gemini,
             )
         else:
             self.checkpointer = CheckpointManager(

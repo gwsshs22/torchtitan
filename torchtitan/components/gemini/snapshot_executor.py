@@ -103,6 +103,8 @@ class SnapshotExecutor:
         tp_process_group: dist.ProcessGroup | None = None,
         fsdp_process_group: dist.ProcessGroup | None = None,
         rmp_restored: bool = False,
+        rmp_client=None,
+        enable_rmp_gemini: bool = False,
     ) -> None:
         if not self.enable:
             return
@@ -113,6 +115,8 @@ class SnapshotExecutor:
         self.pp_process_group = pp_process_group
         self.tp_process_group = tp_process_group
         self.rmp_restored = rmp_restored
+        self._rmp_client = rmp_client
+        self._enable_rmp_gemini = enable_rmp_gemini
 
         self._fsdp_pg = fsdp_process_group
         self.snapshot_group = SnapshotGroup(self._fsdp_pg)
@@ -187,6 +191,18 @@ class SnapshotExecutor:
         self._comm_gap_id = 0
         self._swap_buffers()
 
+    def _init_in_mem_state_cpu_tensors(self, in_mem_state: InMemState):
+        if self._enable_rmp_gemini:
+            in_mem_state.init_cpu_tensors_from_rmp(
+                self._rmp_client, self._global_rank,
+                mem_fs_folder=self.mem_fs_folder,
+            )
+        else:
+            in_mem_state.init_cpu_tensors(
+                rank=self._global_rank,
+                mem_fs_folder=self.mem_fs_folder,
+            )
+
     def load(self, step) -> bool:
         if not self.enable:
             return False
@@ -201,7 +217,7 @@ class SnapshotExecutor:
         self.model_wrapper.reset_cached_state_dict()
 
         t0 = time.monotonic()
-        self.local_curr.init_cpu_tensors()
+        self._init_in_mem_state_cpu_tensors(self.local_curr)
         logger.info(f"[Gemini Load R{rank}] local_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         loaded = False
@@ -217,15 +233,15 @@ class SnapshotExecutor:
                         v.zero_()
 
         t0 = time.monotonic()
-        self.local_prev.init_cpu_tensors()
+        self._init_in_mem_state_cpu_tensors(self.local_prev)
         logger.info(f"[Gemini Load R{rank}] local_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         t0 = time.monotonic()
-        self.remote_curr.init_cpu_tensors()
+        self._init_in_mem_state_cpu_tensors(self.remote_curr)
         logger.info(f"[Gemini Load R{rank}] remote_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         t0 = time.monotonic()
-        self.remote_prev.init_cpu_tensors()
+        self._init_in_mem_state_cpu_tensors(self.remote_prev)
         logger.info(f"[Gemini Load R{rank}] remote_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         t0 = time.monotonic()

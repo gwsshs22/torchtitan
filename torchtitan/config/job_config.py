@@ -1031,11 +1031,17 @@ class Leto:
     stage_inputs_folder: str = "stage_inputs"
     """Folder to save/load recorded stage shape metadata (relative to dump_folder)."""
 
-    enable_rmp: bool = False
+    enable_rmp_gpu: bool = False
     """Enable RMP (Remote Memory Provider) for shared GPU memory across processes."""
 
     rmp_server_port: int = 52051
     """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
+
+    enable_rmp_gemini: bool = False
+    """Allocate Gemini checkpoint CPU shared memory tensors via RMP server."""
+
+    enable_standby: bool = False
+    """Launch standby torchrun group for faster fault recovery."""
 
     standby_poll_interval: float = 0.5
     """Polling interval in seconds for standby processes checking activation status."""

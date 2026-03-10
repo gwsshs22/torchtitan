@@ -33,17 +33,13 @@ class RmpManager:
         lr_schedulers,
         dataloader,
         device):
-        self.enabled = leto_config.enable_rmp
-        if not self.enabled:
+        self.enabled = leto_config.enable_rmp_gpu
+        self.rmp_client = None
+
+        # Create RMP client if either GPU or Gemini RMP feature is enabled
+        if not (leto_config.enable_rmp_gpu or leto_config.enable_rmp_gemini):
             return
 
-        self.model_parts = model_parts
-        self.optimizers = optimizers
-        self.states = states
-        self.states.update({
-            DATALOADER: dataloader,
-            LR_SCHEDULER: lr_schedulers
-        })
         self.device = device
 
         # RMP client configuration
@@ -55,6 +51,17 @@ class RmpManager:
 
         # Connect to RMP server
         self.rmp_client = RmpClient(self.rmp_server_address)
+
+        if not self.enabled:
+            return
+
+        self.model_parts = model_parts
+        self.optimizers = optimizers
+        self.states = states
+        self.states.update({
+            DATALOADER: dataloader,
+            LR_SCHEDULER: lr_schedulers
+        })
 
     def maybe_init(self, buffer_device):
         if not self.enabled:

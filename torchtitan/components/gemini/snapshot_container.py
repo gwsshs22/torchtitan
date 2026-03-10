@@ -12,6 +12,12 @@ import torch.multiprocessing as mp
 
 from torchtitan.components.gemini.utils import InMemStateType
 
+try:
+    from leto.rmp.shm_tensor import import_shm_tensor
+    _SHM_TENSOR_AVAILABLE = True
+except ImportError:
+    _SHM_TENSOR_AVAILABLE = False
+
 # Leto integration for checkpoint timing reporting
 try:
     from leto.launch.worker_controller_client import (
@@ -55,31 +61,33 @@ def _setup_subprocess_logger(log_dir: str, rank: int) -> None:
 
 
 class InMemStateView:
-    """Holds references to shared memory tensors in subprocess"""
+    """Holds file-based shared memory tensor metadata in subprocess.
+
+    Instead of receiving serialized UntypedStorage objects (which triggers
+    reduce_storage and creates extra /dev/shm files), this view stores
+    lightweight file path + metadata. Tensors are reconstructed via
+    from_file() in dump().
+    """
 
     def __init__(
         self,
         state_id: int,
         state_type: str,
         model_keys: List[str],
-        model_storages: Dict[str, torch.UntypedStorage],
-        model_metadata: Dict[str, dict],
+        model_file_infos: Dict[str, dict],
         optim_keys: List[str],
-        optim_storages: Dict[str, torch.UntypedStorage],
-        optim_metadata: Dict[str, dict],
+        optim_file_infos: Dict[str, dict],
     ):
         self.state_id = state_id
         self.state_type = state_type
 
         # Model state
         self.model_keys = model_keys
-        self.model_storages = model_storages  # Shared memory references
-        self.model_metadata = model_metadata
+        self.model_file_infos = model_file_infos
 
         # Optimizer state
         self.optim_keys = optim_keys
-        self.optim_storages = optim_storages  # Shared memory references
-        self.optim_metadata = optim_metadata
+        self.optim_file_infos = optim_file_infos
 
         # CPU metadata (set later via snapshot_cpu_metadata)
         self.cpu_metadata = None
@@ -96,28 +104,13 @@ class InMemStateView:
         }
 
         for key in self.model_keys:
-            storage = self.model_storages[key]
-            meta = self.model_metadata[key]
-            tensor = torch.empty(0, dtype=meta['dtype'])
-            tensor.set_(
-                source=storage,
-                storage_offset=meta['storage_offset'],
-                size=meta['shape'],
-                stride=meta['stride']
-            )
+            info = self.model_file_infos[key]
+            tensor = import_shm_tensor(info, pin=False)
             model_cpu_tensors.append(tensor)
 
         for key in self.optim_keys:
-            storage = self.optim_storages[key]
-            meta = self.optim_metadata[key]
-            tensor = torch.empty(0, dtype=meta['dtype'])
-            tensor.set_(
-                source=storage,
-                storage_offset=meta['storage_offset'],
-                size=meta['shape'],
-                stride=meta['stride']
-            )
-
+            info = self.optim_file_infos[key]
+            tensor = import_shm_tensor(info, pin=False)
             optim_cpu_tensors.append(tensor)
 
         torch.save(state, path)
@@ -157,52 +150,34 @@ class SnapshotContainer:
         state_id: int,
         in_mem_state_type: InMemStateType,
         model_tensor_keys: List[str],
-        model_cpu_tensors: List[torch.Tensor],
+        model_file_infos: Dict[str, dict],
         optim_tensor_keys: List[str],
-        optim_cpu_tensors: List[torch.Tensor],
+        optim_file_infos: Dict[str, dict],
     ):
-        # Validate lengths match
-        assert len(model_tensor_keys) == len(model_cpu_tensors), \
-            f"Length mismatch: {len(model_tensor_keys)} keys vs {len(model_cpu_tensors)} tensors"
-        assert len(optim_tensor_keys) == len(optim_cpu_tensors), \
-            f"Length mismatch: {len(optim_tensor_keys)} keys vs {len(optim_cpu_tensors)} tensors"
+        """Register tensor file info with the subprocess.
 
-        # Extract shared storages and metadata from model tensors
-        model_storages = {}
-        model_metadata = {}
-        for key, tensor in zip(model_tensor_keys, model_cpu_tensors):
-            # Get underlying storage (must be shared memory!)
-            model_storages[key] = tensor.untyped_storage()
-            model_metadata[key] = {
-                'dtype': tensor.dtype,
-                'shape': tuple(tensor.shape),
-                'stride': tuple(tensor.stride()),
-                'storage_offset': tensor.storage_offset(),
-            }
+        Instead of sending UntypedStorage objects (which triggers reduce_storage
+        serialization and creates extra /dev/shm files), we send lightweight
+        file path + metadata. The subprocess reconstructs tensors via from_file().
 
-        # Extract shared storages and metadata from optimizer tensors
-        optim_storages = {}
-        optim_metadata = {}
-        for key, tensor in zip(optim_tensor_keys, optim_cpu_tensors):
-            optim_storages[key] = tensor.untyped_storage()
-            optim_metadata[key] = {
-                'dtype': tensor.dtype,
-                'shape': tuple(tensor.shape),
-                'stride': tuple(tensor.stride()),
-                'storage_offset': tensor.storage_offset(),
-            }
+        Args:
+            model_file_infos: Dict mapping key -> {file_path, storage_size, dtype,
+                              shape, stride, storage_offset}
+            optim_file_infos: Same format as model_file_infos
+        """
+        assert len(model_tensor_keys) == len(model_file_infos), \
+            f"Length mismatch: {len(model_tensor_keys)} keys vs {len(model_file_infos)} file_infos"
+        assert len(optim_tensor_keys) == len(optim_file_infos), \
+            f"Length mismatch: {len(optim_tensor_keys)} keys vs {len(optim_file_infos)} file_infos"
 
-        # Send to subprocess via queue
-        # Shared memory references are preserved (no copy)
+        # Send lightweight file info to subprocess (no storage serialization)
         self.input_queue.put(('REGISTER', {
             'state_id': state_id,
             'state_type': in_mem_state_type,
             'model_keys': model_tensor_keys,
-            'model_storages': model_storages,      # Shared memory refs
-            'model_metadata': model_metadata,
+            'model_file_infos': model_file_infos,
             'optim_keys': optim_tensor_keys,
-            'optim_storages': optim_storages,      # Shared memory refs
-            'optim_metadata': optim_metadata,
+            'optim_file_infos': optim_file_infos,
         }))
 
         # Wait for acknowledgment
@@ -311,16 +286,14 @@ class SnapshotContainer:
             cmd, data = msg
 
             if cmd == 'REGISTER':
-                # Create InMemStateView with shared memory references
+                # Create InMemStateView with file path metadata
                 view = InMemStateView(
                     state_id=data['state_id'],
                     state_type=data['state_type'],
                     model_keys=data['model_keys'],
-                    model_storages=data['model_storages'],
-                    model_metadata=data['model_metadata'],
+                    model_file_infos=data['model_file_infos'],
                     optim_keys=data['optim_keys'],
-                    optim_storages=data['optim_storages'],
-                    optim_metadata=data['optim_metadata'],
+                    optim_file_infos=data['optim_file_infos'],
                 )
                 _process_states["in_mem_states"][(data['state_id'], data['state_type'])] = view
                 output_queue.put(('REGISTER_DONE', data['state_id']))
