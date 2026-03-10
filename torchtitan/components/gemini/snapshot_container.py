@@ -1,6 +1,6 @@
+import json
 import logging
 import os
-import sys
 import queue
 import signal
 import time
@@ -127,8 +127,7 @@ class SnapshotContainer:
 
     def __init__(
         self,
-        local_checkpoint_path: str,
-        remote_checkpoint_path: str,
+        checkpoint_dir: str,
         log_dir: str,
         rank: int
     ):
@@ -140,8 +139,7 @@ class SnapshotContainer:
         self.process = self.ctx.Process(
             target=SnapshotContainer._subprocess_main,
             args=(
-                local_checkpoint_path,
-                remote_checkpoint_path,
+                checkpoint_dir,
                 log_dir,
                 rank,
                 self.input_queue,
@@ -226,6 +224,12 @@ class SnapshotContainer:
         response = self.output_queue.get()
         assert response == ('SNAPSHOT_METADATA_DONE', state_id)
 
+    def invalidate(self, state_id: int):
+        """Mark a version as invalid (about to be overwritten)."""
+        self.input_queue.put(('INVALIDATE', {'state_id': state_id}))
+        response = self.output_queue.get()
+        assert response == ('INVALIDATE', state_id)
+
     def commit(self, state_id: int, snapshot_step: int):
         self.input_queue.put(('COMMIT', {
             'state_id': state_id,
@@ -243,8 +247,7 @@ class SnapshotContainer:
 
     @staticmethod
     def _subprocess_main(
-        local_checkpoint_path: str,
-        remote_checkpoint_path: str,
+        checkpoint_dir: str,
         log_dir: str,
         rank: int,
         input_queue,
@@ -255,10 +258,10 @@ class SnapshotContainer:
 
         _process_states = {
             "in_mem_states": {},
-            "rank": rank
+            "version_steps": {},  # {version_id: step}
+            "rank": rank,
+            "checkpoint_dir": checkpoint_dir,
         }
-        _process_states["local_checkpoint_path"] = local_checkpoint_path
-        _process_states["remote_checkpoint_path"] = remote_checkpoint_path
 
         _setup_subprocess_logger(log_dir, rank)
 
@@ -280,7 +283,13 @@ class SnapshotContainer:
             except queue.Empty:
                 # No command from training process — poll worker controller
                 if _LETO_AVAILABLE:
-                    action = poll_service_action()
+                    try:
+                        action = poll_service_action()
+                    except Exception as e:
+                        logger.warning(f"poll_service_action() failed: {e}")
+                        logger.info("Falling back to poll-until-done loop")
+                        SnapshotContainer._poll_worker_controller_until_done()
+                        break
                     if action == SERVICE_ACTION_PERSIST:
                         logger.info("Worker controller requested PERSIST")
                         SnapshotContainer._dump_states()
@@ -320,11 +329,14 @@ class SnapshotContainer:
                 state_type = data['state_type']
                 _process_states["in_mem_states"][(state_id, state_type)].cpu_metadata = data['cpu_metadata']
                 output_queue.put(('SNAPSHOT_METADATA_DONE', state_id))
+            elif cmd == 'INVALIDATE':
+                state_id = data['state_id']
+                _process_states['version_steps'].pop(state_id, None)
+                output_queue.put(('INVALIDATE', state_id))
             elif cmd == 'COMMIT':
                 state_id = data['state_id']
                 snapshot_step = data['snapshot_step']
-                _process_states['commited_state_id'] = state_id
-                _process_states['snapshot_step'] = snapshot_step
+                _process_states['version_steps'][state_id] = snapshot_step
                 assert ((state_id, InMemStateType.LOCAL) in _process_states["in_mem_states"])
                 assert ((state_id, InMemStateType.REMOTE) in _process_states["in_mem_states"])
                 output_queue.put(('COMMIT', state_id))
@@ -361,25 +373,42 @@ class SnapshotContainer:
     @staticmethod
     def _dump_states():
         global _process_states
-        if 'commited_state_id' not in _process_states:
+        version_steps = _process_states.get('version_steps', {})
+        if not version_steps:
             logger.info("Nothing to dump.")
             return
-        snapshot_step = _process_states['snapshot_step']
-        logger.info(f"Start dumping step={snapshot_step}")
+
+        checkpoint_dir = _process_states["checkpoint_dir"]
+        rank = _process_states["rank"]
+
+        logger.info(f"Start dumping {len(version_steps)} version(s): {version_steps}")
         persist_start_time = time.time()
 
-        commited_state_id = _process_states['commited_state_id']
-        local_state_view = _process_states["in_mem_states"][(commited_state_id, InMemStateType.LOCAL)]
-        remote_state_view = _process_states["in_mem_states"][(commited_state_id, InMemStateType.REMOTE)]
+        in_mem_states = _process_states["in_mem_states"]
         del _process_states["in_mem_states"]
         gc.collect()
-        local_state_view.dump(_process_states["local_checkpoint_path"])
-        remote_state_view.dump(_process_states["remote_checkpoint_path"])
+
+        for version, step in version_steps.items():
+            local_view = in_mem_states[(version, InMemStateType.LOCAL)]
+            remote_view = in_mem_states[(version, InMemStateType.REMOTE)]
+            local_path = os.path.join(checkpoint_dir, f"rank_{rank}_v{version}_local.pt")
+            remote_path = os.path.join(checkpoint_dir, f"rank_{rank}_v{version}_remote.pt")
+            local_view.dump(local_path)
+            remote_view.dump(remote_path)
+            logger.info(f"Dumped version {version} (step {step})")
+
+        # Write metadata file (index-aligned: list[version] = step)
+        metadata = {"version_steps": [version_steps.get(0), version_steps.get(1)]}
+        metadata_path = os.path.join(checkpoint_dir, f"rank_{rank}_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+        logger.info(f"Wrote metadata: {metadata}")
 
         # Report persisting duration to leto
         if _LETO_AVAILABLE:
             persist_duration = time.time() - persist_start_time
-            report_duration(DURATION_CHECKPOINT_PERSISTING, persist_duration, snapshot_step)
+            latest_step = max(version_steps.values())
+            report_duration(DURATION_CHECKPOINT_PERSISTING, persist_duration, latest_step)
             logger.info(f"Persist took {persist_duration:.2f} seconds.")
 
-        logger.info(f"End dumping step={snapshot_step}")
+        logger.info("End dumping")

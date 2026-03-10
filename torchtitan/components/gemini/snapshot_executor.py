@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import time
@@ -78,16 +79,14 @@ class SnapshotExecutor:
         self._snapshot_future: Future | None = None
 
         self._global_rank = int(os.environ["RANK"])
-        self.local_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_local.pt"
-        self.remote_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_remote.pt"
-        self.tmp_checkpoint_path = f"{self.mem_fs_folder}/rank_{self._global_rank}_tmp.pt"
+        self._metadata_path = os.path.join(self.mem_fs_folder, f"rank_{self._global_rank}_metadata.json")
+        self.tmp_checkpoint_path = os.path.join(self.mem_fs_folder, f"rank_{self._global_rank}_tmp.pt")
         self.container_log_dir = os.path.join(self.mem_fs_folder, "logs")
 
         self.has_checkpoint = self._check_has_checkpoint()
 
         self.snapshot_container = SnapshotContainer(
-            self.local_checkpoint_path,
-            self.remote_checkpoint_path,
+            self.mem_fs_folder,
             self.container_log_dir,
             self._global_rank,
         )
@@ -100,6 +99,8 @@ class SnapshotExecutor:
         states: dict,
         model_wrapper,
         optimizers,
+        pp_process_group: dist.ProcessGroup | None = None,
+        tp_process_group: dist.ProcessGroup | None = None,
         fsdp_process_group: dist.ProcessGroup | None = None,
         rmp_restored: bool = False,
     ) -> None:
@@ -109,6 +110,8 @@ class SnapshotExecutor:
         self.model_wrapper = model_wrapper
         self.optimizers = optimizers
         self.states = states
+        self.pp_process_group = pp_process_group
+        self.tp_process_group = tp_process_group
         self.rmp_restored = rmp_restored
 
         self._fsdp_pg = fsdp_process_group
@@ -140,6 +143,8 @@ class SnapshotExecutor:
         self._copy_stream = torch.cuda.Stream()
         self._p2p_stream = torch.cuda.Stream()
         self._local_copy_event = torch.cuda.Event()  # Reusable event for local GPU→CPU copy
+        self._p2p_copy_event = torch.cuda.Event()  # Reusable event for P2P copy
+        self._first_copy_event_recorded = False
 
         # Distributed setup - compute ranks within FSDP group
         self._peer_global_rank = self.snapshot_group.peer_global_rank
@@ -160,10 +165,19 @@ class SnapshotExecutor:
     def remote_prev(self) -> InMemState:
         return self.in_mem_states[REMOTE][1 - self._curr_version]
 
+    def _version_path(self, version: int, locality: str) -> str:
+        return os.path.join(self.mem_fs_folder, f"rank_{self._global_rank}_v{version}_{locality}.pt")
+
+    def _read_checkpoint_metadata(self) -> list:
+        """Read checkpoint metadata. Returns list of committed steps."""
+        if not os.path.exists(self._metadata_path):
+            return []
+        with open(self._metadata_path) as f:
+            metadata = json.load(f)
+        return metadata["version_steps"]
+
     def _check_has_checkpoint(self) -> bool:
-        return os.path.exists(self.local_checkpoint_path) and os.path.exists(
-            self.remote_checkpoint_path
-        )
+        return os.path.exists(self._metadata_path)
 
     def _swap_buffers(self):
         self._curr_version = 1 - self._curr_version
@@ -235,51 +249,52 @@ class SnapshotExecutor:
 
     def _load_snapshot(self):
         rank = self.snapshot_group._global_rank
-        loaded = True
 
+        # Read local metadata to find available versions/steps
+        # version_steps is index-aligned: list[version] = step or None
+        version_steps = self._read_checkpoint_metadata()
+        available_steps = set(s for s in version_steps if s is not None) if self.has_checkpoint else set()
+        version_for_step = {step: version for version, step in enumerate(version_steps) if step is not None}
+
+        # Find consistent step across all ranks via all-gather
         t0 = time.monotonic()
-        load_action = self.snapshot_group.get_checkpoint_load_action(self.has_checkpoint)
-        logger.info(f"[Gemini Load R{rank}] get_checkpoint_load_action: {time.monotonic() - t0:.3f}s, action={load_action}")
+        target_step, load_action = self.snapshot_group.find_consistent_step_and_action(available_steps)
+        logger.info(
+            f"[Gemini Load R{rank}] find_consistent_step_and_action: {time.monotonic() - t0:.3f}s, "
+            f"target_step={target_step}, action={load_action}, available={version_steps}"
+        )
 
         if load_action == CheckpointLoadAction.NONE:
-            loaded = False
-        elif load_action == CheckpointLoadAction.LOCAL:
+            return False
+
+        if load_action in (CheckpointLoadAction.LOCAL, CheckpointLoadAction.SEND):
+            version = version_for_step[target_step]
+            if load_action == CheckpointLoadAction.SEND:
+                remote_path = self._version_path(version, "remote")
+                t0 = time.monotonic()
+                self.snapshot_group.send_checkpoint(remote_path)
+                logger.info(f"[Gemini Load R{rank}] send_checkpoint: {time.monotonic() - t0:.3f}s")
+
+            local_path = self._version_path(version, "local")
             t0 = time.monotonic()
-            ckpt = torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
-            logger.info(f"[Gemini Load R{rank}] torch.load (LOCAL): {time.monotonic() - t0:.3f}s")
+            ckpt = torch.load(local_path, map_location="cpu", weights_only=False)
+            logger.info(f"[Gemini Load R{rank}] torch.load ({load_action.name}): {time.monotonic() - t0:.3f}s")
+
             t0 = time.monotonic()
             self.local_curr.load_state_dict(ckpt)
-            logger.info(f"[Gemini Load R{rank}] load_state_dict (LOCAL): {time.monotonic() - t0:.3f}s")
-        elif load_action == CheckpointLoadAction.SEND:
-            t0 = time.monotonic()
-            ckpt = torch.load(self.local_checkpoint_path, map_location="cpu", weights_only=False)
-            logger.info(f"[Gemini Load R{rank}] torch.load (SEND): {time.monotonic() - t0:.3f}s")
-            t0 = time.monotonic()
-            self.local_curr.load_state_dict(ckpt)
-            logger.info(f"[Gemini Load R{rank}] load_state_dict (SEND): {time.monotonic() - t0:.3f}s")
-            t0 = time.monotonic()
-            self.snapshot_group.send_checkpoint(self.remote_checkpoint_path)
-            logger.info(f"[Gemini Load R{rank}] send_checkpoint: {time.monotonic() - t0:.3f}s")
+            logger.info(f"[Gemini Load R{rank}] load_state_dict ({load_action.name}): {time.monotonic() - t0:.3f}s")
         elif load_action == CheckpointLoadAction.RECV:
             t0 = time.monotonic()
             ckpt = self.snapshot_group.recv_checkpoint(self.tmp_checkpoint_path)
             logger.info(f"[Gemini Load R{rank}] recv_checkpoint: {time.monotonic() - t0:.3f}s")
+
             t0 = time.monotonic()
             self.local_curr.load_state_dict(ckpt)
             logger.info(f"[Gemini Load R{rank}] load_state_dict (RECV): {time.monotonic() - t0:.3f}s")
-        else:
-            raise ValueError(f"Unknown load action: {load_action}")
 
-        if loaded:
-            loaded_step = self.states["train_state"].step
-            logger.info(f"[Gemini Load R{rank}] Loaded checkpoint at step {loaded_step}, load_action={load_action}")
-        else:
-            loaded_step = 1
-
-        t0 = time.monotonic()
-        self.snapshot_group.validate_steps(loaded_step)
-        logger.info(f"[Gemini Load R{rank}] validate_steps: {time.monotonic() - t0:.3f}s")
-        return loaded
+        loaded_step = self.states["train_state"].step
+        logger.info(f"[Gemini Load R{rank}] Loaded checkpoint at step {loaded_step}, action={load_action}")
+        return True
 
     def _load_gaps_and_compute_strategy(self):
         strategy = None
@@ -322,6 +337,8 @@ class SnapshotExecutor:
 
         remote_cpu_metadata_state_dict = self.snapshot_group.exchange_object(cpu_metadata_state_dict)
         self.remote_curr.set_cpu_metadata_state_dict(remote_cpu_metadata_state_dict)
+        self.local_curr.commit_cpu_metadata()
+        self.remote_curr.commit_cpu_metadata()
 
     def snapshot(self, curr_step):
         if not self.enable:
@@ -330,10 +347,17 @@ class SnapshotExecutor:
         self._is_snapshot_step = True
         self._snapshot_step = curr_step
         self._staging_start_time = time.time()  # Track staging start time
+        self._first_copy_event_recorded = False
         self._reset_for_new_step()
 
-        cpu_metadata_state_dict = self.local_curr.snapshot_cpu_metadata_state()
+        if self.tp_process_group is not None:
+            dist.barrier(group=self.tp_process_group)
+        if self.pp_process_group is not None:
+            dist.barrier(group=self.pp_process_group)
+        dist.barrier(group=self._fsdp_pg)
 
+        self.snapshot_container.invalidate(self._curr_version)
+        cpu_metadata_state_dict = self.local_curr.snapshot_cpu_metadata_state()
         self._snapshot_future = self._snapshot_thread_pool.submit(
             self._snapshot_background, cpu_metadata_state_dict
         )
@@ -381,12 +405,18 @@ class SnapshotExecutor:
 
         output_tensor = self._gpu_buffers[self._gpu_buffer_id][:block_size]
         self._gpu_buffer_id = 1 - self._gpu_buffer_id
+
+        if self._first_copy_event_recorded:
+            self._p2p_stream.wait_event(self._p2p_copy_event)
+
         self.snapshot_group.sendrecv_tensor(gpu_block, output_tensor)
 
         with torch.cuda.stream(self._copy_stream):
             cpu_block = self.remote_curr.get_block(block_id)
             self._copy_stream.wait_stream(self._p2p_stream)
             cpu_block.copy_(output_tensor, non_blocking=True)
+            self._p2p_copy_event.record()
+            self._first_copy_event_recorded = True
 
         self._cur_block_id += 1
 
@@ -399,14 +429,14 @@ class SnapshotExecutor:
 
             # Wait for background thread (Gloo exchange + local copy launch)
             self._snapshot_future.result()
-
-            # Sync streams to ensure all copies are done
             curr_stream = torch.cuda.current_stream()
             curr_stream.wait_stream(self._copy_stream)
             curr_stream.wait_stream(self._p2p_stream)
             curr_stream.wait_event(self._local_copy_event)
-            curr_stream.synchronize()
 
+            if self.tp_process_group is not None:
+                dist.barrier(group=self.tp_process_group)
+            dist.barrier(group=self._fsdp_pg)
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
 
             # Report staging duration to leto

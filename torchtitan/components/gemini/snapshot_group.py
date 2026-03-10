@@ -1,5 +1,4 @@
 from enum import Enum, auto
-import io
 import json
 from pathlib import Path
 from typing import Any
@@ -198,28 +197,71 @@ class SnapshotGroup:
 
         return gap_times
 
-    def get_checkpoint_load_action(self, has_checkpoint):
-        # Exchange has_checkpoint status with peer
-        peer_has_checkpoint = self.exchange_object(has_checkpoint)
+    def find_consistent_step_and_action(self, available_steps: set):
+        """Find the latest consistent checkpoint step across all ranks.
 
-        # Determine action based on (has_checkpoint, peer_has_checkpoint)
-        if has_checkpoint and peer_has_checkpoint:
-            return CheckpointLoadAction.LOCAL
-        elif has_checkpoint and not peer_has_checkpoint:
-            return CheckpointLoadAction.SEND
-        elif not has_checkpoint and peer_has_checkpoint:
-            return CheckpointLoadAction.RECV
-        else:  # not has_checkpoint and not peer_has_checkpoint
-            return CheckpointLoadAction.NONE
+        Each rank provides its set of available steps and its peer rank.
+        For each peer pair, the recoverable steps are the union.
+        The consistent step is the latest step recoverable by ALL pairs.
 
-    def validate_steps(self, step):
-        all_steps = [None] * self._global_world_size
-        dist.all_gather_object(all_steps, step, group=self._gloo_pg)
+        Args:
+            available_steps: Set of steps this rank has checkpoint data for.
 
-        # Check if all steps are the same
-        first_step = all_steps[0]
-        if not all(s == first_step for s in all_steps):
+        Returns:
+            (target_step, load_action): target_step is None if no consistent step found.
+        """
+        # All-gather (available_steps, peer_global_rank) from every rank
+        all_info = [None] * self._global_world_size
+        dist.all_gather_object(
+            all_info,
+            (available_steps, self._peer_global_rank),
+            group=self._gloo_pg,
+        )
+
+        # Build all unique peer pairs and compute recoverable steps per pair
+        seen_pairs = set()
+        pair_recoverable_sets = []
+        for rank in range(self._global_world_size):
+            steps, peer = all_info[rank]
+            pair = (min(rank, peer), max(rank, peer))
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                steps_a = all_info[pair[0]][0] or set()
+                steps_b = all_info[pair[1]][0] or set()
+                pair_recoverable_sets.append(steps_a | steps_b)
+
+        if not pair_recoverable_sets:
+            return None, CheckpointLoadAction.NONE
+
+        consistent_steps = set.intersection(*pair_recoverable_sets)
+
+        if not consistent_steps:
+            # If no rank has any steps, that's fine — no checkpoint to load.
+            # But if some ranks have steps and others don't, that's an error.
+            all_steps = set().union(*pair_recoverable_sets)
+            if not all_steps:
+                return None, CheckpointLoadAction.NONE
             raise RuntimeError(
-                f"Step mismatch detected across ranks. Steps: {all_steps}. "
-                f"All ranks must be at the same training step."
+                f"No consistent checkpoint step found across all FSDP pairs, "
+                f"but some ranks have steps. Per-pair recoverable steps: {pair_recoverable_sets}"
+            )
+
+        target_step = max(consistent_steps)
+
+        # Determine load action for this rank
+        my_steps = all_info[self._global_rank][0] or set()
+        peer_steps = all_info[self._peer_global_rank][0] or set()
+        has_step = target_step in my_steps
+        peer_has_step = target_step in peer_steps
+
+        if has_step and peer_has_step:
+            return target_step, CheckpointLoadAction.LOCAL
+        elif has_step and not peer_has_step:
+            return target_step, CheckpointLoadAction.SEND
+        elif not has_step and peer_has_step:
+            return target_step, CheckpointLoadAction.RECV
+        else:
+            raise RuntimeError(
+                f"Step {target_step} is in consistent_steps but neither rank has it. "
+                f"available={available_steps}, peer={peer_steps}"
             )

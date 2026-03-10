@@ -117,19 +117,24 @@ class GeminiCheckpointManager:
         self.optimizers = optimizers
         self.states[LR_SCHEDULER] = lr_schedulers
 
-        # Get FSDP process group from parallel_dims
-        fsdp_pg = None
-        if parallel_dims is not None:
-            fsdp_mesh = parallel_dims.get_optional_mesh("fsdp")
-            if fsdp_mesh is not None:
-                fsdp_pg = fsdp_mesh.get_group()
+        def _get_pg(mesh_name: str) -> dist.ProcessGroup | None:
+            if parallel_dims is None:
+                return None
+            mesh = parallel_dims.get_optional_mesh(mesh_name)
+            return mesh.get_group() if mesh is not None else None
+
+        fsdp_pg = _get_pg("fsdp")
+        tp_pg = _get_pg("tp")
+        pp_pg = _get_pg("pp")
 
         self._profiler.lazy_init(fsdp_process_group=fsdp_pg)
         self._executor.lazy_init(
             states=self.states,
             model_wrapper=self.model_wrapper,
             optimizers=self.optimizers,
+            tp_process_group=tp_pg,
             fsdp_process_group=fsdp_pg,
+            pp_process_group=pp_pg,
             rmp_restored=rmp_restored,
         )
 

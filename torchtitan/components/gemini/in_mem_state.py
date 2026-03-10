@@ -154,18 +154,13 @@ class InMemState:
             "OPTIM": optim_cpu_metadata
         }
 
-        # Send metadata to SnapshotContainer if enabled
-        self._snapshot_container.snapshot_cpu_metadata(
-            state_id=self._state_id,
-            in_mem_state_type=self._state_type,
-            cpu_metadata=self._cpu_metadata_state_dict,
-        )
-
         return self._cpu_metadata_state_dict
 
     def set_cpu_metadata_state_dict(self, cpu_metadata_state_dict):
         assert self._state_type == InMemStateType.REMOTE
         self._cpu_metadata_state_dict = cpu_metadata_state_dict
+    
+    def commit_cpu_metadata(self):
         self._snapshot_container.snapshot_cpu_metadata(
             state_id=self._state_id,
             in_mem_state_type=self._state_type,
@@ -198,13 +193,7 @@ class InMemState:
         ):
             optim_new_state_dict[k] = _to_dtensor(cpu_tensor, optim_state_dict[k])
 
-        # Manually setting "*.step" values to avoid handle such a small tensors.
-        for k, tensor in optim_state_dict.items():
-            if k.endswith(".step"):
-                cpu_tensor = torch.tensor(checkpointed_step, dtype=tensor.dtype, device="cpu")
-                optim_new_state_dict[k] = _to_dtensor(cpu_tensor, tensor)
-
-
+        # Manually setting "*.step" values to avoid handling such small tensors.
         for k, tensor in optim_state_dict.items():
             if k.endswith(".step"):
                 cpu_tensor = torch.tensor(checkpointed_step, dtype=tensor.dtype, device="cpu")
