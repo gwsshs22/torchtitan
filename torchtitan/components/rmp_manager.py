@@ -33,7 +33,20 @@ class RmpManager:
         lr_schedulers,
         dataloader,
         device):
-        self.enabled = leto_config.enable_rmp
+        self.enabled = leto_config.enable_rmp_gpu
+        self.device = device
+
+        if self.enabled or leto_config.enable_rmp_cpu:
+            # RMP client configuration
+            # Server address: localhost:{rmp_server_port + local_rank}
+            base_port = leto_config.rmp_server_port
+            local_rank = device.index if hasattr(device, 'index') else 0
+            rmp_port = base_port + local_rank
+            self.rmp_server_address = f"localhost:{rmp_port}"
+
+            # Connect to RMP server
+            self.rmp_client = RmpClient(self.rmp_server_address)
+
         if not self.enabled:
             return
 
@@ -44,17 +57,6 @@ class RmpManager:
             DATALOADER: dataloader,
             LR_SCHEDULER: lr_schedulers
         })
-        self.device = device
-
-        # RMP client configuration
-        # Server address: localhost:{rmp_server_port + local_rank}
-        base_port = leto_config.rmp_server_port
-        local_rank = self.device.index if hasattr(self.device, 'index') else 0
-        rmp_port = base_port + local_rank
-        self.rmp_server_address = f"localhost:{rmp_port}"
-
-        # Connect to RMP server
-        self.rmp_client = RmpClient(self.rmp_server_address)
 
     def maybe_init(self, buffer_device):
         if not self.enabled:
@@ -166,6 +168,9 @@ class RmpManager:
         optim_state_dict = self.optimizers.state_dict()
         optim_state_dict.update(committed_metadata["OPTIM"])
         self.optimizers.load_state_dict(optim_state_dict)
+
+    def get_or_allocate_cpu_memory(self, name, num_bytes):
+        return self.rmp_client.get_or_allocate_cpu_memory(name, num_bytes)
 
     def cleanup(self):
         """Clean up resources (e.g., close RMP client connection)."""

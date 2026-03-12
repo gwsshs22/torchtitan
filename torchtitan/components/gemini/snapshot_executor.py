@@ -103,6 +103,8 @@ class SnapshotExecutor:
         tp_process_group: dist.ProcessGroup | None = None,
         fsdp_process_group: dist.ProcessGroup | None = None,
         rmp_restored: bool = False,
+        rmp_manager=None,
+        enable_rmp_cpu: bool = False,
     ) -> None:
         if not self.enable:
             return
@@ -113,6 +115,8 @@ class SnapshotExecutor:
         self.pp_process_group = pp_process_group
         self.tp_process_group = tp_process_group
         self.rmp_restored = rmp_restored
+        self.rmp_manager = rmp_manager
+        self.enable_rmp_cpu = enable_rmp_cpu
 
         self._fsdp_pg = fsdp_process_group
         self.snapshot_group = SnapshotGroup(self._fsdp_pg)
@@ -130,6 +134,7 @@ class SnapshotExecutor:
                     states,
                     state_type,
                     self.snapshot_container,
+                    rmp_manager=rmp_manager if enable_rmp_cpu else None,
                 ) for state_id in range(2)
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
