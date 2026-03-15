@@ -18,6 +18,16 @@ from torchtitan.tools.utils import (
     state_dict_to_stateful
 )
 
+try:
+    from leto.launch.worker_controller_client import (
+        report_duration,
+        DURATION_CHECKPOINT_ALLOC,
+        DURATION_CHECKPOINT_INIT_TOTAL,
+    )
+    _LETO_AVAILABLE = True
+except ImportError:
+    _LETO_AVAILABLE = False
+
 _POOL_ALIGNMENT = 64  # bytes
 
 
@@ -56,6 +66,8 @@ class InMemState:
     def init_cpu_tensors(self):
         if self._model_cpu_tensors is not None:
             return
+
+        t_init_start = time.perf_counter()
 
         # Phase 1: Collect tensor metadata (no allocation yet).
         model_entries = []
@@ -114,7 +126,7 @@ class InMemState:
 
         pool_view = torch.empty(0, dtype=torch.uint8)
         pool_view.set_(source=pool_storage, storage_offset=0, size=(total_bytes,))
-        pool_view.fill_(0)
+        pool_view[::4096] = 0
         t2 = time.perf_counter()
 
         pin_memory(pool_storage.data_ptr(), pool_storage.nbytes())
@@ -193,6 +205,8 @@ class InMemState:
         )
         t5_reg_end = time.perf_counter()
 
+        t_init_end = time.perf_counter()
+
         logger.info(
             f"Pool timings: "
             f"_new_shared={(t1 - t0) * 1000:.2f}ms, "
@@ -201,8 +215,12 @@ class InMemState:
             f"pin={(t3 - t2) * 1000:.2f}ms, "
             f"views={(t4_end - t4_start) * 1000:.2f}ms, "
             f"register={(t5_reg_end - t5_reg_start) * 1000:.2f}ms, "
-            f"total={(t5_reg_end - t0) * 1000:.2f}ms"
+            f"total={(t_init_end - t_init_start) * 1000:.2f}ms"
         )
+
+        if _LETO_AVAILABLE:
+            report_duration(DURATION_CHECKPOINT_ALLOC, t1b - t0)
+            report_duration(DURATION_CHECKPOINT_INIT_TOTAL, t_init_end - t_init_start)
 
     def compute_tensor_blocks(
         self,

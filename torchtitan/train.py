@@ -46,24 +46,20 @@ from torchtitan.tools.profiling import (
     maybe_enable_profiling,
 )
 
-# Optional leto integration for measurements
+# Optional leto integration
 try:
     from leto.launch.worker_controller_client import (
-        get_client as get_leto_client,
+        register_training_process,
         report_event,
         report_duration,
-        register_training_process,
-        get_checkpoint_loading_type,
         poll_standby_status,
         is_standby as leto_is_standby,
+        EVENT_PROCESS_STARTED,
         EVENT_TRAINING_STARTED,
-        EVENT_CHECKPOINT_LOADING_DONE,
         EVENT_STEP_DONE,
-        DURATION_CHECKPOINT_LOADING,
-        DURATION_ITERATION,
-        DURATION_WEIGHT_ALLOCATION,
         STANDBY_ACTION_ACTIVATE,
         STANDBY_ACTION_TERMINATE,
+        DURATION_ITERATION,
     )
     _LETO_AVAILABLE = True
 except ImportError:
@@ -281,9 +277,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.buffer_device = None
 
         # apply parallelisms and initialization
-        # [Leto] Start timing weight allocation and init
-        _weight_alloc_start = time.time()
-
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
                 raise RuntimeError(
@@ -333,10 +326,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 model.train()
 
             self.model_parts = [model]
-
-        # [Leto] Record weight allocation and init time
-        if _LETO_AVAILABLE:
-            report_duration(DURATION_WEIGHT_ALLOCATION, time.time() - _weight_alloc_start)
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -727,24 +716,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         maybe_eager_init(job_config.leto.eager_init_list, self.parallel_dims, self.device)
 
-        # [Leto] Report training started event
-        if _LETO_AVAILABLE:
-            report_event(EVENT_TRAINING_STARTED)
-
-        # [Leto] Time checkpoint loading
-        _ckpt_load_start = time.time()
         self.checkpointer.load(step=job_config.checkpoint.load_step)
-        if _LETO_AVAILABLE:
-            _ckpt_loading_type = get_checkpoint_loading_type()
-            report_duration(DURATION_CHECKPOINT_LOADING, time.time() - _ckpt_load_start,
-                            checkpoint_loading_type=_ckpt_loading_type)
-            report_event(EVENT_CHECKPOINT_LOADING_DONE)
 
         maybe_warmup_stages(
             self.model_parts,
             job_config
         )
 
+        if _LETO_AVAILABLE:
+            report_event(EVENT_TRAINING_STARTED)
         logger.info(f"Training starts at step {self.step + 1}")
 
         leaf_folder = (
@@ -786,10 +766,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # pyrefly: ignore [bad-argument-type]
             self._data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
-                # [Leto] Time each iteration
-                _iter_start = time.time()
-
                 self.step += 1
+                _iter_start = time.monotonic()
 
                 # Handle stage input/output recording (before/after first iteration)
                 self.stage_input_recorder = maybe_record_stage_inputs(
@@ -841,14 +819,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         parallel_dims=self.parallel_dims,
                     )
 
-                # [Leto] Record iteration time and report step done
-                _iter_time = time.time() - _iter_start
                 if _LETO_AVAILABLE:
-                    report_duration(DURATION_ITERATION, _iter_time, step=self.step)
+                    report_duration(DURATION_ITERATION, time.monotonic() - _iter_start, step=self.step)
                     report_event(EVENT_STEP_DONE, step=self.step)
 
 
-        # [Leto] Wait for any pending checkpoint tracking to complete
+        # Wait for any pending checkpoint tracking to complete
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.wait_for_tracking()
 
@@ -958,4 +934,5 @@ def main(trainer_class: type[Trainer]) -> None:
 if __name__ == "__main__":
     if _LETO_AVAILABLE:
             register_training_process(rank=int(os.environ["RANK"]))
+            report_event(EVENT_PROCESS_STARTED)
     main(Trainer)

@@ -16,10 +16,8 @@ from torchtitan.components.gemini.utils import InMemStateType
 try:
     from leto.launch.worker_controller_client import (
         register_service_process,
-        report_duration,
         poll_service_action,
         get_process_group_id,
-        DURATION_CHECKPOINT_PERSISTING,
         SERVICE_ACTION_PERSIST,
         SERVICE_ACTION_CLOSE,
         SERVICE_ACTION_WORKING,
@@ -28,10 +26,8 @@ try:
 except ImportError:
     _LETO_AVAILABLE = False
     register_service_process = None
-    report_duration = None
     poll_service_action = None
     get_process_group_id = None
-    DURATION_CHECKPOINT_PERSISTING = None
     SERVICE_ACTION_PERSIST = None
     SERVICE_ACTION_CLOSE = None
     SERVICE_ACTION_WORKING = None
@@ -367,11 +363,5 @@ class SnapshotContainer:
             json.dump(metadata, f)
         logger.info(f"Wrote metadata: {metadata}")
 
-        # Report persisting duration to leto
-        if _LETO_AVAILABLE:
-            persist_duration = time.time() - persist_start_time
-            latest_step = max(version_steps.values())
-            report_duration(DURATION_CHECKPOINT_PERSISTING, persist_duration, latest_step)
-            logger.info(f"Persist took {persist_duration:.2f} seconds.")
-
+        logger.info(f"Persist took {time.time() - persist_start_time:.2f} seconds.")
         logger.info("End dumping")

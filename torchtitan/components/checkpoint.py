@@ -44,33 +44,6 @@ from torchtitan.protocols import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
-# Optional leto integration for measurements
-try:
-    from leto.launch.worker_controller_client import (
-        report_duration,
-        DURATION_CHECKPOINT_STAGING,
-        DURATION_CHECKPOINT_PERSISTING,
-    )
-    _LETO_AVAILABLE = True
-except ImportError:
-    _LETO_AVAILABLE = False
-
-
-class CheckpointTiming:
-    """Tracks checkpoint timing for leto measurements."""
-    def __init__(self, should_save: bool):
-        self.should_save = should_save
-        self.start_time = time.time() if should_save else 0.0
-
-    def set_staging_done(self) -> None:
-        if self.should_save and _LETO_AVAILABLE:
-            report_duration(DURATION_CHECKPOINT_STAGING, time.time() - self.start_time)
-
-    def set_checkpoint_done(self) -> None:
-        if self.should_save and _LETO_AVAILABLE:
-            report_duration(DURATION_CHECKPOINT_PERSISTING, time.time() - self.start_time)
-
-
 MODEL = "model"
 OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
@@ -552,12 +525,8 @@ class CheckpointManager:
             # GC right after async_save -- the CPU memory is not able to be
             # freed until _async_wait()
 
-            # Create timing record for leto measurements
-            record = CheckpointTiming(True)
-
             if last_step:
                 self._save_last_step(curr_step)
-                record.set_checkpoint_done()
                 return
             states = self._flattened_model_states_sd()
             if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
@@ -575,16 +544,14 @@ class CheckpointManager:
                 # pyrefly: ignore [missing-attribute]
                 self.staging_future = result.staging_completion
                 self.staging = True
-                self._track_staging_and_save(self.staging_future, self.save_future, record)
+                self._track_staging_and_save(self.staging_future, self.save_future)
             elif self.async_mode == AsyncMode.ASYNC:
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
                 # pyrefly: ignore[bad-assignment]
                 self.save_future = self.dcp_save(
                     states, checkpoint_id=checkpoint_id, async_mode=self.async_mode
                 )
-                # For ASYNC mode, staging happens synchronously inside dcp.async_save()
-                record.set_staging_done()
-                self._track_staging_and_save(None, self.save_future, record)
+                self._track_staging_and_save(None, self.save_future)
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
             else:
                 self.dcp_save(
@@ -593,8 +560,6 @@ class CheckpointManager:
                     async_mode=AsyncMode.DISABLED,
                     enable_garbage_collection=True,
                 )
-                # For synchronous mode, both staging and save are done
-                record.set_checkpoint_done()
             self._purge_stale_checkpoints()
 
             logger.info(
@@ -616,29 +581,23 @@ class CheckpointManager:
             if task is None:  # Shutdown signal
                 self._tracking_queue.task_done()
                 break
-            staging_future, save_future, record = task
+            staging_future, save_future = task
             try:
                 if staging_future is not None:
                     staging_future.result()
-                    record.set_staging_done()
                 if save_future is not None:
                     save_future.result()
-                    record.set_checkpoint_done()
             except Exception as e:
                 logger.warning(f"Error in tracking worker: {e}")
             finally:
                 self._tracking_queue.task_done()
 
-    def _track_staging_and_save(self, staging_future, save_future, record: CheckpointTiming):
+    def _track_staging_and_save(self, staging_future, save_future):
         """Queue a task to track staging and save completion."""
-        self._tracking_queue.put((staging_future, save_future, record))
+        self._tracking_queue.put((staging_future, save_future))
 
     def wait_for_tracking(self) -> None:
-        """Wait for all pending tracking tasks to complete.
-
-        This should be called before writing measurements to ensure all
-        checkpoint timing data has been recorded.
-        """
+        """Wait for all pending tracking tasks to complete."""
         if hasattr(self, "_tracking_queue"):
             self._tracking_queue.join()
 
