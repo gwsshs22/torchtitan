@@ -7,10 +7,11 @@
 from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable
+import os
 
 import torch
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
@@ -33,6 +34,8 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
 
 def _load_fineweb_dataset(dataset_path: str, split: str):
     """Load FineWeb dataset with default configuration."""
+    if os.environ.get("HF_DATASETS_FINEWEB_DISK_PART", ""):
+        return load_from_disk(os.environ["HF_DATASETS_FINEWEB_DISK_PART"])
     return load_dataset(dataset_path, name="sample-10BT", split="train")
 
 # Add your dataset here - more information at docs/datasets.md
