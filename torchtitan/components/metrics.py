@@ -165,7 +165,7 @@ class WandBLogger(BaseLogger):
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step)
+        self.wandb.log(wandb_metrics, step=step, commit=True)
 
     def close(self) -> None:
         if self.wandb.run is not None:

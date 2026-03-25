@@ -1046,6 +1046,27 @@ class Leto:
     standby_poll_interval: float = 0.5
     """Polling interval in seconds for standby processes checking activation status."""
 
+    fault_injection_step_enabled: bool = False
+    """Enable step-based fault injection (worker self-injects faults at specific steps)."""
+
+    fault_injection_step_interval: int = 0
+    """Inject a fault every N training steps. 0 = disabled."""
+
+    fault_injection_step_rank_mode: str = "single"
+    """Which ranks fault: 'single' (one rank per step), 'tp' (all ranks in TP group), 'fsdp' (all ranks in FSDP group)."""
+
+    fault_injection_step_barrier: bool = False
+    """If True, call dist.barrier() before raising the fault exception."""
+
+    fault_injection_step_seed: int = 42
+    """Seed for deterministic hash used in rank selection for step-based fault injection."""
+
+    fault_injection_start_step: int = 0
+    """First step at which faults can be injected (0 = from the beginning)."""
+
+    fault_injection_end_step: int = 0
+    """Last step at which faults can be injected (0 = until training ends)."""
+
 @dataclass
 class JobConfig:
     """
