@@ -259,6 +259,9 @@ class Training:
     steps: int = 10000
     """How many train steps to run"""
 
+    max_steps: int = -1
+    """Max steps for LR scheduler decay. If -1, defaults to training.steps."""
+
     enable_cpu_offload: bool = False
     """
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP

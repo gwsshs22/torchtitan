@@ -345,8 +345,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizers = self.train_spec.build_optimizers_fn(
             self.model_parts, job_config.optimizer, parallel_dims, self.ft_manager
         )
+        lr_steps = job_config.training.max_steps if job_config.training.max_steps > 0 else job_config.training.steps
         self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
-            self.optimizers, job_config.lr_scheduler, job_config.training.steps
+            self.optimizers, job_config.lr_scheduler, lr_steps
         )
 
         # Initialize trainer states that will be saved in checkpoint.
@@ -820,7 +821,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if not fault_triggered:
             self.optimizers.step()
-            self.lr_schedulers.step()
+        
+        self.lr_schedulers.step()
 
         # Barrier: all ranks participate (faulting ranks barrier then crash,
         # non-faulting ranks barrier then continue normally)
