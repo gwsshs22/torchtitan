@@ -1067,6 +1067,12 @@ class Leto:
     fault_injection_end_step: int = 0
     """Last step at which faults can be injected (0 = until training ends)."""
 
+    fault_injection_raise_error: bool = False
+    """If True, raise RuntimeError on fault. If False (default), skip optimizer.step() instead."""
+
+    fault_injection_target_rank: int = -1
+    """If >= 0, always fault this specific rank instead of selecting via hash. Compatible with rank_mode."""
+
 @dataclass
 class JobConfig:
     """

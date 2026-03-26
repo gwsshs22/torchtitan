@@ -38,6 +38,15 @@ def _load_fineweb_dataset(dataset_path: str, split: str):
         return load_from_disk(os.environ["HF_DATASETS_FINEWEB_DISK_PART"])
     return load_dataset(dataset_path, name="sample-10BT", split="train")
 
+
+def _load_fineweb_val_dataset(dataset_path: str, num_samples: int = 1024):
+    """Load the last `num_samples` documents from FineWeb as a validation set."""
+    if os.environ.get("HF_DATASETS_FINEWEB_DISK_PART", ""):
+        ds = load_from_disk(os.environ["HF_DATASETS_FINEWEB_DISK_PART"])
+    else:
+        ds = load_dataset(dataset_path, name="sample-10BT", split="train")
+    return ds.select(range(len(ds) - num_samples, len(ds)))
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -58,6 +67,11 @@ DATASETS = {
     "fineweb": DatasetConfig(
         path="HuggingFaceFW/fineweb",
         loader=partial(_load_fineweb_dataset, split="train"),
+        sample_processor=_process_c4_text,
+    ),
+    "fineweb_val": DatasetConfig(
+        path="HuggingFaceFW/fineweb",
+        loader=_load_fineweb_val_dataset,
         sample_processor=_process_c4_text,
     ),
 }

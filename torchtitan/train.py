@@ -471,7 +471,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 sys.exit(0)
             time.sleep(poll_interval)
 
-    def maybe_inject_fault(self):
+    def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
         When enabled, every `fault_injection_step_interval` steps, a deterministic
@@ -482,15 +482,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         If `fault_injection_step_barrier` is True, all ranks call dist.barrier()
         before the faulting rank(s) raise an exception.
+
+        Returns:
+            True if a fault was triggered (and raise_error is False), False otherwise.
         """
         import hashlib
 
         leto_cfg = self.job_config.leto
 
         if not leto_cfg.fault_injection_step_enabled:
-            return
+            return False
         if leto_cfg.fault_injection_step_interval <= 0:
-            return
+            return False
 
         # self.step is 1-indexed (incremented at start of training loop)
         step = self.step
@@ -500,12 +503,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         start_step = leto_cfg.fault_injection_start_step
         end_step = leto_cfg.fault_injection_end_step
         if start_step > 0 and step < start_step:
-            return
+            return False
         if end_step > 0 and step > end_step:
-            return
+            return False
 
         if step % interval != 0:
-            return
+            return False
 
         # Skip fault on the first step after checkpoint restore to prevent
         # infinite loop (fault at step N -> restore to N-1 -> step N faults again)
@@ -514,15 +517,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"[STEP FAULT INJECTION] Skipping fault at step {step} "
                 f"(first step after restore from step {self._restored_step})"
             )
-            return
+            return False
 
-        # Determine target rank via deterministic hash
+        # Determine target rank
         world_size = self.parallel_dims.world_size
         global_rank = int(os.environ["RANK"])
-        seed = leto_cfg.fault_injection_step_seed
 
-        h = hashlib.sha256(f"{seed}:{step}".encode()).hexdigest()
-        target_rank = int(h, 16) % world_size
+        # Use explicit target rank if set, otherwise select via deterministic hash
+        if leto_cfg.fault_injection_target_rank >= 0:
+            target_rank = leto_cfg.fault_injection_target_rank
+        else:
+            seed = leto_cfg.fault_injection_step_seed
+            h = hashlib.sha256(f"{seed}:{step}".encode()).hexdigest()
+            target_rank = int(h, 16) % world_size
 
         # Determine if this rank should fault based on rank_mode
         rank_mode = leto_cfg.fault_injection_step_rank_mode
@@ -532,6 +539,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             should_fault = (global_rank == target_rank)
         elif rank_mode == "tp":
             mesh_tensor = self.parallel_dims.get_mesh("tp").mesh
+            if mesh_tensor.ndim == 1:
+                mesh_tensor = mesh_tensor.unsqueeze(0)
             for group_idx in range(mesh_tensor.shape[0]):
                 group_ranks = mesh_tensor[group_idx].tolist()
                 if target_rank in group_ranks and global_rank in group_ranks:
@@ -539,6 +548,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     break
         elif rank_mode == "fsdp":
             mesh_tensor = self.parallel_dims.get_mesh("fsdp").mesh
+            if mesh_tensor.ndim == 1:
+                mesh_tensor = mesh_tensor.unsqueeze(0)
             for group_idx in range(mesh_tensor.shape[0]):
                 group_ranks = mesh_tensor[group_idx].tolist()
                 if target_rank in group_ranks and global_rank in group_ranks:
@@ -546,17 +557,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     break
 
         if not should_fault:
-            return
-        
+            return False
+
         torch.cuda.synchronize()
         logger.info(
             f"[STEP FAULT INJECTION] step={step}, rank={global_rank}, "
             f"target_rank={target_rank}, mode={rank_mode}"
         )
 
-        raise RuntimeError(
-            f"[STEP FAULT INJECTION] Fault at step {step} on rank {global_rank}"
+        if leto_cfg.fault_injection_raise_error:
+            time.sleep(3.0)
+            raise RuntimeError(
+                f"[STEP FAULT INJECTION] Fault at step {step} on rank {global_rank}"
+            )
+
+        # Skip optimizer.step() instead of raising
+        logger.info(
+            f"[STEP FAULT INJECTION] Skipping optimizer.step() at step {step} "
+            f"on rank {global_rank}"
         )
+        return True
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -796,10 +816,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self.checkpointer.maybe_wait_for_staging()
 
-        self.maybe_inject_fault()
+        fault_triggered = self.maybe_inject_fault()
 
-        self.optimizers.step()
-        self.lr_schedulers.step()
+        if not fault_triggered:
+            self.optimizers.step()
+            self.lr_schedulers.step()
+
+        # Barrier: all ranks participate (faulting ranks barrier then crash,
+        # non-faulting ranks barrier then continue normally)
+        if self.job_config.leto.fault_injection_step_barrier:
+            dist.barrier()
+        self.rmp_manager.maybe_commit()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -901,7 +928,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             while self.should_continue_training():
                 self.step += 1
                 _iter_start = time.monotonic()
-                
+
+
+                # Run validation if validator is available
+                if (
+                    self.job_config.validation.enable
+                    and self.validator.should_validate(self.step)
+                ):
+                    # pyrefly: ignore [missing-attribute]
+                    with self.loss_fn.no_rescale():
+                        # pyrefly: ignore [bad-argument-count]
+                        self.validator.validate(self.model_parts, self.step)
+
                 self.maybe_check_step_consistency(self._data_iterator)
                 # Handle stage input/output recording (before/after first iteration)
                 self.stage_input_recorder = maybe_record_stage_inputs(
@@ -924,22 +962,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
-
-                # Barrier: all ranks participate (faulting ranks barrier then crash,
-                # non-faulting ranks barrier then continue normally)
-                if self.job_config.leto.fault_injection_step_barrier:
-                    dist.barrier()
-                self.rmp_manager.maybe_commit()
-
-                # Run validation if validator is available
-                if (
-                    self.job_config.validation.enable
-                    and self.validator.should_validate(self.step)
-                ):
-                    # pyrefly: ignore [missing-attribute]
-                    with self.loss_fn.no_rescale():
-                        # pyrefly: ignore [bad-argument-count]
-                        self.validator.validate(self.model_parts, self.step)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:
