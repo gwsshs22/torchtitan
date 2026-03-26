@@ -160,6 +160,9 @@ class Validator(BaseValidator):
         model_parts: list[nn.Module],
         step: int,
     ) -> None:
+        # Reset validation dataloader to start from the beginning
+        self.validation_dataloader.reset()
+
         # Set model to eval mode
         for model in model_parts:
             model.eval()

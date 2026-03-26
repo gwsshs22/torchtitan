@@ -39,7 +39,7 @@ def _load_fineweb_dataset(dataset_path: str, split: str):
     return load_dataset(dataset_path, name="sample-10BT", split="train")
 
 
-def _load_fineweb_val_dataset(dataset_path: str, num_samples: int = 1024):
+def _load_fineweb_val_dataset(dataset_path: str, num_samples: int = 20000):
     """Load the last `num_samples` documents from FineWeb as a validation set."""
     if os.environ.get("HF_DATASETS_FINEWEB_DISK_PART", ""):
         ds = load_from_disk(os.environ["HF_DATASETS_FINEWEB_DISK_PART"])
@@ -168,6 +168,11 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                         self._data, "epoch"
                     ):
                         self._data.set_epoch(self._data.epoch + 1)
+
+    def reset(self):
+        """Reset dataset to the beginning, discarding any buffered tokens."""
+        self._sample_idx = 0
+        self._token_buffer = []
 
     def load_state_dict(self, state_dict):
         self._token_buffer = state_dict["token_buffer"]

@@ -111,6 +111,11 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
             kwargs.pop("persistent_workers", None)
             kwargs.pop("prefetch_factor", None)
 
+    def reset(self) -> None:
+        """Reset the underlying dataset to the beginning."""
+        if hasattr(self.dataset, "reset"):
+            self.dataset.reset()
+
     def state_dict(self) -> dict[str, Any]:
         # Store state only for dp rank to avoid replicating the same state across other dimensions.
         return {
