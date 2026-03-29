@@ -1040,6 +1040,8 @@ class Leto:
     enable_rmp_cpu: bool = False
     """Enable RMP for Gemini CPU shared memory pools."""
 
+    enable_skip_commit: bool = False
+
     rmp_server_port: int = 52051
     """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
 
@@ -1075,6 +1077,9 @@ class Leto:
 
     fault_injection_target_rank: int = -1
     """If >= 0, always fault this specific rank instead of selecting via hash. Compatible with rank_mode."""
+
+    fault_injection_nocommit: bool = False
+    """If True, reset dataloader and lr scheduler at the start of the next step after a faulted step."""
 
 @dataclass
 class JobConfig:

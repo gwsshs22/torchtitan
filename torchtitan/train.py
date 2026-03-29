@@ -354,6 +354,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self._prev_step_faulted = False
 
         self.rmp_manager = RmpManager(
             leto_config=job_config.leto,
@@ -557,6 +558,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     should_fault = True
                     break
 
+        # All ranks mark the fault so nocommit reset happens everywhere
+        self._prev_step_faulted = True
+
         if not should_fault:
             return False
 
@@ -578,6 +582,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"on rank {global_rank}"
         )
         return True
+
+    def maybe_reset_after_fault(self):
+        """Reset dataloader and lr scheduler if the previous step faulted and nocommit is enabled."""
+        if not self._prev_step_faulted:
+            return
+
+        logger.info(
+            f"[NOCOMMIT] Resetting dataloader and lr scheduler "
+            f"after fault at step {self.step - 1}"
+        )
+        self._data_iterator = self.batch_generator(self.dataloader)
+        lr_steps = (
+            self.job_config.training.max_steps
+            if self.job_config.training.max_steps > 0
+            else self.job_config.training.steps
+        )
+        self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
+            self.optimizers, self.job_config.lr_scheduler, lr_steps
+        )
+        self._prev_step_faulted = False
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -931,6 +955,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 _iter_start = time.monotonic()
 
+                self.maybe_reset_after_fault()
 
                 # Run validation if validator is available
                 if (

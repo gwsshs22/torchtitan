@@ -50,6 +50,7 @@ class RmpManager:
         if not self.enabled:
             return
 
+        self.skip_commit = leto_config.enable_skip_commit
         self.model_parts = model_parts
         self.optimizers = optimizers
         self.states = states
@@ -147,6 +148,9 @@ class RmpManager:
     def maybe_commit(self):
         if not self.enabled:
             return
+        if self.skip_commit:
+            return
+
         torch.cuda.synchronize()
         optim_metadata = {}
         metadata = {
@@ -162,6 +166,8 @@ class RmpManager:
         self.rmp_client.commit_metadata(metadata)
 
     def _load_cpu_metadata(self):
+        if self.skip_commit:
+            return
         committed_metadata = self.rmp_client.get_committed_metadata()
         state_dict_to_stateful(self.states, committed_metadata["TRAIN"])
 
