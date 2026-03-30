@@ -144,10 +144,11 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        metrics_config = job_config.metrics
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
-            project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
+            project=metrics_config.wandb_project or os.getenv("WANDB_PROJECT", "torchtitan"),
+            name=metrics_config.wandb_run_name or os.getenv("WANDB_RUN_NAME", None),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=os.getenv("WANDB_RUN_TAGS", None),

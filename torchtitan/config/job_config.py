@@ -95,6 +95,12 @@ class Metrics:
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
 
+    wandb_project: str = ""
+    """WandB project name. Overrides WANDB_PROJECT env var if set."""
+
+    wandb_run_name: str = ""
+    """WandB run name. Overrides WANDB_RUN_NAME env var if set."""
+
 
 @dataclass
 class Model:
