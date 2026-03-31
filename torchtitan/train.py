@@ -30,6 +30,7 @@ from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
+    GPUMemoryMonitor,
 )
 from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.components.skip_shape_infer import (
@@ -122,6 +123,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+
+        # Start pynvml-based GPU memory monitor as early as possible
+        if job_config.metrics.enable_gpu_memory_monitor:
+            save_dir = (
+                os.environ.get("LETO_LOGS_DIR") or job_config.job.dump_folder
+                if job_config.metrics.save_gpu_memory_trace
+                else None
+            )
+            self.gpu_memory_monitor = GPUMemoryMonitor(
+                local_rank=int(os.environ["LOCAL_RANK"]),
+                rank=global_rank,
+                save_dir=save_dir,
+                interval=job_config.metrics.gpu_memory_monitor_interval,
+            )
+        else:
+            self.gpu_memory_monitor = None
+
         batch_degree, batch_rank = parallel_dims.get_batch_info(global_rank)
         # pyrefly: ignore [bad-argument-type]
         self.ft_manager = FTManager(job_config.fault_tolerance)
@@ -188,7 +206,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else self.train_spec.build_metrics_processor_fn
         )
         self.metrics_processor = build_metrics_processor_fn(
-            job_config, parallel_dims, model_args
+            job_config, parallel_dims, model_args,
+            gpu_memory_monitor=self.gpu_memory_monitor,
         )
         color = self.metrics_processor.color
 

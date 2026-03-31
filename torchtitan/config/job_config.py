@@ -70,6 +70,7 @@ class Profiling:
     """Memory snapshot files location"""
 
 
+
 @dataclass
 class Metrics:
     log_freq: int = 10
@@ -100,6 +101,15 @@ class Metrics:
 
     wandb_run_name: str = ""
     """WandB run name. Overrides WANDB_RUN_NAME env var if set."""
+
+    enable_gpu_memory_monitor: bool = False
+    """Enable pynvml-based GPU memory polling (nvidia-smi level) on a background thread."""
+
+    gpu_memory_monitor_interval: float = 1.0
+    """Polling interval in seconds for the GPU memory monitor."""
+
+    save_gpu_memory_trace: bool = False
+    """Save per-rank GPU memory timeseries to CSV files in the dump folder."""
 
 
 @dataclass
