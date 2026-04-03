@@ -140,17 +140,21 @@ class SnapshotExecutor:
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
 
+        # Allocate as uint8 byte buffers for dtype-agnostic P2P transfer.
+        # block_size is in elements but we need bytes for the largest possible block.
+        max_block_bytes = self.block_size * sample_tensor.element_size()
         self._gpu_buffers = [
-            torch.zeros(self.block_size, dtype=sample_tensor.dtype, device="cuda"),
-            torch.zeros(self.block_size, dtype=sample_tensor.dtype, device="cuda"),
+            torch.zeros(max_block_bytes, dtype=torch.uint8, device="cuda"),
+            torch.zeros(max_block_bytes, dtype=torch.uint8, device="cuda"),
         ]
 
         self._local_copy_stream = torch.cuda.Stream()
         self._copy_stream = torch.cuda.Stream()
         self._p2p_stream = torch.cuda.Stream()
         self._local_copy_event = torch.cuda.Event()  # Reusable event for local GPU→CPU copy
-        self._p2p_copy_event = torch.cuda.Event()  # Reusable event for P2P copy
-        self._first_copy_event_recorded = False
+        # One event per double-buffer slot: block N+2 (same buffer as N) waits for N's copy
+        self._p2p_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._p2p_copy_event_recorded = [False, False]
 
         # Distributed setup - compute ranks within FSDP group
         self._peer_global_rank = self.snapshot_group.peer_global_rank
@@ -359,7 +363,7 @@ class SnapshotExecutor:
 
         self._is_snapshot_step = True
         self._snapshot_step = curr_step
-        self._first_copy_event_recorded = False
+        self._p2p_copy_event_recorded = [False, False]
         self._reset_for_new_step()
 
         if self.tp_process_group is not None:
@@ -385,10 +389,8 @@ class SnapshotExecutor:
             return
 
         self._comm_gap_id += 1
-
         if self._comm_gap_id in self._snapshot_strategy:
             num_blocks = self._snapshot_strategy[self._comm_gap_id]
-
             comm_stream = torch.cuda.current_stream()
             with torch.cuda.stream(self._p2p_stream):
                 if async_op:
@@ -413,22 +415,32 @@ class SnapshotExecutor:
 
         block_id = self._cur_block_id
         gpu_block = self._gpu_blocks[block_id]
-        block_size = self._block_sizes[block_id]
 
-        output_tensor = self._gpu_buffers[self._gpu_buffer_id][:block_size]
+        # View as uint8 for dtype-agnostic P2P (avoids NCCL size mismatch
+        # when gpu_block dtype differs from peer's, e.g. bfloat16 vs float32).
+        gpu_block_bytes = gpu_block.view(torch.uint8)
+        block_bytes = gpu_block_bytes.numel()
+
+        buf_id = self._gpu_buffer_id
+        output_tensor = self._gpu_buffers[buf_id][:block_bytes]
         self._gpu_buffer_id = 1 - self._gpu_buffer_id
 
-        if self._first_copy_event_recorded:
-            self._p2p_stream.wait_event(self._p2p_copy_event)
+        # Wait only for the previous copy that used THIS buffer (2 blocks ago),
+        # not the immediately preceding copy which uses the other buffer.
+        if self._p2p_copy_event_recorded[buf_id]:
+            self._p2p_stream.wait_event(self._p2p_copy_events[buf_id])
 
-        self.snapshot_group.sendrecv_tensor(gpu_block, output_tensor)
+        self.snapshot_group.sendrecv_tensor(gpu_block_bytes, output_tensor)
 
         with torch.cuda.stream(self._copy_stream):
             cpu_block = self.remote_curr.get_block(block_id)
+            # View cpu_block as uint8 to match output_tensor dtype (avoids GPU cast kernel)
+            cpu_block_bytes = cpu_block.view(torch.uint8)
+
             self._copy_stream.wait_stream(self._p2p_stream)
-            cpu_block.copy_(output_tensor, non_blocking=True)
-            self._p2p_copy_event.record()
-            self._first_copy_event_recorded = True
+            cpu_block_bytes.copy_(output_tensor, non_blocking=True)
+            self._p2p_copy_events[buf_id].record()
+            self._p2p_copy_event_recorded[buf_id] = True
 
         self._cur_block_id += 1
 
@@ -438,7 +450,6 @@ class SnapshotExecutor:
 
         if self._is_snapshot_step:
             assert self._cur_block_id == self._total_blocks
-
             # Wait for background thread (Gloo exchange + local copy launch)
             self._snapshot_future.result()
             curr_stream = torch.cuda.current_stream()
@@ -450,7 +461,6 @@ class SnapshotExecutor:
                 dist.barrier(group=self.tp_process_group)
             dist.barrier(group=self._fsdp_pg)
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
-
             # Mark snapshot step as complete
             self._is_snapshot_step = False
 
