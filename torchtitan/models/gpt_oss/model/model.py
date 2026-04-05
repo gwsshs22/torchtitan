@@ -284,9 +284,7 @@ class GptOssModel(ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args).to(
-                torch.bfloat16
-            )
+            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(

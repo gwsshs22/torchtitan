@@ -78,37 +78,23 @@ class InMemStateView:
         self.cpu_metadata = None
 
     def dump(self, path):
-        model_cpu_tensors = []
-        optim_cpu_tensors = []
+        # Save pool as a single uint8 view + metadata to avoid torch.save's
+        # "Cannot save multiple tensors that view the same data as
+        # different types" error when pool has mixed dtypes (e.g. bfloat16
+        # model params + float32 optimizer states).
+        # pool_bytes is a zero-copy view into pool_storage — no extra memory.
+        pool_bytes = torch.empty(0, dtype=torch.uint8)
+        pool_bytes.set_(source=self.pool_storage, storage_offset=0,
+                        size=(self.pool_storage.nbytes(),))
+
         state = {
             "_model_tensor_keys": self.model_keys,
-            "_model_cpu_tensors": model_cpu_tensors,
             "_optim_tensor_keys": self.optim_keys,
-            "_optim_cpu_tensors": optim_cpu_tensors,
-            "_cpu_metadata": self.cpu_metadata
+            "_cpu_metadata": self.cpu_metadata,
+            "_pool_bytes": pool_bytes,
+            "_model_metadata": self.model_metadata,
+            "_optim_metadata": self.optim_metadata,
         }
-
-        for key in self.model_keys:
-            meta = self.model_metadata[key]
-            tensor = torch.empty(0, dtype=meta['dtype'])
-            tensor.set_(
-                source=self.pool_storage,
-                storage_offset=meta['storage_offset'],
-                size=meta['shape'],
-                stride=meta['stride']
-            )
-            model_cpu_tensors.append(tensor)
-
-        for key in self.optim_keys:
-            meta = self.optim_metadata[key]
-            tensor = torch.empty(0, dtype=meta['dtype'])
-            tensor.set_(
-                source=self.pool_storage,
-                storage_offset=meta['storage_offset'],
-                size=meta['shape'],
-                stride=meta['stride']
-            )
-            optim_cpu_tensors.append(tensor)
 
         torch.save(state, path)
 

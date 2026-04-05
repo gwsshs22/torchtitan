@@ -111,6 +111,9 @@ class Metrics:
     save_gpu_memory_trace: bool = False
     """Save per-rank GPU memory timeseries to CSV files in the dump folder."""
 
+    save_expert_dist: bool = False
+    """Save per-step expert token distribution (first MoE layer) to CSV per rank."""
+
 
 @dataclass
 class Model:

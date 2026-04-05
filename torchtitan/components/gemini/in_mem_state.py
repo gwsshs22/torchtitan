@@ -292,6 +292,23 @@ class InMemState:
         assert self._tensor_blocks is not None, "Must call compute_tensor_blocks first"
         return self._tensor_blocks[block_id]
 
+    @staticmethod
+    def _reconstruct_tensors_from_pool(pool_bytes, keys, metadata):
+        """Reconstruct typed tensor views from raw pool bytes."""
+        pool_storage = pool_bytes.untyped_storage()
+        tensors = []
+        for key in keys:
+            meta = metadata[key]
+            tensor = torch.empty(0, dtype=meta['dtype'])
+            tensor.set_(
+                source=pool_storage,
+                storage_offset=meta['storage_offset'],
+                size=meta['shape'],
+                stride=meta['stride']
+            )
+            tensors.append(tensor)
+        return tensors
+
     def load_state_dict(self, state_dict: dict[str, Any]):
         cpu_metadata = state_dict["_cpu_metadata"]
         state_dict_to_stateful(self._train_states, cpu_metadata["TRAIN"])
@@ -299,9 +316,22 @@ class InMemState:
         assert self._model_tensor_keys == state_dict["_model_tensor_keys"]
         assert self._optim_tensor_keys == state_dict["_optim_tensor_keys"]
         checkpointed_step = self._train_states["train_state"].step
+
+        # Support both old format (direct tensor lists) and new format (pool bytes + metadata)
+        if "_pool_bytes" in state_dict:
+            pool_bytes = state_dict["_pool_bytes"]
+            model_cpu_tensors = self._reconstruct_tensors_from_pool(
+                pool_bytes, self._model_tensor_keys, state_dict["_model_metadata"]
+            )
+            optim_cpu_tensors = self._reconstruct_tensors_from_pool(
+                pool_bytes, self._optim_tensor_keys, state_dict["_optim_metadata"]
+            )
+        else:
+            model_cpu_tensors = state_dict["_model_cpu_tensors"]
+            optim_cpu_tensors = state_dict["_optim_cpu_tensors"]
+
         for gpu_tensor, cpu_tensor in zip(
-            self._model_gpu_tensors,
-            state_dict["_model_cpu_tensors"]
+            self._model_gpu_tensors, model_cpu_tensors
         ):
             gpu_tensor.copy_(cpu_tensor, non_blocking=True)
 
@@ -309,7 +339,7 @@ class InMemState:
         optim_state_dict = self._optimizers.state_dict()
 
         for k, cpu_tensor in zip(
-            self._optim_tensor_keys, state_dict["_optim_cpu_tensors"]
+            self._optim_tensor_keys, optim_cpu_tensors
         ):
             optim_new_state_dict[k] = _to_dtensor(cpu_tensor, optim_state_dict[k])
 

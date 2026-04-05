@@ -67,6 +67,47 @@ try:
 except ImportError:
     _LETO_AVAILABLE = False
 
+
+class ExpertDistTracker:
+    """Tracks per-step expert token distribution for the first MoE layer."""
+
+    def __init__(self, model: torch.nn.Module, dump_folder: str, rank: int):
+        self._moe_layer = None
+        # Find first MoE layer
+        from torchtitan.models.moe.moe import MoE
+        for module in model.modules():
+            if isinstance(module, MoE):
+                self._moe_layer = module
+                break
+        if self._moe_layer is None:
+            logger.warning("[ExpertDist] No MoE layer found, disabling tracker")
+            return
+
+        base_dir = os.environ.get("LETO_LOGS_DIR") or dump_folder
+        experts_dir = os.path.join(base_dir, "experts")
+        os.makedirs(experts_dir, exist_ok=True)
+        self._csv_path = os.path.join(experts_dir, f"expert_dist_rank_{rank}.csv")
+        num_experts = self._moe_layer.tokens_per_expert.numel()
+        header = "step," + ",".join(f"expert_{i}" for i in range(num_experts))
+        with open(self._csv_path, "w") as f:
+            f.write(header + "\n")
+        self._prev_tokens = self._moe_layer.tokens_per_expert.clone()
+
+    def begin_step(self):
+        if self._moe_layer is None:
+            return
+        self._prev_tokens.copy_(self._moe_layer.tokens_per_expert)
+
+    def end_step(self, step: int):
+        if self._moe_layer is None:
+            return
+        delta = self._moe_layer.tokens_per_expert - self._prev_tokens
+        counts = delta.long().tolist()
+        line = f"{step}," + ",".join(str(c) for c in counts)
+        with open(self._csv_path, "a") as f:
+            f.write(line + "\n")
+
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # core configs
     job_config: JobConfig
@@ -398,6 +439,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
 
+        # Expert distribution tracker
+        self._expert_dist_tracker = None
+        if job_config.metrics.save_expert_dist:
+            self._expert_dist_tracker = ExpertDistTracker(
+                self.model_parts[0], job_config.job.dump_folder, dist.get_rank()
+            )
 
         if job_config.checkpoint.use_gemini:
             self.checkpointer.lazy_init(
@@ -838,6 +885,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
+        if self._expert_dist_tracker is not None:
+            self._expert_dist_tracker.begin_step()
+
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
@@ -850,6 +900,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             input_dict, labels = next(data_iterator)
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
+
+        if self._expert_dist_tracker is not None:
+            self._expert_dist_tracker.end_step(self.step)
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
