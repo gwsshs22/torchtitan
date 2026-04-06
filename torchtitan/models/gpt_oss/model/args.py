@@ -86,6 +86,10 @@ class GptOssModelArgs(BaseModelArgs):
             )
             self.moe_args.use_grouped_mm = False
 
+        self.moe_args._debug_force_load_balance = (
+            job_config.debug.moe_force_load_balance
+        )
+
         if job_config.parallelism.context_parallel_degree > 1:
             raise NotImplementedError(
                 "CP support for gpt-oss model is still in progress."
