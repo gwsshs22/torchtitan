@@ -25,6 +25,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.eager_init import maybe_eager_init
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
+from torchtitan.components.fsdp_collective_manager import FsdpCollectiveManager
 from torchtitan.components.gemini.checkpoint import GeminiCheckpointManager
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
@@ -446,6 +447,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.model_parts[0], job_config.job.dump_folder, dist.get_rank()
             )
 
+        # Unified FSDP collective manager: Gemini registers __call__,
+        # RMP registers per-group allocate, then attach() registers all at once.
+        collective_manager = FsdpCollectiveManager()
+
         if job_config.checkpoint.use_gemini:
             self.checkpointer.lazy_init(
                 model_parts=self.model_parts,
@@ -455,6 +460,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 parallel_dims=self.parallel_dims,
                 rmp_manager=self.rmp_manager,
                 enable_rmp_cpu=job_config.leto.enable_rmp_cpu,
+                collective_manager=collective_manager,
             )
         else:
             self.checkpointer = CheckpointManager(
@@ -475,6 +481,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 base_folder=job_config.job.dump_folder,
                 ft_manager=self.ft_manager,
             )
+
+        self.rmp_manager.init_gradient_allocator(collective_manager, self.model_parts)
+        collective_manager.attach(self.model_parts)
 
         # Build validator if validation is configured
         if job_config.validation.enable:

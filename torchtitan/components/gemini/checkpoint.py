@@ -3,10 +3,9 @@ import os
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp._fully_shard import FSDPModule
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     DefaultAllGather,
-    DefaultReduceScatter
+    DefaultReduceScatter,
 )
 import torch.nn as nn
 
@@ -23,53 +22,6 @@ from torchtitan.distributed import ParallelDims
 
 from torchtitan.components.gemini.snapshot_executor import SnapshotExecutor
 from torchtitan.components.gemini.snapshot_profiler import SnapshotProfiler
-
-class GeminiAllGather(DefaultAllGather):
-    def __init__(self, callback):
-        super().__init__()
-        self._callback = callback
-
-    def __call__(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group: dist.ProcessGroup,
-        async_op: bool = False,
-    ) -> dist.Work | None:
-        self._callback.begin_collective()
-        handle = super().__call__(
-            output_tensor,
-            input_tensor,
-            group=group,
-            async_op=async_op,
-        )
-        self._callback.end_collective(async_op, handle)
-        return handle
-
-class GeminiReduceScatter(DefaultReduceScatter):
-
-    def __init__(self, callback):
-        super().__init__()
-        self._callback = callback
-
-    def __call__(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group: Any,
-        op: Any,
-        async_op: bool = False,
-    ) -> dist.Work:
-        self._callback.begin_collective()
-        handle = super().__call__(
-            output_tensor=output_tensor,
-            input_tensor=input_tensor,
-            group=group,
-            op=op,
-            async_op=async_op,
-        )
-        self._callback.end_collective(async_op, handle)
-        return handle
 
 class GeminiCheckpointManager:
     def __init__(
@@ -112,6 +64,7 @@ class GeminiCheckpointManager:
         rmp_restored: bool = False,
         rmp_manager=None,
         enable_rmp_cpu: bool = False,
+        collective_manager=None,
     ) -> None:
         assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
 
@@ -143,20 +96,45 @@ class GeminiCheckpointManager:
         )
 
         checkpoint_config = self._checkpoint_config
-        if checkpoint_config.gemini_profile_comm_gaps:
-            self._gemini_all_gather = GeminiAllGather(self._profiler)
-            self._gemini_reduce_scatter = GeminiReduceScatter(self._profiler)
-        else:
-            self._gemini_all_gather = GeminiAllGather(self._executor)
-            self._gemini_reduce_scatter = GeminiReduceScatter(self._executor)
-        self._register_collectives(model_parts)
+        callback = (
+            self._profiler
+            if checkpoint_config.gemini_profile_comm_gaps
+            else self._executor
+        )
+        self._register_collectives(callback, collective_manager)
 
-    def _register_collectives(self, model_parts):
-        for model_part in model_parts:
-            for module in model_part.modules():
-                if isinstance(module, FSDPModule):
-                    module.set_custom_all_gather(self._gemini_all_gather)
-                    module.set_custom_reduce_scatter(self._gemini_reduce_scatter)
+    def _register_collectives(self, callback, collective_manager=None):
+        default_ag = DefaultAllGather()
+        default_rs = DefaultReduceScatter()
+
+        def ag_call(output_tensor, input_tensor, group, async_op=False):
+            callback.begin_collective()
+            handle = default_ag(
+                output_tensor, input_tensor, group=group, async_op=async_op
+            )
+            callback.end_collective(async_op, handle)
+            return handle
+
+        def rs_call(output_tensor, input_tensor, group, op, async_op=False):
+            callback.begin_collective()
+            handle = default_rs(
+                output_tensor=output_tensor, input_tensor=input_tensor,
+                group=group, op=op, async_op=async_op,
+            )
+            callback.end_collective(async_op, handle)
+            return handle
+
+        if collective_manager is not None:
+            collective_manager.set_all_gather_call(ag_call)
+            collective_manager.set_reduce_scatter_call(rs_call)
+        else:
+            from torchtitan.components.fsdp_collective_manager import (
+                FsdpCollectiveManager,
+            )
+            # Standalone: create a manager just for Gemini
+            mgr = FsdpCollectiveManager()
+            mgr.set_all_gather_call(ag_call)
+            mgr.set_reduce_scatter_call(rs_call)
 
     @torch.no_grad()
     def begin_step(self, curr_step: int, last_step: bool = False) -> None:

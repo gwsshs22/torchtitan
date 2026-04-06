@@ -10,6 +10,7 @@ from torchtitan.components.checkpoint import (
     DATALOADER,
     LR_SCHEDULER,
 )
+from torchtitan.components.rmp_grad_alloc import RmpGradientAllocator
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import (
     _to_local_tensor,
@@ -46,6 +47,9 @@ class RmpManager:
 
             # Connect to RMP server
             self.rmp_client = RmpClient(self.rmp_server_address)
+
+        self._grad_allocator: RmpGradientAllocator | None = None
+        self._allocated: bool = True  # set by maybe_init
 
         if not self.enabled:
             return
@@ -104,6 +108,7 @@ class RmpManager:
 
         # Request all tensors from RMP server in one batch
         shared_tensors, allocated = self.rmp_client.get_or_allocate_tensors(tensor_specs)
+        self._allocated = allocated
 
         # Map shared tensors to their IDs, wrapping with DTensor if needed
         for tid, name in tid_to_name.items():
@@ -174,6 +179,17 @@ class RmpManager:
         optim_state_dict = self.optimizers.state_dict()
         optim_state_dict.update(committed_metadata["OPTIM"])
         self.optimizers.load_state_dict(optim_state_dict)
+
+    def init_gradient_allocator(self, collective_manager, model_parts):
+        """Register RMP gradient allocator on the collective manager."""
+        if not self.enabled:
+            return
+        self._grad_allocator = RmpGradientAllocator(
+            rmp_client=self.rmp_client,
+            device=self.device,
+            allocated=self._allocated,
+        )
+        self._grad_allocator.register(collective_manager, model_parts)
 
     def get_or_allocate_cpu_memory(self, name, num_bytes):
         return self.rmp_client.get_or_allocate_cpu_memory(name, num_bytes)
