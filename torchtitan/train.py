@@ -887,6 +887,79 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         return loss
 
+    def maybe_dump_optimizer_info(self):
+        """Dump optimizer setup (shapes, dtypes, hyperparams) to JSON.
+
+        Controlled by leto.dump_optimizer_info config. Runs once on step 1,
+        rank 0 only. The output is used by resilient optimizer tests.
+        """
+        if not self.job_config.leto.dump_optimizer_info:
+            return
+        if self.step != 1 or dist.get_rank() != 0:
+            return
+
+        import json
+        dump = {"optimizers": []}
+        for optimizer in self.optimizers:
+            opt_info = {
+                "class": optimizer.__class__.__name__,
+                "defaults": {
+                    k: v for k, v in optimizer.defaults.items()
+                    if not callable(v) and not isinstance(v, torch.Tensor)
+                },
+                "param_groups": [],
+            }
+            for pg in optimizer.param_groups:
+                pg_info = {
+                    "num_params": len(pg["params"]),
+                    "lr": pg.get("lr"),
+                    "betas": pg.get("betas"),
+                    "eps": pg.get("eps"),
+                    "weight_decay": pg.get("weight_decay"),
+                    "fused": pg.get("fused"),
+                    "foreach": pg.get("foreach"),
+                    "params": [],
+                }
+                for param in pg["params"]:
+                    local_p = param._local_tensor if hasattr(param, '_local_tensor') else param
+                    p_info = {
+                        "shape": list(local_p.shape),
+                        "dtype": str(local_p.dtype),
+                        "device": str(local_p.device),
+                        "requires_grad": param.requires_grad,
+                    }
+                    if param in optimizer.state:
+                        state = optimizer.state[param]
+                        state_info = {}
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                local_v = v._local_tensor if hasattr(v, '_local_tensor') else v
+                                state_info[k] = {
+                                    "shape": list(local_v.shape),
+                                    "dtype": str(local_v.dtype),
+                                }
+                            else:
+                                state_info[k] = v
+                        p_info["state"] = state_info
+
+                    if param.grad is not None:
+                        local_g = param.grad._local_tensor if hasattr(param.grad, '_local_tensor') else param.grad
+                        p_info["grad"] = {
+                            "shape": list(local_g.shape),
+                            "dtype": str(local_g.dtype),
+                        }
+
+                    pg_info["params"].append(p_info)
+                opt_info["param_groups"].append(pg_info)
+            dump["optimizers"].append(opt_info)
+
+        dump_path = os.path.join(
+            self.job_config.job.dump_folder, "optimizer_info.json"
+        )
+        with open(dump_path, "w") as f:
+            json.dump(dump, f, indent=2)
+        logger.info(f"Dumped optimizer info to {dump_path}")
+
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -926,7 +999,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if not fault_triggered:
             self.optimizers.step()
-        
+
+        self.maybe_dump_optimizer_info()
+
         self.lr_schedulers.step()
 
         # Barrier: all ranks participate (faulting ranks barrier then crash,

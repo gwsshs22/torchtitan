@@ -1100,6 +1100,9 @@ class Leto:
     fault_injection_nocommit: bool = False
     """If True, reset dataloader and lr scheduler at the start of the next step after a faulted step."""
 
+    dump_optimizer_info: bool = False
+    """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
+
 @dataclass
 class JobConfig:
     """

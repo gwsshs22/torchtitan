@@ -44,6 +44,22 @@ gptoss_configs = {
         ),
         attn_mask_type="causal",
     ),
+    "1.25b": GptOssModelArgs(
+        dim=2348,
+        moe_inter_dim=2348,
+        n_layers=2,
+        moe_args=MoEArgs(
+            num_experts=8,
+            num_shared_experts=0,
+            score_func="softmax",
+            route_norm=False,
+            route_scale=1.0,
+            score_before_experts=False,
+            top_k=4,
+            use_grouped_mm=True,
+            load_balance_coeff=1e-3,
+        ),
+    ),
     "4b": GptOssModelArgs(
         n_layers=3,
         moe_args=MoEArgs(
