@@ -98,7 +98,9 @@ class ResilientOptimizer:
     ):
         self._optimizers = optimizers
         self._use_cuda_graph = use_cuda_graph
-        chunk_bytes = chunk_size_mb * 1024 * 1024
+        # chunk_size_mb = param bytes to update per chunk
+        # buffer needs 3x (param + exp_avg + exp_avg_sq)
+        chunk_bytes = chunk_size_mb * 3 * 1024 * 1024
 
         # -- collect slice entries, splitting large params ------------------
         all_slices: list[_SliceEntry] = []

@@ -1,27 +1,31 @@
-"""Resilient optimizer: zero GPU overhead via exponential bootstrap.
+"""Resilient optimizer: zero GPU overhead via CPU bootstrap + gradient reuse.
 
-Processes the optimizer step in chunks with fault-tolerant backup.
-Uses a tiny pinned CPU buffer to bootstrap, then exponentially grows
-the chunk size by harvesting freed gradient memory from completed
-chunks — achieving zero additional GPU memory overhead.
+One GPU→CPU copy, then exponential growth on GPU using freed gradients.
+Chunk size doubles every 3 chunks.
 
-Bootstrap (exponential growth):
-    Round 0: backup init_chunk_mb to CPU, step → frees grad memory
-    Round 1: backup init_chunk_mb to CPU, step → more grad memory
-    Round 2: backup 2×init to GPU grad buf, step → even more
-    Round 3: backup 4×init to GPU grad buf, step → ...
-    ...until chunk size reaches max_chunk_mb → steady state
+Terminology:
+    chunk_size     = bytes of PARAMETERS updated per chunk
+    input_buffer   = 3 × chunk_size (param + exp_avg + exp_avg_sq backup)
 
-Params are sorted by gradient size (descending) so that early rounds
-free the most memory per step, minimizing bootstrap rounds.
+Schedule (init_chunk_size=1MB, max_chunk_size=256MB):
+
+    CPU phase:  allocate 9MB CPU pinned (= init * 3 * 3)
+                backup 9MB state → step 3MB params → frees 3MB grad
+
+    GPU level 0: chunk_size=1MB, input_buf=3MB (fits in 3MB freed grad)
+                 ×3 steps → frees 3×1MB → pool=6MB
+
+    GPU level 1: chunk_size=2MB, input_buf=6MB (fits in 6MB pool)
+                 ×3 steps → frees 3×2MB → pool=12MB
+    ...
+    doubles every 3 steps until max_chunk_size
 
 Memory budget:
-    GPU: 0 extra (gradient memory is already allocated)
-    CPU: init_chunk_mb pinned (e.g. 4 MB)
+    GPU: 0 extra
+    CPU: 9 × init_chunk_size pinned
 
 Usage:
-    resilient_opt = ResilientOptimizer(optimizers, rmp_client, device,
-                                       init_chunk_mb=4, max_chunk_mb=256)
+    resilient_opt = ResilientOptimizer(optimizers, rmp_client, device)
     resilient_opt.step()
 """
 
@@ -29,6 +33,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
+from torch.cuda._pin_memory_utils import pin_memory
 from torch.distributed._tensor import DTensor
 
 from leto.rmp.client import RmpClient, TensorSpec
@@ -46,7 +51,7 @@ def _get_local(tensor):
 
 @dataclass
 class _ParamInfo:
-    """Per-parameter info before slicing into chunks."""
+    """Per-parameter info with pre-computed flat views (no alloc in hot path)."""
 
     param: torch.Tensor
     exp_avg: torch.Tensor
@@ -54,78 +59,39 @@ class _ParamInfo:
     step: torch.Tensor
     group: dict
     numel: int
+    param_elem_size: int  # bytes per element for param (and grad)
     bytes_per_elem: int  # param + exp_avg + exp_avg_sq per element
-    grad_bytes: int  # gradient bytes (param portion only)
-    backup_bytes: int  # total backup bytes
+    param_bytes: int  # numel × param_elem_size
+    backup_bytes: int  # numel × bytes_per_elem
+    # Pre-computed flat views (verified contiguous at init)
+    flat_param: torch.Tensor = None  # type: ignore[assignment]
+    flat_exp_avg: torch.Tensor = None  # type: ignore[assignment]
+    flat_exp_avg_sq: torch.Tensor = None  # type: ignore[assignment]
 
 
 @dataclass
 class _SliceEntry:
-    """One unit of work: a full param or a contiguous slice of one."""
+    """One unit of work: a contiguous slice of one param."""
 
-    param: torch.Tensor
-    exp_avg: torch.Tensor
-    exp_avg_sq: torch.Tensor
+    param_ref: torch.Tensor  # original nn.Parameter (for .grad access)
     step: torch.Tensor
     group: dict
     start: int
     end: int
     is_first_slice: bool
-    nbytes: int
-
-
-def _make_slices(params: list[_ParamInfo], chunk_bytes: int) -> list[_SliceEntry]:
-    """Split params into slices that fit in chunk_bytes."""
-    slices: list[_SliceEntry] = []
-    for p in params:
-        if p.backup_bytes <= chunk_bytes:
-            slices.append(
-                _SliceEntry(
-                    param=p.param, exp_avg=p.exp_avg, exp_avg_sq=p.exp_avg_sq,
-                    step=p.step, group=p.group,
-                    start=0, end=p.numel, is_first_slice=True,
-                    nbytes=p.backup_bytes,
-                )
-            )
-        else:
-            max_elems = chunk_bytes // p.bytes_per_elem
-            assert max_elems > 0
-            for s in range(0, p.numel, max_elems):
-                e = min(s + max_elems, p.numel)
-                slices.append(
-                    _SliceEntry(
-                        param=p.param, exp_avg=p.exp_avg, exp_avg_sq=p.exp_avg_sq,
-                        step=p.step, group=p.group,
-                        start=s, end=e, is_first_slice=(s == 0),
-                        nbytes=(e - s) * p.bytes_per_elem,
-                    )
-                )
-    return slices
-
-
-def _pack_chunks(slices: list[_SliceEntry], chunk_bytes: int) -> list[list[_SliceEntry]]:
-    """Pack slices into chunks that fit in chunk_bytes."""
-    chunks: list[list[_SliceEntry]] = []
-    cur: list[_SliceEntry] = []
-    cur_bytes = 0
-    for sl in slices:
-        if cur_bytes + sl.nbytes > chunk_bytes and cur:
-            chunks.append(cur)
-            cur = []
-            cur_bytes = 0
-        cur.append(sl)
-        cur_bytes += sl.nbytes
-    if cur:
-        chunks.append(cur)
-    return chunks
+    param_bytes: int  # (end-start) × param_elem_size
+    backup_bytes: int  # (end-start) × bytes_per_elem
+    # Pre-computed flat views (zero-copy, from _ParamInfo)
+    flat_param: torch.Tensor = None  # type: ignore[assignment]
+    flat_exp_avg: torch.Tensor = None  # type: ignore[assignment]
+    flat_exp_avg_sq: torch.Tensor = None  # type: ignore[assignment]
+    flat_grad: torch.Tensor = None  # set at step time (grad may change)
 
 
 class ResilientOptimizer:
-    """Zero-GPU-overhead resilient optimizer with exponential bootstrap.
+    """Zero-GPU-overhead resilient optimizer.
 
-    Sorts params by gradient size (descending), bootstraps with a tiny
-    CPU buffer, then doubles the chunk size each round by reusing freed
-    gradient memory until reaching max_chunk_mb.
+    CPU bootstrap (one copy) → 3-step doubling on freed gradient memory.
     """
 
     def __init__(
@@ -133,13 +99,13 @@ class ResilientOptimizer:
         optimizers,
         rmp_client: RmpClient,
         device: torch.device,
-        init_chunk_mb: int = 4,
-        max_chunk_mb: int = 256,
+        init_chunk_size_mb: int = 2,
+        max_chunk_size_mb: int = 256,
     ):
         self._optimizers = optimizers
         self._device = device
-        self._init_chunk_bytes = init_chunk_mb * 1024 * 1024
-        self._max_chunk_bytes = max_chunk_mb * 1024 * 1024
+        self._init_chunk_size = init_chunk_size_mb * 1024 * 1024
+        self._max_chunk_size = max_chunk_size_mb * 1024 * 1024
 
         # -- collect per-param info ----------------------------------------
         all_params: list[_ParamInfo] = []
@@ -154,7 +120,13 @@ class ResilientOptimizer:
                     lm = _get_local(state["exp_avg"])
                     lv = _get_local(state["exp_avg_sq"])
                     numel = lp.numel()
-                    bpe = lp.element_size() + lm.element_size() + lv.element_size()
+                    pes = lp.element_size()
+                    bpe = pes + lm.element_size() + lv.element_size()
+                    # Verify contiguity — flat views must not allocate.
+                    assert lp.is_contiguous(), f"param not contiguous: {lp.shape}"
+                    assert lm.is_contiguous(), f"exp_avg not contiguous: {lm.shape}"
+                    assert lv.is_contiguous(), f"exp_avg_sq not contiguous: {lv.shape}"
+
                     all_params.append(
                         _ParamInfo(
                             param=param,
@@ -163,25 +135,37 @@ class ResilientOptimizer:
                             step=state["step"],
                             group=group,
                             numel=numel,
+                            param_elem_size=pes,
                             bytes_per_elem=bpe,
-                            grad_bytes=numel * lp.element_size(),
+                            param_bytes=numel * pes,
                             backup_bytes=numel * bpe,
+                            flat_param=lp.view(-1),
+                            flat_exp_avg=lm.view(-1),
+                            flat_exp_avg_sq=lv.view(-1),
                         )
                     )
 
-        # Sort by gradient size descending — large grads first to maximize
-        # freed memory early in the bootstrap phase.
-        all_params.sort(key=lambda p: p.grad_bytes, reverse=True)
+        # Sort by param_bytes descending — large params freed first.
+        all_params.sort(key=lambda p: p.param_bytes, reverse=True)
 
         self._all_params = all_params
         self._num_params = len(all_params)
 
-        # -- allocate pinned CPU buffer (for bootstrap) --------------------
-        self._cpu_buffer = torch.empty(
-            self._init_chunk_bytes, dtype=torch.uint8, device="cpu",
-        ).pin_memory()
+        # -- CPU buffer: init_chunk_size × 3 × 3 --------------------------
+        # Backs up (init_chunk_size × 3) worth of params in one copy.
+        # Allocated via RMP so it survives faults and is accessible on recovery.
+        cpu_buffer_bytes = self._init_chunk_size * 3 * 3
+        cpu_storage, cpu_allocated = rmp_client.get_or_allocate_cpu_memory(
+            "resilient/cpu_buffer", cpu_buffer_bytes,
+        )
+        pin_memory(cpu_storage.data_ptr(), cpu_storage.nbytes())
+        self._cpu_buffer = torch.empty(0, dtype=torch.uint8).set_(
+            source=cpu_storage, storage_offset=0, size=(cpu_buffer_bytes,),
+        )
+        # The CPU phase updates this many param bytes:
+        self._cpu_phase_param_bytes = self._init_chunk_size * 3
 
-        # -- allocate RMP marker -------------------------------------------
+        # -- RMP marker ----------------------------------------------------
         device_idx = device.index if hasattr(device, "index") else 0
         marker_tensors, gpu_allocated = rmp_client.get_or_allocate_tensors(
             [TensorSpec(
@@ -194,126 +178,222 @@ class ResilientOptimizer:
             self._marker.fill_(_MARKER_IDLE)
             torch.cuda.current_stream().synchronize()
 
+        # -- Step counter (RMP-backed CPU) ------------------------------------
+        step_cnt_storage, step_cnt_allocated = rmp_client.get_or_allocate_cpu_memory(
+            "resilient/step_counter", 8,  # int64
+        )
+        self._cpu_step_counter = torch.empty(0, dtype=torch.int64).set_(
+            source=step_cnt_storage, storage_offset=0, size=(1,),
+        )
+        if step_cnt_allocated:
+            self._cpu_step_counter.fill_(int(all_params[0].step.item()))
+
+        # -- Precompute chunk schedule --------------------------------------
+        self._schedule = self._build_schedule()
+
         logger.info(
-            f"[ResilientOpt] {self._num_params} params "
-            f"(sorted by grad size desc), "
-            f"init_chunk: {init_chunk_mb} MB CPU, "
-            f"max_chunk: {max_chunk_mb} MB GPU"
+            f"[ResilientOpt] {self._num_params} params, "
+            f"{len(self._schedule)} chunks, "
+            f"init_chunk: {init_chunk_size_mb} MB, "
+            f"max_chunk: {max_chunk_size_mb} MB, "
+            f"CPU buffer: {cpu_buffer_bytes / (1024**2):.1f} MB"
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    @property
-    def needs_recovery(self) -> bool:
-        return self._marker.item() != _MARKER_IDLE
-
     def step(self):
-        """Exponential-bootstrap fault-tolerant optimizer step.
+        """Fault-tolerant optimizer step with 3-step doubling."""
+        self._cpu_step_counter += 1
+        self._run_chunks(resume_from=0)
 
-        Maintains a cursor into the sorted param list.  Each iteration:
-        1. Decide chunk_bytes based on freed gradient memory.
-        2. Take exactly one chunk's worth of elements from the cursor.
-        3. Backup → step → harvest gradient.
-        4. Try to double chunk_bytes for the next iteration.
+    def _run_chunks(self, resume_from: int):
+        """Execute chunks starting from resume_from.
+
+        Chunks before resume_from are treated as committed — only their
+        freed grad memory is harvested for scratch space.
         """
         freed_grad_segments: list[torch.Tensor] = []
-        freed_grad_bytes = 0
-        chunk_bytes = self._init_chunk_bytes
-        global_chunk_idx = 0
 
-        # Flatten all params into a stream of (param_info, elem_offset) work.
-        # We consume elements from this stream one chunk at a time.
-        param_cursor = 0  # index into self._all_params
-        elem_cursor = 0   # element offset within current param
+        for chunk_idx, chunk in enumerate(self._schedule):
+            if chunk_idx < resume_from:
+                # Committed chunk: harvest freed grad memory for scratch space.
+                self._resolve_grads(chunk)
+                self._harvest_grads(chunk, freed_grad_segments)
+                continue
 
-        while param_cursor < len(self._all_params):
-            # -- decide buffer and chunk size ------------------------------
-            # Try to grow chunk_bytes using freed gradient memory
-            while (
-                freed_grad_bytes >= min(chunk_bytes * 2, self._max_chunk_bytes)
-                and chunk_bytes < self._max_chunk_bytes
-            ):
-                chunk_bytes = min(chunk_bytes * 2, self._max_chunk_bytes)
+            backup_dest = (
+                [self._cpu_buffer] if chunk_idx == 0 else freed_grad_segments
+            )
 
-            if freed_grad_bytes >= chunk_bytes:
-                buf_segments = freed_grad_segments
-            else:
-                buf_segments = [self._cpu_buffer]
-                chunk_bytes = self._init_chunk_bytes
-
-            # -- fill one chunk from the cursor ----------------------------
-            chunk: list[_SliceEntry] = []
-            chunk_used = 0
-
-            while param_cursor < len(self._all_params) and chunk_used < chunk_bytes:
-                p = self._all_params[param_cursor]
-                remaining_elems = p.numel - elem_cursor
-                space_elems = (chunk_bytes - chunk_used) // p.bytes_per_elem
-                if space_elems <= 0:
-                    break
-
-                take_elems = min(remaining_elems, space_elems)
-                start = elem_cursor
-                end = elem_cursor + take_elems
-
-                chunk.append(_SliceEntry(
-                    param=p.param, exp_avg=p.exp_avg, exp_avg_sq=p.exp_avg_sq,
-                    step=p.step, group=p.group,
-                    start=start, end=end,
-                    is_first_slice=(start == 0),
-                    nbytes=take_elems * p.bytes_per_elem,
-                ))
-                chunk_used += take_elems * p.bytes_per_elem
-
-                elem_cursor += take_elems
-                if elem_cursor >= p.numel:
-                    param_cursor += 1
-                    elem_cursor = 0
-
-            if not chunk:
-                break
-
-            # -- backup, step, harvest -------------------------------------
-            self._marker.fill_(global_chunk_idx * 2)
-            self._backup_chunk_scatter(chunk, buf_segments)
-            self._marker.fill_(global_chunk_idx * 2 + 1)
+            self._marker.fill_(chunk_idx * 2)
+            self._backup_chunk_scatter(chunk, backup_dest)
+            self._marker.fill_(chunk_idx * 2 + 1)
             self._step_chunk(chunk)
-
-            for sl in chunk:
-                grad = _get_local(sl.param.grad)
-                flat_grad = grad.contiguous().view(-1)
-                seg = flat_grad[sl.start : sl.end].view(torch.uint8).reshape(-1)
-                freed_grad_segments.append(seg)
-                freed_grad_bytes += seg.numel()
-
-            global_chunk_idx += 1
+            self._harvest_grads(chunk, freed_grad_segments)
 
         self._marker.fill_(_MARKER_IDLE)
-        torch.cuda.current_stream().synchronize()
 
-    def maybe_recover(self) -> bool:
-        """Detect mid-step fault and replay full step.
+    def maybe_recover(self, resume_step: int) -> bool:
+        """Detect mid-step fault and resume from the interrupted chunk.
 
-        Uses the same exponential bootstrap logic as step() so that
-        recovery performance matches normal operation.
+        Args:
+            resume_step: the step number this recovery should produce.
+                Must equal cpu_step_counter or cpu_step_counter + 1.
+
+        Assumes optimizer states and gradients persist in RMP across faults.
+        Committed chunks (before the fault) are not re-applied.
         """
+        stored = self._cpu_step_counter.item()
         marker_val = self._marker.item()
-        if marker_val == _MARKER_IDLE:
-            return False
 
-        logger.warning(
-            f"[ResilientOpt] Fault detected (marker={marker_val}), "
-            f"replaying full step"
+        if stored + 1 == resume_step:
+            assert marker_val == _MARKER_IDLE
+            self.step()
+            logger.info("[ResilientOpt] Full step executed")
+            return True
+
+        # Counter hasn't been bumped yet — step was interrupted or never started.
+        assert stored == resume_step, (
+            f"step counter mismatch: stored={stored}, resume_step={resume_step}"
         )
 
-        # Replay the entire step (gradients are intact in RMP).
-        # We can't trust any partial state, so redo everything.
-        self.step()
+        if marker_val == _MARKER_IDLE:
+            if int(self._all_params[0].step.item()) == resume_step:
+                # Step was never started — nothing to recover.
+                logger.info("[ResilientOpt] Step not started, no recovery needed")
+                return False
+            else:
+                self._run_chunks(resume_from=0)
+                logger.info("[ResilientOpt] Full step executed")
+                return True
 
+        fault_chunk = marker_val // 2
+        backup_done = (marker_val % 2 == 1)
+
+        logger.warning(
+            f"[ResilientOpt] Fault detected (marker={marker_val}, "
+            f"chunk={fault_chunk}, backup_done={backup_done}), recovering"
+        )
+
+        if backup_done:
+            # Adam was interrupted — restore chunk state from backup.
+            self._restore_faulted_chunk(fault_chunk)
+
+        self._run_chunks(resume_from=fault_chunk)
         logger.info("[ResilientOpt] Recovery complete")
         return True
+
+    # ------------------------------------------------------------------
+    # Internal: schedule, cursor, harvest
+    # ------------------------------------------------------------------
+
+    def _build_schedule(self) -> list[list[_SliceEntry]]:
+        """Precompute the chunk schedule (deterministic from param layout)."""
+        schedule: list[list[_SliceEntry]] = []
+        param_cursor = 0
+        elem_cursor = 0
+        freed_grad_bytes = 0
+
+        # CPU phase
+        chunk, param_cursor, elem_cursor = self._take_chunk_by_param_bytes(
+            param_cursor, elem_cursor, self._cpu_phase_param_bytes,
+        )
+        if chunk:
+            schedule.append(chunk)
+            freed_grad_bytes = sum(sl.param_bytes for sl in chunk)
+
+        # GPU phase: 3 steps per level, doubling
+        chunk_size = self._init_chunk_size
+        while param_cursor < len(self._all_params):
+            chunk_size = min(chunk_size, self._max_chunk_size)
+            for _ in range(3):
+                if param_cursor >= len(self._all_params):
+                    break
+                needed = chunk_size * 3
+                if freed_grad_bytes < needed:
+                    chunk_size = freed_grad_bytes // 3
+                    if chunk_size <= 0:
+                        break
+                chunk, param_cursor, elem_cursor = self._take_chunk_by_param_bytes(
+                    param_cursor, elem_cursor, chunk_size,
+                )
+                if not chunk:
+                    break
+                schedule.append(chunk)
+                freed_grad_bytes += sum(sl.param_bytes for sl in chunk)
+            chunk_size = min(chunk_size * 2, self._max_chunk_size)
+
+        return schedule
+
+    def _take_chunk_by_param_bytes(
+        self, param_cursor: int, elem_cursor: int, param_bytes_budget: int,
+    ) -> tuple[list[_SliceEntry], int, int]:
+        """Take slices totalling up to param_bytes_budget of param data."""
+        chunk: list[_SliceEntry] = []
+        used = 0
+
+        while param_cursor < len(self._all_params) and used < param_bytes_budget:
+            p = self._all_params[param_cursor]
+            remaining_elems = p.numel - elem_cursor
+            space_elems = (param_bytes_budget - used) // p.param_elem_size
+            if space_elems <= 0:
+                break
+
+            take_elems = min(remaining_elems, space_elems)
+            start = elem_cursor
+            end = elem_cursor + take_elems
+
+            chunk.append(_SliceEntry(
+                param_ref=p.param,
+                step=p.step, group=p.group,
+                start=start, end=end,
+                is_first_slice=(start == 0),
+                param_bytes=take_elems * p.param_elem_size,
+                backup_bytes=take_elems * p.bytes_per_elem,
+                flat_param=p.flat_param,
+                flat_exp_avg=p.flat_exp_avg,
+                flat_exp_avg_sq=p.flat_exp_avg_sq,
+            ))
+            used += take_elems * p.param_elem_size
+
+            elem_cursor += take_elems
+            if elem_cursor >= p.numel:
+                param_cursor += 1
+                elem_cursor = 0
+
+        return chunk, param_cursor, elem_cursor
+
+    def _resolve_grads(self, chunk: list[_SliceEntry]):
+        """Set flat_grad references for slices (needed for harvesting)."""
+        for sl in chunk:
+            grad_local = _get_local(sl.param_ref.grad)
+            sl.flat_grad = grad_local.view(-1)
+
+    def _harvest_grads(
+        self, chunk: list[_SliceEntry], freed_segments: list[torch.Tensor],
+    ):
+        """Collect freed gradient segments from a completed chunk."""
+        for sl in chunk:
+            seg = sl.flat_grad[sl.start : sl.end].view(torch.uint8).reshape(-1)
+            freed_segments.append(seg)
+
+    def _restore_faulted_chunk(self, fault_chunk: int):
+        """Restore a chunk whose adam was interrupted from its backup."""
+        chunk = self._schedule[fault_chunk]
+
+        if fault_chunk == 0:
+            # CPU phase backup is in cpu_buffer
+            self._restore_chunk_scatter(chunk, [self._cpu_buffer])
+        else:
+            # GPU phase backup is in freed grad segments of preceding chunks.
+            # Reconstruct the segment list by harvesting committed chunks' grads.
+            freed_grad_segments: list[torch.Tensor] = []
+            for i in range(fault_chunk):
+                self._resolve_grads(self._schedule[i])
+                self._harvest_grads(self._schedule[i], freed_grad_segments)
+            self._restore_chunk_scatter(chunk, freed_grad_segments)
 
     # ------------------------------------------------------------------
     # Internal: backup / restore / step
@@ -321,13 +401,12 @@ class ResilientOptimizer:
 
     @torch.no_grad()
     def _backup_chunk_scatter(self, chunk: list[_SliceEntry], segments: list[torch.Tensor]):
-        """Copy chunk's slices into buffer segments (scatter write)."""
+        """Scatter-write chunk's (param, exp_avg, exp_avg_sq) into segments."""
         seg_idx = 0
         seg_offset = 0
 
         for sl in chunk:
-            for tensor in (sl.param, sl.exp_avg, sl.exp_avg_sq):
-                flat = _get_local(tensor).contiguous().view(-1)
+            for flat in (sl.flat_param, sl.flat_exp_avg, sl.flat_exp_avg_sq):
                 src = flat[sl.start : sl.end].view(torch.uint8).reshape(-1)
                 remaining = src.numel()
                 src_offset = 0
@@ -337,7 +416,7 @@ class ResilientOptimizer:
                     avail = seg.numel() - seg_offset
                     n = min(remaining, avail)
                     seg[seg_offset : seg_offset + n].copy_(
-                        src[src_offset : src_offset + n]
+                        src[src_offset : src_offset + n], non_blocking=True
                     )
                     src_offset += n
                     seg_offset += n
@@ -348,13 +427,12 @@ class ResilientOptimizer:
 
     @torch.no_grad()
     def _restore_chunk_scatter(self, chunk: list[_SliceEntry], segments: list[torch.Tensor]):
-        """Copy from buffer segments back into chunk's slices."""
+        """Scatter-read from segments back into chunk's tensors."""
         seg_idx = 0
         seg_offset = 0
 
         for sl in chunk:
-            for tensor in (sl.param, sl.exp_avg, sl.exp_avg_sq):
-                flat = _get_local(tensor).contiguous().view(-1)
+            for flat in (sl.flat_param, sl.flat_exp_avg, sl.flat_exp_avg_sq):
                 dst = flat[sl.start : sl.end].view(torch.uint8).reshape(-1)
                 remaining = dst.numel()
                 dst_offset = 0
@@ -364,7 +442,7 @@ class ResilientOptimizer:
                     avail = seg.numel() - seg_offset
                     n = min(remaining, avail)
                     dst[dst_offset : dst_offset + n].copy_(
-                        seg[seg_offset : seg_offset + n]
+                        seg[seg_offset : seg_offset + n], non_blocking=True
                     )
                     dst_offset += n
                     seg_offset += n
@@ -376,11 +454,10 @@ class ResilientOptimizer:
     @torch.no_grad()
     def _step_chunk(self, chunk: list[_SliceEntry]):
         """Run fused AdamW on one chunk's slices."""
-        steps_to_inc = list(
-            {id(sl.step): sl.step for sl in chunk if sl.is_first_slice}.values()
-        )
-        if steps_to_inc:
-            torch._foreach_add_(steps_to_inc, 1)
+        step_val = self._cpu_step_counter.item()
+        for sl in chunk:
+            if sl.is_first_slice:
+                sl.step.fill_(step_val)
 
         by_group: dict[int, list[_SliceEntry]] = defaultdict(list)
         for sl in chunk:
@@ -395,15 +472,14 @@ class ResilientOptimizer:
             steps = []
 
             for sl in group_slices:
-                fp = _get_local(sl.param).contiguous().view(-1)
-                fg = _get_local(sl.param.grad).contiguous().view(-1)
-                fm = _get_local(sl.exp_avg).contiguous().view(-1)
-                fv = _get_local(sl.exp_avg_sq).contiguous().view(-1)
+                # Resolve grad flat view (grad tensor may change between steps)
+                grad_local = _get_local(sl.param_ref.grad)
+                sl.flat_grad = grad_local.view(-1)
 
-                params.append(fp[sl.start : sl.end])
-                grads.append(fg[sl.start : sl.end])
-                exp_avgs.append(fm[sl.start : sl.end])
-                exp_avg_sqs.append(fv[sl.start : sl.end])
+                params.append(sl.flat_param[sl.start : sl.end])
+                grads.append(sl.flat_grad[sl.start : sl.end])
+                exp_avgs.append(sl.flat_exp_avg[sl.start : sl.end])
+                exp_avg_sqs.append(sl.flat_exp_avg_sq[sl.start : sl.end])
                 steps.append(sl.step)
 
             torch._fused_adamw_(
