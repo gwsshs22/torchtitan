@@ -127,6 +127,8 @@ def main():
     )
     args = parser.parse_args()
 
+    torch.cuda.set_device(args.device)
+
     info = load_optimizer_info(args.optimizer_info)
     params, optimizer = create_optimizer_from_info(info, device=args.device)
     print(f"Created {len(params)} params on {args.device}")
