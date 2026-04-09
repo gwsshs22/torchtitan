@@ -99,7 +99,7 @@ class ResilientOptimizer:
         optimizers,
         rmp_client: RmpClient,
         device: torch.device,
-        init_chunk_size_mb: int = 2,
+        init_chunk_size_mb: int = 1,
         max_chunk_size_mb: int = 256,
     ):
         self._optimizers = optimizers

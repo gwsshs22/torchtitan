@@ -1,4 +1,6 @@
 from itertools import chain
+import pickle
+import time
 
 import torch
 from torch import nn
@@ -19,6 +21,84 @@ from torchtitan.tools.utils import (
     state_dict_to_stateful
 )
 from leto.rmp.client import RmpClient, TensorSpec
+
+
+class MetadataCircularBuffer:
+    """Circular buffer for training metadata backed by RMP CPU shared memory.
+
+    Allocates NUM_SLOTS fixed-size CPU shared memory regions via RMP.
+    Each slot stores a pickled metadata dict with a step marker.
+    Slots are written in round-robin order (step % NUM_SLOTS).
+
+    Per-slot layout (SLOT_SIZE bytes):
+        [0:8]    step      (int64) — commit marker, -1 = invalid
+        [8:16]   data_len  (int64) — payload byte count
+        [16:...] payload   (uint8) — pickled metadata
+    """
+
+    NUM_SLOTS = 3
+    SLOT_SIZE = 1 * 1024 * 1024  # 1 MB
+    HEADER_SIZE = 16  # 8 bytes step + 8 bytes data_len
+    MAX_PAYLOAD = SLOT_SIZE - HEADER_SIZE
+    _INVALID_STEP = -1
+
+    def __init__(self, rmp_client, slot_key_prefix="metadata"):
+        self._slots = []
+        for i in range(self.NUM_SLOTS):
+            storage, allocated = rmp_client.get_or_allocate_cpu_memory(
+                f"{slot_key_prefix}_{i}", self.SLOT_SIZE,
+            )
+            step_view = torch.tensor([], dtype=torch.int64).set_(
+                storage, 0, (1,),
+            )
+            len_view = torch.tensor([], dtype=torch.int64).set_(
+                storage, 1, (1,),  # element offset 1 = byte offset 8
+            )
+            payload_view = torch.tensor([], dtype=torch.uint8).set_(
+                storage, self.HEADER_SIZE, (self.MAX_PAYLOAD,),
+            )
+            self._slots.append((step_view, len_view, payload_view))
+            if allocated:
+                step_view.fill_(self._INVALID_STEP)
+
+    def commit(self, step: int, metadata: dict) -> int:
+        """Write metadata to the slot for *step*, using invalidation protocol.
+
+        Returns the number of payload bytes written.
+        """
+        slot_idx = step % self.NUM_SLOTS
+        step_view, len_view, payload_view = self._slots[slot_idx]
+
+        payload = pickle.dumps(metadata)
+        assert len(payload) <= self.MAX_PAYLOAD, (
+            f"Metadata payload ({len(payload)} bytes) exceeds "
+            f"slot capacity ({self.MAX_PAYLOAD} bytes)"
+        )
+
+        # 1. Invalidate slot
+        step_view.fill_(self._INVALID_STEP)
+        # 2. Write payload
+        payload_tensor = torch.frombuffer(payload, dtype=torch.uint8)
+        payload_view[: len(payload)].copy_(payload_tensor)
+        # 3. Write length
+        len_view.fill_(len(payload))
+        # 4. Mark valid (commit point)
+        step_view.fill_(step)
+        return len(payload)
+
+    def load_latest(self) -> tuple[int, dict] | None:
+        """Return (step, metadata) from the most recent valid slot, or None."""
+        best_step, best_idx = -1, -1
+        for i, (step_view, _, _) in enumerate(self._slots):
+            s = step_view.item()
+            if s > best_step:
+                best_step, best_idx = s, i
+        if best_idx < 0:
+            return None
+        _, len_view, payload_view = self._slots[best_idx]
+        data_len = len_view.item()
+        payload_bytes = bytes(payload_view[:data_len].numpy())
+        return best_step, pickle.loads(payload_bytes)
 
 def get_fqns(model, name):
     fqns = _get_fqns(model, name)
@@ -131,6 +211,8 @@ class RmpManager:
         def _apply_fn(tensor):
             return tid_to_gpu_tensor[id(tensor)]
 
+        self._meta_buffer = MetadataCircularBuffer(self.rmp_client)
+
         if allocated:
             logger.info(f"New tensors allocated on RMP server.")
         else:
@@ -144,13 +226,13 @@ class RmpManager:
             model_part.train()
 
         if allocated:
-            self.maybe_commit()
+            self.maybe_commit(step=0)
         else:
             self._load_cpu_metadata()
 
         return not allocated
 
-    def maybe_commit(self):
+    def maybe_commit(self, step: int):
         if not self.enabled:
             return
         if self.skip_commit:
@@ -160,20 +242,28 @@ class RmpManager:
         optim_metadata = {}
         metadata = {
             "TRAIN": stateful_to_state_dict(self.states),
-            "OPTIM": optim_metadata
+            "OPTIM": optim_metadata,
         }
 
         for name, v in self.optimizers.state_dict().items():
-            if isinstance(v, torch.Tensor):
-                pass
-            else:
+            if not isinstance(v, torch.Tensor):
                 optim_metadata[name] = v
-        self.rmp_client.commit_metadata(metadata)
+
+        t0 = time.perf_counter()
+        num_bytes = self._meta_buffer.commit(step, metadata)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            f"Metadata commit: step={step}, {num_bytes} bytes, {elapsed_ms:.2f} ms"
+        )
 
     def _load_cpu_metadata(self):
         if self.skip_commit:
             return
-        committed_metadata = self.rmp_client.get_committed_metadata()
+        result = self._meta_buffer.load_latest()
+        if result is None:
+            raise RuntimeError("No committed metadata found in circular buffer")
+        step, committed_metadata = result
+        logger.info(f"Loaded metadata from circular buffer (step={step})")
         state_dict_to_stateful(self.states, committed_metadata["TRAIN"])
 
         optim_state_dict = self.optimizers.state_dict()

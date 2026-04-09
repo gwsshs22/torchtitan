@@ -1008,7 +1008,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # non-faulting ranks barrier then continue normally)
         if self.job_config.leto.fault_injection_step_barrier:
             dist.barrier()
-        self.rmp_manager.maybe_commit()
+        self.rmp_manager.maybe_commit(self.step)
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
