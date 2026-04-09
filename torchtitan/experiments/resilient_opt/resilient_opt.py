@@ -29,6 +29,7 @@ Usage:
     resilient_opt.step()
 """
 
+import random
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -284,6 +285,31 @@ class ResilientOptimizer:
         self._run_chunks(resume_from=fault_chunk)
         logger.info("[ResilientOpt] Recovery complete")
         return True
+
+    def enable_fault_injection(self, prob: float):
+        """Monkey-patch marker.fill_() to randomly crash with given probability.
+
+        When triggered, synchronizes CUDA and raises RuntimeError to simulate
+        a GPU fault.  When not triggered, calls the original fill_() with
+        near-zero overhead (one random.random() call).
+
+        Seeds RNG from time so each process launch gets a different sequence.
+        """
+        import time
+        rng = random.Random(time.time_ns())
+        original_fill = self._marker.fill_
+
+        def _faulting_fill(value):
+            if rng.random() < prob:
+                logger.warning(
+                    f"[ResilientOpt] Fault injection triggered at "
+                    f"marker.fill_({value})"
+                )
+                torch.cuda.synchronize()
+                raise RuntimeError("[ResilientOpt] Injected fault")
+            return original_fill(value)
+
+        self._marker.fill_ = _faulting_fill
 
     # ------------------------------------------------------------------
     # Internal: schedule, cursor, harvest

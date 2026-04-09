@@ -1103,6 +1103,12 @@ class Leto:
     dump_optimizer_info: bool = False
     """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
 
+    resilient_opt_fault_injection: bool = False
+    """Enable fault injection in resilient optimizer marker."""
+
+    resilient_opt_fault_injection_prob: float = 0.005
+    """Per-fill_() probability of injecting a fault (only when fault injection enabled)."""
+
 @dataclass
 class JobConfig:
     """

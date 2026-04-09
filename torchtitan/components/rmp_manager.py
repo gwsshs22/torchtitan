@@ -3,6 +3,7 @@ import pickle
 import time
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.state_dict import _get_fqns
@@ -100,6 +101,9 @@ class MetadataCircularBuffer:
         payload_bytes = bytes(payload_view[:data_len].numpy())
         return best_step, pickle.loads(payload_bytes)
 
+def _ms(t_start, t_end):
+    return (t_end - t_start) * 1000
+
 def get_fqns(model, name):
     fqns = _get_fqns(model, name)
     return next(iter(fqns))
@@ -131,6 +135,10 @@ class RmpManager:
         self._grad_allocator: RmpGradientAllocator | None = None
         self._allocated: bool = True  # set by maybe_init
 
+        # CPU-only barrier group for metadata commit synchronization
+        self._gloo_group = dist.new_group(backend="gloo")
+        self._gloo_warmup = dist.barrier(group=self._gloo_group, async_op=True)
+
         if not self.enabled:
             return
 
@@ -142,6 +150,7 @@ class RmpManager:
             DATALOADER: dataloader,
             LR_SCHEDULER: lr_schedulers
         })
+        self.lr_schedulers = lr_schedulers
 
     def maybe_init(self, buffer_device):
         if not self.enabled:
@@ -239,6 +248,8 @@ class RmpManager:
             return
 
         torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         optim_metadata = {}
         metadata = {
             "TRAIN": stateful_to_state_dict(self.states),
@@ -249,11 +260,25 @@ class RmpManager:
             if not isinstance(v, torch.Tensor):
                 optim_metadata[name] = v
 
-        t0 = time.perf_counter()
+        t_snapshot = time.perf_counter()
+
         num_bytes = self._meta_buffer.commit(step, metadata)
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        t_commit = time.perf_counter()
+
+        # Ensure all ranks have committed metadata before any rank proceeds
+        if self._gloo_warmup is not None:
+            self._gloo_warmup.wait()
+            self._gloo_warmup = None
+        dist.barrier(group=self._gloo_group)
+
+        t_barrier = time.perf_counter()
         logger.info(
-            f"Metadata commit: step={step}, {num_bytes} bytes, {elapsed_ms:.2f} ms"
+            f"Metadata commit: step={step}, {num_bytes} bytes, "
+            f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
+            f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
+            f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
+            f"total={_ms(t0, t_barrier):.2f} ms"
         )
 
     def _load_cpu_metadata(self):
@@ -274,12 +299,30 @@ class RmpManager:
         """Register RMP gradient allocator on the collective manager."""
         if not self.enabled:
             return
-        self._grad_allocator = RmpGradientAllocator(
-            rmp_client=self.rmp_client,
-            device=self.device,
-            allocated=self._allocated,
-        )
+        if self._grad_allocator is None:
+            self._grad_allocator = RmpGradientAllocator(
+                rmp_client=self.rmp_client,
+                device=self.device,
+                allocated=self._allocated,
+            )
         self._grad_allocator.register(collective_manager, model_parts)
+
+    def restore_param_gradients(self, model_parts):
+        """Restore RMP-backed gradient tensors to param.grad.
+
+        Creates the gradient allocator early (if needed) so that its
+        prefetched tensors are available, then assigns them to param.grad.
+        Must be called before init_gradient_allocator().register().
+        """
+        if not self.enabled:
+            return
+        if self._grad_allocator is None:
+            self._grad_allocator = RmpGradientAllocator(
+                rmp_client=self.rmp_client,
+                device=self.device,
+                allocated=self._allocated,
+            )
+        self._grad_allocator.restore_param_gradients(model_parts)
 
     def get_or_allocate_cpu_memory(self, name, num_bytes):
         return self.rmp_client.get_or_allocate_cpu_memory(name, num_bytes)

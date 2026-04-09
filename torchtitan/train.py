@@ -34,6 +34,7 @@ from torchtitan.components.metrics import (
     GPUMemoryMonitor,
 )
 from torchtitan.components.rmp_manager import RmpManager
+from torchtitan.experiments.resilient_opt.resilient_opt import ResilientOptimizer
 from torchtitan.components.skip_shape_infer import (
     maybe_record_stage_inputs,
     maybe_warmup_stages
@@ -429,6 +430,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.rmp_restored = self.rmp_manager.maybe_init(self.buffer_device)
 
+        # Wrap optimizers with resilient optimizer if RMP GPU is enabled
+        self._resilient_opt = None
+        if job_config.leto.enable_rmp_gpu:
+            self._resilient_opt = ResilientOptimizer(
+                self.optimizers,
+                self.rmp_manager.rmp_client,
+                self.device,
+            )
+            if self.rmp_restored:
+                self.rmp_manager.restore_param_gradients(self.model_parts)
+                self._resilient_opt_recover()
+            if job_config.leto.resilient_opt_fault_injection:
+                self._resilient_opt.enable_fault_injection(
+                    job_config.leto.resilient_opt_fault_injection_prob,
+                )
+
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
         # where it issues a single all-reduce for all parameters at once for better performance
@@ -677,6 +694,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.optimizers, self.job_config.lr_scheduler, lr_steps
         )
         self._prev_step_faulted = False
+
+    def _resilient_opt_recover(self):
+        """Recover resilient optimizer state on RMP resume.
+
+        Each rank reads its local step from the metadata buffer, then all
+        ranks agree on the minimum step via an all-reduce.  The minimum
+        is used as resume_step for maybe_recover().
+        """
+        result = self.rmp_manager._meta_buffer.load_latest()
+        if result is None:
+            raise RuntimeError("Cannot recover: no committed metadata")
+        local_step = result[0]
+
+        # MIN all-reduce across all ranks to find the globally consistent step
+        step_tensor = torch.tensor([local_step], dtype=torch.int64, device=self.device)
+        dist.all_reduce(step_tensor, op=dist.ReduceOp.MIN)
+        resume_step = step_tensor.item()
+
+        logger.info(
+            f"[ResilientOpt] local_step={local_step}, "
+            f"resume_step={resume_step} (global min)"
+        )
+
+        recovered = self._resilient_opt.maybe_recover(resume_step)
+        if recovered:
+            logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
+        else:
+            logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
+        self.lr_schedulers.step()
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -996,19 +1042,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.maybe_wait_for_staging()
 
         fault_triggered = self.maybe_inject_fault()
-
-        if not fault_triggered:
-            self.optimizers.step()
-
-        self.maybe_dump_optimizer_info()
-
-        self.lr_schedulers.step()
-
         # Barrier: all ranks participate (faulting ranks barrier then crash,
         # non-faulting ranks barrier then continue normally)
         if self.job_config.leto.fault_injection_step_barrier:
             dist.barrier()
         self.rmp_manager.maybe_commit(self.step)
+
+        if not fault_triggered:
+            if self._resilient_opt is not None:
+                self._resilient_opt.step()
+            else:
+                self.optimizers.step()
+
+        self.maybe_dump_optimizer_info()
+
+        self.lr_schedulers.step()
+
+
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))

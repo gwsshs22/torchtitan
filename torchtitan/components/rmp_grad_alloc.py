@@ -9,6 +9,7 @@ group index so they survive ordering changes between runs.
 from typing import Sequence
 
 import torch
+from torch.distributed._tensor import DTensor
 from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 
 from leto.rmp.client import RmpClient
@@ -54,6 +55,78 @@ class RmpGradientAllocator:
                 f"[RmpGradAlloc] Retrieved {len(self._prefetched)} "
                 f"RS output buffers ({total_bytes / (1024*1024):.2f} MB total)"
             )
+
+    def restore_param_gradients(
+        self,
+        model_parts: list[torch.nn.Module],
+    ) -> int:
+        """Assign prefetched RMP gradient tensors back to param.grad.
+
+        Must be called before register() (which clears _prefetched).
+        Walks FSDP param groups in the same order as register() to
+        match ``grad_rs/{group_idx}`` keys to parameters.
+
+        Handles padding: the RS output buffer may be larger than the
+        param's numel (due to world-size padding), so we take a
+        ``[:numel]`` slice.
+
+        Returns the number of gradients restored.
+        """
+        if self._prefetched is None:
+            return 0
+
+        restored = 0
+        group_idx = 0
+        for model in model_parts:
+            for module in model.modules():
+                state = _get_module_fsdp_state(module)
+                if state is None or state._fsdp_param_group is None:
+                    continue
+                param_group = state._fsdp_param_group
+                key = f"grad_rs/{group_idx}"
+                group_idx += 1
+
+                if not any(
+                    p.sharded_param.requires_grad for p in param_group.fsdp_params
+                ):
+                    continue
+
+                grad_tensor = self._prefetched.get(key)
+                if grad_tensor is None:
+                    continue
+
+                grad_flat = grad_tensor.view(-1)
+                offset = 0
+                for fsdp_param in param_group.fsdp_params:
+                    if not fsdp_param.sharded_param.requires_grad:
+                        continue
+                    param = fsdp_param.sharded_param
+                    # Use local tensor numel (sharded), not DTensor global numel
+                    local = (
+                        param._local_tensor
+                        if isinstance(param, DTensor)
+                        else param
+                    )
+                    local_numel = local.numel()
+                    local_grad = grad_flat[offset : offset + local_numel].view(
+                        local.shape
+                    )
+                    if isinstance(param, DTensor):
+                        param.grad = DTensor.from_local(
+                            local_grad,
+                            device_mesh=param.device_mesh,
+                            placements=param.placements,
+                            run_check=False,
+                        )
+                    else:
+                        param.grad = local_grad
+                    offset += local_numel
+                    restored += 1
+
+        logger.info(
+            f"[RmpGradAlloc] Restored {restored} param gradients from RMP"
+        )
+        return restored
 
     def register(
         self,
