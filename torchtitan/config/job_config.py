@@ -1109,6 +1109,9 @@ class Leto:
     resilient_opt_fault_injection_prob: float = 0.005
     """Per-fill_() probability of injecting a fault (only when fault injection enabled)."""
 
+    enable_cpu_snapshot_opt: bool = False
+    """Use AsyncCpuSnapshotOptimizer baseline (mutually exclusive with enable_rmp_gpu)."""
+
 @dataclass
 class JobConfig:
     """

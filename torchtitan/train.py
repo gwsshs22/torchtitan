@@ -35,6 +35,9 @@ from torchtitan.components.metrics import (
 )
 from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.experiments.resilient_opt.resilient_opt import ResilientOptimizer
+from torchtitan.experiments.resilient_opt.resilient_opt_cpu_snapshot import (
+    AsyncCpuSnapshotOptimizer,
+)
 from torchtitan.components.skip_shape_infer import (
     maybe_record_stage_inputs,
     maybe_warmup_stages
@@ -432,6 +435,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Wrap optimizers with resilient optimizer if RMP GPU is enabled
         self._resilient_opt = None
+        self._cpu_snapshot_opt = None
+        assert not (
+            job_config.leto.enable_rmp_gpu and job_config.leto.enable_cpu_snapshot_opt
+        ), "enable_rmp_gpu and enable_cpu_snapshot_opt are mutually exclusive"
+
         if job_config.leto.enable_rmp_gpu:
             self._resilient_opt = ResilientOptimizer(
                 self.optimizers,
@@ -445,6 +453,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self._resilient_opt.enable_fault_injection(
                     job_config.leto.resilient_opt_fault_injection_prob,
                 )
+        elif job_config.leto.enable_cpu_snapshot_opt:
+            self._cpu_snapshot_opt = AsyncCpuSnapshotOptimizer(
+                self.optimizers, self.device,
+            )
 
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
@@ -1010,6 +1022,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        if self._cpu_snapshot_opt is not None:
+            self._cpu_snapshot_opt.begin_snapshot()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
@@ -1051,6 +1065,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if not fault_triggered:
             if self._resilient_opt is not None:
                 self._resilient_opt.step()
+            elif self._cpu_snapshot_opt is not None:
+                self._cpu_snapshot_opt.step()
             else:
                 self.optimizers.step()
 
