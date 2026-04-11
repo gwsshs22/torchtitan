@@ -421,6 +421,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_seen = 0
         self._prev_step_faulted = False
 
+        # When async RMP commit is active, RmpManager snapshots CUDA + DTensor
+        # rng state on the main thread and injects it into the metadata dict
+        # directly; Trainer.state_dict() must not re-read those fields here,
+        # otherwise the worker thread would touch CUDA device-guard code.
+        self._include_rng_in_state_dict = not (
+            job_config.leto.enable_rmp_gpu and not job_config.leto.rmp_commit_sync
+        )
+
         self.rmp_manager = RmpManager(
             leto_config=job_config.leto,
             model_parts=self.model_parts,
@@ -1043,6 +1051,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
+        # All microbatches' forward/backward have been dispatched. Kick off the
+        # async RMP metadata commit now so pickle/shm_write/barrier overlap
+        # with clip_grad_norm_ and in-flight GPU work. No-op in sync mode.
+        self.rmp_manager.schedule_commit(self.step)
+
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
 
@@ -1252,14 +1265,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "ntokens_seen": self.ntokens_seen,
             # RNG states for reproducibility
             "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
             "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
         }
-        # Save DTensor RNG tracker state if available
-        rng_tracker = dtensor_random._rng_tracker
-        if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
-            state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
+        # CUDA and DTensor rng state are omitted when the RmpManager async
+        # commit path captures them on the main thread and injects them into
+        # the metadata dict directly (see RmpManager.schedule_commit).
+        if self._include_rng_in_state_dict:
+            state["cuda_rng_state"] = torch.cuda.get_rng_state(self.device)
+            rng_tracker = dtensor_random._rng_tracker
+            if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
+                state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):

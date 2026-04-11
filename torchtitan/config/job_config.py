@@ -1061,6 +1061,11 @@ class Leto:
 
     enable_skip_commit: bool = False
 
+    rmp_commit_sync: bool = False
+    """If True, run RmpManager.maybe_commit inline on the main thread.
+    If False (default), the commit body runs on a background thread
+    scheduled from train_step after all microbatches have been dispatched."""
+
     rmp_server_port: int = 52051
     """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
 
