@@ -147,9 +147,10 @@ class GPUMemoryMonitor:
         self._thread.start()
 
     def _poll_loop(self):
+        from pynvml import nvmlMemory_v2
         while not self._stop_event.is_set():
             try:
-                info = self._nvmlDeviceGetMemoryInfo(self._handle)
+                info = self._nvmlDeviceGetMemoryInfo(self._handle, version=nvmlMemory_v2)
                 self._current_used_bytes = info.used
                 self._total_bytes = info.total
                 if info.used > self._peak_used_bytes:

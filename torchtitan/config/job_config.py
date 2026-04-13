@@ -1031,6 +1031,14 @@ class Debug:
 
 @dataclass
 class Leto:
+    init_mode: str = "baseline"
+    """Initialization mode: 'baseline' (original order, CUDA immediately),
+    'reordered' (default, defers CUDA until after standby poll)."""
+
+    profile_init: bool = False
+    """If True, profile each init task's wall time and GPU memory usage (via pynvml).
+    Writes a JSON file to dump_folder/init_profile_rank{rank}.json."""
+
     eager_init_list: list[str] = field(default_factory=list)
     """
         all, none, nccl

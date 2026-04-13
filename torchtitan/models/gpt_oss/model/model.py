@@ -389,9 +389,7 @@ class GptOssModel(ModelProtocol):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-
         for layer in self.layers.values():
             h = layer(h, self.rope_cache, attention_masks)
         h = self.norm(h) if self.norm else h

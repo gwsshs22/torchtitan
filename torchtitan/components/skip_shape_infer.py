@@ -17,7 +17,7 @@ import gc
 import json
 import os
 import types
-from typing import Any
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -26,9 +26,60 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from torchtitan.tools.logging import logger
 
 
+def _placement_to_metadata(p: Any) -> dict[str, Any]:
+    from torch.distributed.tensor import Partial, Replicate, Shard
+
+    if isinstance(p, Shard):
+        return {"type": "Shard", "dim": int(p.dim)}
+    if isinstance(p, Replicate):
+        return {"type": "Replicate"}
+    if isinstance(p, Partial):
+        return {"type": "Partial", "reduce_op": str(p.reduce_op)}
+    return {"type": "Unknown"}
+
+
+def _metadata_to_placement(d: dict[str, Any]) -> Any:
+    from torch.distributed.tensor import Partial, Replicate, Shard
+
+    kind = d.get("type")
+    if kind == "Shard":
+        return Shard(d["dim"])
+    if kind == "Replicate":
+        return Replicate()
+    if kind == "Partial":
+        return Partial(d.get("reduce_op", "sum"))
+    raise ValueError(f"Unknown placement metadata: {d}")
+
+
 def _tensor_to_metadata(tensor: torch.Tensor) -> dict[str, Any]:
-    """Convert a tensor to metadata dict with shape, dtype, and device."""
+    """Convert a tensor to metadata dict with shape, dtype, and device.
+
+    For DTensor inputs, additionally capture the local shape, mesh dim
+    names, and placements so the reader can reconstruct a matching
+    DTensor at warmup time. Without this, warmup inputs would be plain
+    ``torch.Tensor`` even for graphs that real training calls with
+    DTensors, which would cause AOTAutograd's ``subclass_inp_meta`` to
+    mismatch and crash in ``runtime_unwrap_tensor_subclasses``.
+    """
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(tensor, DTensor):
+        local = tensor.to_local()
+        mesh = tensor.device_mesh
+        mesh_dim_names = list(mesh.mesh_dim_names) if mesh.mesh_dim_names else []
+        return {
+            "type": "DTensor",
+            "shape": list(tensor.shape),
+            "local_shape": list(local.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(local.device),
+            "mesh_dim_names": mesh_dim_names,
+            "placements": [
+                _placement_to_metadata(p) for p in tensor.placements
+            ],
+        }
     return {
+        "type": "Tensor",
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
         "device": str(tensor.device),
@@ -41,13 +92,35 @@ def _metadata_to_meta_tensor(metadata: dict[str, Any]) -> torch.Tensor:
     dtype = getattr(torch, dtype_str.split(".")[-1])
     return torch.empty(metadata["shape"], dtype=dtype, device="meta")
 
+def _remap_device(device_str: str) -> str:
+    """Remap a recorded cuda device index to the current rank's local cuda
+    device. Recording captured absolute local indices from the recording
+    topology (e.g. ``cuda:2`` when the recording node had 4 GPUs). A replay
+    run with a different #GPUs-per-node layout would crash with "invalid
+    device ordinal" if we used the recorded index verbatim.
+    """
+    if device_str.startswith("cuda"):
+        if torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+    return device_str
+
+
+# Module-level reference to the current rank's ``ParallelDims`` during
+# warmup. ``_metadata_to_tensor`` reads this when encountering a DTensor
+# metadata entry so it can reconstruct a DTensor with the matching mesh.
+_current_parallel_dims: Any = None
+
+
 def _metadata_to_tensor(metadata: dict[str, Any]) -> torch.Tensor:
     """Create a zero tensor from metadata."""
     dtype_str = metadata["dtype"]
     # Parse dtype string like "torch.float32" to actual dtype
     dtype = getattr(torch, dtype_str.split(".")[-1])
 
-    device_str = metadata["device"]
+    device_str = _remap_device(metadata["device"])
+
+    if metadata.get("type") == "DTensor":
+        return _metadata_to_dtensor(metadata, dtype, device_str)
 
     # Use zeros to support all dtypes including integer types (e.g. torch.int64)
     tensor = torch.zeros(metadata["shape"], dtype=dtype, device=device_str)
@@ -56,6 +129,51 @@ def _metadata_to_tensor(metadata: dict[str, Any]) -> torch.Tensor:
         tensor.requires_grad = True
 
     return tensor
+
+
+def _metadata_to_dtensor(
+    metadata: dict[str, Any],
+    dtype: torch.dtype,
+    device_str: str,
+) -> torch.Tensor:
+    """Reconstruct a DTensor from recorded metadata using the current rank's
+    mesh. Falls back to a plain tensor if no matching mesh is available
+    (e.g. parallel_dims not provided or dim names missing).
+    """
+    from torch.distributed.tensor import DTensor
+
+    local_shape = metadata.get("local_shape", metadata["shape"])
+    mesh_dim_names = tuple(metadata.get("mesh_dim_names", ()))
+    placements = tuple(
+        _metadata_to_placement(p) for p in metadata.get("placements", [])
+    )
+
+    local = torch.zeros(local_shape, dtype=dtype, device=device_str)
+    if dtype.is_floating_point:
+        local.requires_grad = True
+
+    mesh = None
+    if _current_parallel_dims is not None and mesh_dim_names:
+        try:
+            mesh = _current_parallel_dims.get_optional_mesh(list(mesh_dim_names))
+        except Exception as e:
+            logger.warning(
+                f"Fake warmup: could not resolve mesh {mesh_dim_names}: "
+                f"{type(e).__name__}: {e}"
+            )
+    if mesh is None or not placements:
+        # Fall back to the raw local tensor; AOTAutograd will see a plain
+        # tensor at this input slot and compile a non-subclass version.
+        # The guard system will force a recompile at real training time
+        # when a real DTensor is passed.
+        return local
+
+    return DTensor.from_local(
+        local,
+        device_mesh=mesh,
+        placements=placements,
+        run_check=False,
+    )
 
 
 def _block_mask_to_metadata(mask: BlockMask) -> dict[str, Any]:
@@ -72,16 +190,24 @@ def _block_mask_to_metadata(mask: BlockMask) -> dict[str, Any]:
 
 
 def _metadata_to_block_mask(metadata: dict[str, Any]) -> BlockMask:
-    """Reconstruct a synthetic all-dense causal BlockMask from recorded metadata."""
+    """Reconstruct a synthetic causal BlockMask from recorded metadata.
+
+    Uses torchtitan's real ``get_causal_mask_mod`` factory so the resulting
+    ``mask_mod`` closure has the same ``__code__`` object id as real
+    training's mask_mod. If Dynamo later traces flex_attention with this
+    BlockMask, the guards it emits on ``mask_mod.__code__`` match what
+    real training produces, so the warmup-compiled cache entry can be
+    reused. A locally-defined ``causal_mask`` would produce a different
+    code object id and force recompilation on every real training call.
+    """
+    from torchtitan.models.attention import get_causal_mask_mod
+
     seq_len_q = metadata["seq_len_q"]
     seq_len_kv = metadata["seq_len_kv"]
-    device = metadata["device"]
-
-    def causal_mask(b, h, q_idx, kv_idx):
-        return q_idx >= kv_idx
+    device = _remap_device(metadata["device"])
 
     return create_block_mask(
-        causal_mask,
+        get_causal_mask_mod(),
         B=None,
         H=None,
         Q_LEN=seq_len_q,
@@ -91,11 +217,29 @@ def _metadata_to_block_mask(metadata: dict[str, Any]) -> BlockMask:
 
 
 def _serialize_arg(arg: Any) -> Any:
-    """Serialize a single arg to JSON-compatible format."""
+    """Serialize a single arg to JSON-compatible format.
+
+    Recurses into dict / list / tuple containers so that composite inputs like
+    ``attention_masks: dict[str, BlockMask]`` round-trip correctly. Primitives
+    (None, bool, int, float, str) are wrapped so they can be distinguished from
+    "unsupported type" on the deserialize side.
+    """
     if isinstance(arg, torch.Tensor):
         return _tensor_to_metadata(arg)
     if isinstance(arg, BlockMask):
         return _block_mask_to_metadata(arg)
+    if isinstance(arg, dict):
+        return {
+            "type": "dict",
+            "items": {k: _serialize_arg(v) for k, v in arg.items()},
+        }
+    if isinstance(arg, (list, tuple)):
+        return {
+            "type": "tuple" if isinstance(arg, tuple) else "list",
+            "items": [_serialize_arg(v) for v in arg],
+        }
+    if arg is None or isinstance(arg, (bool, int, float, str)):
+        return {"type": "primitive", "value": arg}
     return None
 
 
@@ -133,33 +277,48 @@ def _serialize_output(output: Any) -> dict[str, Any]:
 def _deserialize_as_meta(metadata: dict[str, Any]) -> tuple[torch.Tensor, ...]:
     """
     Deserialize a stage's recorded args metadata into a tuple of meta tensors.
-    Non-tensor (null) entries are skipped.
+    Non-tensor entries (dicts, primitives, BlockMasks, None) are skipped.
+    Both plain ``Tensor`` and ``DTensor`` entries are converted to meta
+    tensors (using the global shape for DTensors).
     """
-    return tuple(
-        _metadata_to_meta_tensor(entry)
-        for entry in metadata["args"]
-        if entry is not None
-    )
+    result: list[torch.Tensor] = []
+    for entry in metadata["args"]:
+        if isinstance(entry, dict) and entry.get("type") in ("Tensor", "DTensor"):
+            result.append(_metadata_to_meta_tensor(entry))
+    return tuple(result)
+
 
 def _deserialize_arg(meta: Any) -> Any:
     """Deserialize a single recorded arg back to a synthetic value."""
     if meta is None:
         return None
-    if isinstance(meta, dict) and meta.get("type") == "BlockMask":
-        return _metadata_to_block_mask(meta)
-    if isinstance(meta, dict):
+    if not isinstance(meta, dict):
+        return None
+    kind = meta.get("type")
+    if kind == "Tensor" or kind == "DTensor":
         return _metadata_to_tensor(meta)
+    if kind == "BlockMask":
+        return _metadata_to_block_mask(meta)
+    if kind == "dict":
+        return {k: _deserialize_arg(v) for k, v in meta["items"].items()}
+    if kind == "list":
+        return [_deserialize_arg(v) for v in meta["items"]]
+    if kind == "tuple":
+        return tuple(_deserialize_arg(v) for v in meta["items"])
+    if kind == "primitive":
+        return meta["value"]
     return None
 
 
 def _deserialize_args(metadata: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Deserialize metadata to synthetic tensors/masks."""
+    """Deserialize metadata to synthetic tensors/masks.
+
+    None entries are preserved so that the forward signature is respected —
+    e.g. ``attention_masks=None`` must be passed through, not dropped, or
+    required kwargs disappear and positional arg indices shift.
+    """
     args = tuple(_deserialize_arg(arg_meta) for arg_meta in metadata["args"])
     kwargs = {k: _deserialize_arg(v_meta) for k, v_meta in metadata["kwargs"].items()}
-    # Filter out None values
-    args = tuple(arg for arg in args if arg is not None)
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
     return args, kwargs
 
 class StageInputRecorder:
@@ -355,9 +514,6 @@ def maybe_record_stage_inputs(
     if not job_config.leto.enable_stage_input_record:
         return None
 
-    if job_config.parallelism.pipeline_parallel_degree <= 1:
-        return None
-
     # Install hooks before first iteration
     if step == 1 and recorder is None:
         recorder = StageInputRecorder(model_parts)
@@ -385,26 +541,27 @@ def maybe_record_stage_inputs(
 def maybe_warmup_stages(
     model_parts: list[torch.nn.Module],
     job_config,
+    loss_fn: Optional[Callable] = None,
+    pp_has_last_stage: bool = True,
+    parallel_dims: Any = None,
 ) -> None:
     """
     Warmup stages with recorded inputs if enabled in config.
 
-    Also warms up the loss function if it is compiled and this rank holds
-    the last pipeline stage.
-
     Args:
         model_parts: List of model parts to warmup
         job_config: Job configuration
-        loss_fn: Optional loss function to warmup; only used when
-            pp_has_last_stage=True and "loss" is in compile.components
-        pp_has_last_stage: Whether this rank holds the last pipeline stage
+        loss_fn: Optional compiled loss function. Only applied to the last
+            pipeline stage's output (where ``pred`` has logits shape). On
+            non-last stages the output is activations whose trailing dim
+            differs from the logits, and running ``loss_fn`` on them would
+            compile a variant of the loss graph with the wrong shape.
+        pp_has_last_stage: Whether this rank holds the last PP stage.
     """
     if not job_config.leto.enable_stage_warmup:
         return
 
-    if job_config.parallelism.pipeline_parallel_degree <= 1:
-        return
-
+    _install_subclass_unwrap_debug()
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     record_folder = os.path.join(
@@ -414,33 +571,476 @@ def maybe_warmup_stages(
 
     warmup_stages(
         model_parts,
-        record_path
+        record_path,
+        warmup_backward=True,
+        loss_fn=loss_fn,
+        pp_has_last_stage=pp_has_last_stage,
+        local_batch_size=job_config.training.local_batch_size,
+        seq_len=job_config.training.seq_len,
+        parallel_dims=parallel_dims,
     )
+
+
+_subclass_unwrap_debug_installed = False
+
+
+def _install_subclass_unwrap_debug() -> None:
+    """Wrap ``runtime_unwrap_tensor_subclasses`` so that, if the
+    ``SubclassCreationMeta`` assertion fails, we log the idx, current
+    value type, and recorded meta type before re-raising. This catches
+    the mismatch between warmup-compile-time and real-training-runtime
+    subclass structure.
+    """
+    global _subclass_unwrap_debug_installed
+    if _subclass_unwrap_debug_installed:
+        return
+    _subclass_unwrap_debug_installed = True
+
+    import torch._functorch._aot_autograd.subclass_utils as _sub_mod
+    from torch._functorch._aot_autograd.schemas import SubclassCreationMeta
+
+    orig = _sub_mod.runtime_unwrap_tensor_subclasses
+
+    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+
+    def wrapped(wrapped_args, *, append_symints, subclass_metas=None):
+        # Pre-unwrap any AsyncCollectiveTensor args whose corresponding
+        # subclass_meta entry is PlainTensorMeta. Warmup traces under
+        # FakeTensorMode produce plain FakeTensors for functional
+        # collective outputs (the fake kernels don't wrap in ACS), so
+        # AOT records ``PlainTensorMeta`` for those slots. At real
+        # training the same slots hold ``AsyncCollectiveTensor(tensor)``
+        # from live async collectives; forcing a ``.wait()`` here unwraps
+        # them to the inner tensor so the subclass structure matches
+        # what was recorded.
+        if subclass_metas is not None and isinstance(wrapped_args, list):
+            for idx in range(len(wrapped_args)):
+                x = wrapped_args[idx]
+                if not isinstance(x, AsyncCollectiveTensor):
+                    continue
+                if idx >= len(subclass_metas):
+                    continue
+                meta = subclass_metas[idx]
+                if isinstance(meta, SubclassCreationMeta):
+                    continue
+                wrapped_args[idx] = x.trigger_wait()
+        try:
+            return orig(
+                wrapped_args,
+                append_symints=append_symints,
+                subclass_metas=subclass_metas,
+            )
+        except AssertionError:
+            from torch.utils._python_dispatch import (
+                is_traceable_wrapper_subclass,
+            )
+            logger.error("subclass_inp_meta mismatch diagnostic:")
+            for idx, x in enumerate(wrapped_args):
+                is_sub = (
+                    is_traceable_wrapper_subclass(x)
+                    if isinstance(x, torch.Tensor)
+                    else False
+                )
+                meta = (
+                    subclass_metas[idx]
+                    if subclass_metas is not None and idx < len(subclass_metas)
+                    else None
+                )
+                logger.error(
+                    f"  idx={idx} type={type(x).__name__} "
+                    f"is_subclass={is_sub} "
+                    f"meta_type={type(meta).__name__ if meta is not None else 'None'}"
+                )
+            raise
+
+    _sub_mod.runtime_unwrap_tensor_subclasses = wrapped
+    # Rebind the local copy imported at module-load time in runtime_wrappers.
+    import torch._functorch._aot_autograd.runtime_wrappers as _rw_mod
+    _rw_mod.runtime_unwrap_tensor_subclasses = wrapped
+
+import contextlib
+
+
+def _iter_all_submodules(model_parts):
+    for mp in model_parts:
+        for submod in mp.modules():
+            yield submod
+
+
+def _find_ep_hooks(model_parts, method_name):
+    """
+    Walk every submodule of every model_part and find pre/forward hooks whose
+    closure contains a bound method whose underlying function's ``__qualname__``
+    is ``ExpertParallel.<method_name>``.
+
+    Returns a list of tuples ``(hook_dict, key, orig_hook, ep_instance,
+    device_mesh)``. ``hook_dict`` is the live ``OrderedDict`` from the
+    submodule (``_forward_pre_hooks`` or ``_forward_hooks``), so the caller
+    can replace entries in place and restore them later.
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    target_qualname = f"ExpertParallel.{method_name}"
+    hook_dict_names = ("_forward_pre_hooks", "_forward_hooks")
+
+    results = []
+    for submod in _iter_all_submodules(model_parts):
+        for hook_dict_name in hook_dict_names:
+            hook_dict = getattr(submod, hook_dict_name, None)
+            if not hook_dict:
+                continue
+            for key, hook in list(hook_dict.items()):
+                closure = getattr(hook, "__closure__", None)
+                if not closure:
+                    continue
+                ep_inst = None
+                dm = None
+                for cell in closure:
+                    try:
+                        val = cell.cell_contents
+                    except ValueError:
+                        continue
+                    # Bound method of ExpertParallel.<method_name>?
+                    fn = getattr(val, "__func__", None)
+                    if fn is not None and getattr(
+                        fn, "__qualname__", ""
+                    ) == target_qualname:
+                        ep_inst = val.__self__
+                    elif isinstance(val, DeviceMesh):
+                        dm = val
+                if ep_inst is not None and dm is not None:
+                    results.append((hook_dict, key, hook, ep_inst, dm))
+    return results
+
+
+@contextlib.contextmanager
+def _patch_for_fake_warmup(model_parts):
+    """
+    Monkey-patch layers that can't run safely under FakeTensorMode, replacing
+    them with shape-correct stubs so the whole forward is runnable.
+
+    Why each patch exists:
+
+    - ``ExpertParallel._token_dispatch`` / ``_token_combine``: the real impl
+      does ``.tolist()`` (data-dependent) and ``all_to_all_single_autograd``
+      (collective). Both poison CUDA under fake mode.
+    - ``moe.utils._permute`` / ``_unpermute``: call a custom CUDA kernel
+      (``generate_permute_indices``) with no fake impl.
+    - ``FlexAttentionWrapper._compiled_flex_attn``: a module-level
+      ``torch.compile(flex_attention)`` whose Inductor-compiled Triton kernel
+      is launched below the ``__torch_dispatch__`` layer and reads
+      ``data_ptr()`` on FakeTensors → illegal memory access.
+
+    MoE patches assume *perfectly balanced* token routing; shapes produced
+    match real-run shapes under that assumption.
+    """
+    from torchtitan.distributed import expert_parallel as ep_mod
+    from torchtitan.models.moe import utils as moe_utils
+    from torchtitan.models.moe import moe as shared_moe
+    from torchtitan.models import attention as attention_mod
+    from torchtitan.models.gpt_oss.model import moe as gpt_oss_moe
+    from torchtitan.tools.utils import _round_up
+
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+    from torch._dynamo.guards import GuardBuilder, CheckFunctionManager
+    import torch._C._dynamo.guards as _c_guards_mod
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    orig_token_dispatch = ep_mod.ExpertParallel._token_dispatch
+    orig_token_combine = ep_mod.ExpertParallel._token_combine
+    orig_permute = moe_utils._permute
+    orig_unpermute = moe_utils._unpermute
+    orig_flex_attn = attention_mod.FlexAttentionWrapper._compiled_flex_attn
+    orig_experts_for_loop = gpt_oss_moe._run_experts_for_loop
+    orig_experts_grouped_mm = gpt_oss_moe._run_experts_grouped_mm
+    orig_shared_experts_for_loop = shared_moe._run_experts_for_loop
+    orig_shared_experts_grouped_mm = shared_moe._run_experts_grouped_mm
+    orig_autotuner_run = CachingAutotuner.run
+    orig_tensor_match = GuardBuilder.TENSOR_MATCH
+    orig_cfm_init = CheckFunctionManager.__init__
+    orig_empty_strided_cuda = _c_guards_mod._empty_strided_cuda
+    orig_reinterpret_tensor = _c_guards_mod._reinterpret_tensor
+    orig_fake_new = FakeTensor.__new__
+
+    def fake_permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+        align = moe_utils.TOKEN_GROUP_ALIGN_SIZE_M
+        x_padded_per_expert = x.shape[0] + num_local_experts * align
+        padded_max_len = _round_up(x_padded_per_expert, align)
+
+        # Match the real _permute: it vstacks a padding row then gathers.
+        x_vstacked = torch.vstack((x, x.new_zeros((x.shape[-1],))))
+        input_shape = x_vstacked.shape
+
+        permuted_indices = torch.zeros(
+            padded_max_len, dtype=torch.long, device=x.device
+        )
+        x_out = x.new_zeros((padded_max_len, x.shape[-1]))
+
+        # Balanced counts per local expert.
+        per_expert = padded_max_len // max(num_local_experts, 1)
+        balanced_counts = num_tokens_per_expert.new_full(
+            (num_local_experts,), per_expert
+        )
+        return input_shape, x_out, permuted_indices, balanced_counts
+
+    def fake_unpermute(out, input_shape, permuted_indices):
+        # Real _unpermute returns out_unpermuted[:-1] (drops the padding row).
+        out_unpermuted = out.new_zeros(input_shape)
+        return out_unpermuted[:-1]
+
+    def fake_token_dispatch(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+        ep_degree = device_mesh.shape[0]
+        num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
+
+        input_shape, routed_out, permuted_indices, counts = fake_permute(
+            routed_input, num_tokens_per_expert, ep_degree, num_local_experts
+        )
+        self.input_shape = input_shape
+        self.permuted_indices = permuted_indices
+        # Assume balanced a2a: equal-sized splits across EP ranks.
+        per_rank = routed_input.shape[0] // max(ep_degree, 1)
+        self.input_splits = [per_rank] * ep_degree
+        self.output_splits = [per_rank] * ep_degree
+        return routed_out, counts
+
+    def fake_token_combine(self, mod, routed_output, device_mesh):
+        return fake_unpermute(routed_output, self.input_shape, self.permuted_indices)
+
+    def fake_run_experts(
+        mlp1_weight,
+        mlp1_bias,
+        mlp2_weight,
+        mlp2_bias,
+        swiglu_limit,
+        x,
+        num_tokens_per_expert,
+        tp_degree=1,
+    ):
+        # Real _run_experts_for_loop and _run_experts_grouped_mm both produce
+        # an output with the same shape as x (the loop variant pads with
+        # zeros back to x.shape[0]; the grouped-mm variant preserves shape).
+        return x.new_zeros(x.shape)
+
+    def fake_shared_run_experts(w1, w2, w3, x, num_tokens_per_expert):
+        # Shared moe._run_experts_for_loop calls .tolist() on
+        # num_tokens_per_expert which raises under FakeTensorMode. Both
+        # variants (for_loop and grouped_mm) preserve the input shape of x,
+        # so return a zero tensor matching x.
+        return x.new_zeros(x.shape)
+
+    def fake_flex_attn(q, k, v, *, block_mask=None, scale=None, return_lse=False, **kw):
+        # Output shape of flex_attention matches q: (B, H, S, D).
+        out = q.new_zeros(q.shape, dtype=q.dtype)
+        if return_lse:
+            # LSE shape is (B, H, S), always float32 in flex_attention.
+            lse = q.new_zeros(q.shape[:-1], dtype=torch.float32)
+            return out, lse
+        return out
+
+    def patched_tensor_match(self, guard, value=None):
+        # Skip TENSOR_MATCH guard emission during warmup. Correctness is
+        # preserved by:
+        #   - reconstructing DTensor inputs with proper mesh/placements
+        #     in ``_metadata_to_dtensor`` (AOTAutograd sees the right
+        #     subclass at the input slot),
+        #   - overriding ``FakeTensor.pytype = torch.Tensor`` globally
+        #     during warmup (below), so any guard that bottoms out at
+        #     a leaf tensor (e.g. ``param._local_tensor``) records the
+        #     Tensor pytype rather than FakeTensor. Real training's
+        #     real tensors then match the cached guards.
+        return None
+
+    def patched_fake_new(cls, fake_mode, elem, device, **kwargs):
+        # Dynamo's TENSOR_MATCH guard records ``pytype=value.pytype`` for
+        # FakeTensors and falls back to ``type(value)`` when pytype is
+        # unset (guards.py:2946). The default ``pytype=None`` means the
+        # guard stores ``FakeTensor`` as the expected type, which fails
+        # at real-training lookup time. Default pytype to ``torch.Tensor``
+        # for FakeTensors created during warmup so guards key on Tensor.
+        if kwargs.get("pytype") is None:
+            kwargs["pytype"] = torch.Tensor
+        return orig_fake_new(cls, fake_mode, elem, device, **kwargs)
+
+    def patched_cfm_init(self, f_code, output_graph, *args, **kwargs):
+        # Skip Dynamo's post-build guard self-check during warmup. Our
+        # patched_tensor_match makes guards expect ``torch.Tensor``, but the
+        # self-check (guards.py:3908) runs the new guards against the actual
+        # tracing-time FakeTensor values, which fail the Tensor type check
+        # and raise "Guard failed on the same frame it was created". At real
+        # training time, inputs are real torch.Tensor so the guard passes.
+        if output_graph is not None:
+            try:
+                output_graph.skip_guards_check = True
+            except Exception:
+                pass
+        return orig_cfm_init(self, f_code, output_graph, *args, **kwargs)
+
+    def fake_empty_strided_cuda(size, stride, dtype):
+        # ``torch._C._dynamo.guards._empty_strided_cuda`` is a fast-path
+        # allocator used inside Inductor-generated code that bypasses
+        # __torch_dispatch__, so it produces a real CUDA tensor even when
+        # FakeTensorMode is active. That breaks warmup because subsequent
+        # ops mix real-CUDA temporaries with FakeTensor parameters. Route
+        # through ``torch.empty_strided`` which IS dispatched and therefore
+        # intercepted by the ambient FakeTensorMode.
+        return torch.empty_strided(size, stride, dtype=dtype, device="cuda")
+
+    def fake_reinterpret_tensor(tensor, size, stride, offset=0):
+        # ``torch._C._dynamo.guards._reinterpret_tensor`` bypasses Python
+        # dispatch and constructs a view by reaching into the underlying
+        # ``elem`` of a FakeTensor (which is a meta tensor), losing the
+        # FakeTensor wrapper. ``torch.as_strided`` goes through dispatch and
+        # preserves the FakeTensor subclass.
+        return torch.as_strided(tensor, size, stride, offset)
+
+    def fake_autotuner_run(self, *args, stream, **kwargs):
+        # Inductor Triton kernel launcher. Assumes the disk cache is already
+        # populated from a prior real run, so len(self.launchers) == 1 and we
+        # skip precompile/autotune. Skipping the actual launcher(*args) call
+        # means no GPU kernel fires with (garbage) FakeTensor-backed pointers.
+        # Warmup output tensors stay uninitialized, which is fine because
+        # we throw them away.
+        if len(self.launchers) == 0:
+            self.precompile()
+        if len(self.launchers) > 1:
+            # Pick the first candidate without benchmarking (autotune_to_one_
+            # config would launch kernels to measure latency).
+            self.launchers = self.launchers[:1]
+        return None
+
+    ep_mod.ExpertParallel._token_dispatch = fake_token_dispatch
+    ep_mod.ExpertParallel._token_combine = fake_token_combine
+    moe_utils._permute = fake_permute
+    moe_utils._unpermute = fake_unpermute
+    # Leave FlexAttentionWrapper._compiled_flex_attn untouched: we want Dynamo
+    # to trace it so the frame cache entry gets built during warmup. The
+    # CachingAutotuner.run no-op below ensures the Triton kernel does not
+    # actually launch on fake inputs.
+    gpt_oss_moe._run_experts_for_loop = fake_run_experts
+    gpt_oss_moe._run_experts_grouped_mm = fake_run_experts
+    shared_moe._run_experts_for_loop = fake_shared_run_experts
+    shared_moe._run_experts_grouped_mm = fake_shared_run_experts
+    CachingAutotuner.run = fake_autotuner_run
+    GuardBuilder.TENSOR_MATCH = patched_tensor_match
+    CheckFunctionManager.__init__ = patched_cfm_init
+    _c_guards_mod._empty_strided_cuda = fake_empty_strided_cuda
+    _c_guards_mod._reinterpret_tensor = fake_reinterpret_tensor
+    FakeTensor.__new__ = patched_fake_new
+
+    # Class-level replacement above doesn't affect already-registered DTensor
+    # pre/forward hooks on MoE submodules, because those hooks closed over
+    # *bound methods* of the original ``_token_dispatch``/``_token_combine``
+    # at model-parallelization time — before our patch ran. We have to swap
+    # the hook entries directly.
+    dispatch_hook_records = _find_ep_hooks(model_parts, "_token_dispatch")
+    combine_hook_records = _find_ep_hooks(model_parts, "_token_combine")
+
+    def _make_fake_pre_hook(ep_inst, device_mesh):
+        def _hook(mod, inputs):
+            return fake_token_dispatch(ep_inst, mod, inputs, device_mesh)
+        return _hook
+
+    def _make_fake_post_hook(ep_inst, device_mesh):
+        def _hook(mod, inputs, output):
+            return fake_token_combine(ep_inst, mod, output, device_mesh)
+        return _hook
+
+    for hook_dict, key, _orig, ep_inst, dm in dispatch_hook_records:
+        hook_dict[key] = _make_fake_pre_hook(ep_inst, dm)
+    for hook_dict, key, _orig, ep_inst, dm in combine_hook_records:
+        hook_dict[key] = _make_fake_post_hook(ep_inst, dm)
+
+    logger.info(
+        f"Fake warmup: patched {len(dispatch_hook_records)} _token_dispatch "
+        f"and {len(combine_hook_records)} _token_combine hooks"
+    )
+
+    try:
+        yield
+    finally:
+        ep_mod.ExpertParallel._token_dispatch = orig_token_dispatch
+        ep_mod.ExpertParallel._token_combine = orig_token_combine
+        moe_utils._permute = orig_permute
+        moe_utils._unpermute = orig_unpermute
+        attention_mod.FlexAttentionWrapper._compiled_flex_attn = orig_flex_attn
+        gpt_oss_moe._run_experts_for_loop = orig_experts_for_loop
+        gpt_oss_moe._run_experts_grouped_mm = orig_experts_grouped_mm
+        shared_moe._run_experts_for_loop = orig_shared_experts_for_loop
+        shared_moe._run_experts_grouped_mm = orig_shared_experts_grouped_mm
+        CachingAutotuner.run = orig_autotuner_run
+        GuardBuilder.TENSOR_MATCH = orig_tensor_match
+        CheckFunctionManager.__init__ = orig_cfm_init
+        _c_guards_mod._empty_strided_cuda = orig_empty_strided_cuda
+        _c_guards_mod._reinterpret_tensor = orig_reinterpret_tensor
+        FakeTensor.__new__ = orig_fake_new
+        for hook_dict, key, orig, _ep, _dm in dispatch_hook_records:
+            hook_dict[key] = orig
+        for hook_dict, key, orig, _ep, _dm in combine_hook_records:
+            hook_dict[key] = orig
+
+
+def _reduce_output_to_scalar(output: Any) -> "torch.Tensor | None":
+    """Sum-reduce a forward output (Tensor or tuple/list of Tensors) to a scalar
+    loss for driving backward. Returns None if no grad-requiring tensor is found."""
+    if isinstance(output, torch.Tensor):
+        return output.sum() if output.requires_grad else None
+    if isinstance(output, (tuple, list)):
+        grad_tensors = [
+            o for o in output if isinstance(o, torch.Tensor) and o.requires_grad
+        ]
+        if not grad_tensors:
+            return None
+        return sum(t.sum() for t in grad_tensors)
+    return None
+
 
 def warmup_stages(
     model_parts: list[torch.nn.Module],
-    record_path: str
+    record_path: str,
+    warmup_backward: bool = False,
+    loss_fn: Optional[Callable] = None,
+    pp_has_last_stage: bool = True,
+    local_batch_size: int = 1,
+    seq_len: int = 2048,
+    parallel_dims: Any = None,
 ) -> None:
     """
-    Warmup stages by running forward pass with recorded synthetic inputs.
+    Warmup stages by running forward (and optionally backward) with synthetic
+    inputs under ``FakeTensorMode``.
 
-    This helps torch.compile create the backward graph during forward pass,
-    warming up both forward and backward compilation.
+    Why fake tensors: this runs in a standby process that shares the device with
+    (or stands in for) the real training process. We want Dynamo tracing,
+    AOTAutograd partitioning, and Inductor codegen to happen — populating the
+    in-process Dynamo guarded cache and the on-disk FX/Inductor caches — without
+    launching real CUDA kernels or allocating activation memory. When this same
+    process later runs real training, the first real forward/backward hits the
+    warm Dynamo cache and skips retracing/recompile.
+
+    ``warmup_backward`` defaults to False because backward through
+    expert-parallel MoE drives collective ops that have no fake impl and will
+    poison the CUDA context via real NCCL calls with garbage shapes. Forward
+    can already fail on the same path; this just reduces the surface area.
 
     Args:
         model_parts: List of model parts (stage submodules) to warmup
         record_path: Path to the JSON file with recorded input metadata
-        loss_fn: Optional compiled loss function to warmup (only used on the
-            rank that owns the last PP stage)
-        pp_has_last_stage: Whether this rank holds the last pipeline stage
+        warmup_backward: If True, also run .backward() on each stage's output
+            to compile the backward partition. Leave False for MoE+EP models.
     """
+    global _current_parallel_dims
+    _current_parallel_dims = parallel_dims
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch._inductor import config as inductor_config
+
     if not os.path.exists(record_path):
         logger.warning(
             f"Stage input record file not found at {record_path}, skipping warmup"
         )
+        _current_parallel_dims = None
         return
 
-    # Load recorded inputs
     with open(record_path, "r") as f:
         data = json.load(f)
 
@@ -452,32 +1052,370 @@ def warmup_stages(
             f"and model_parts ({len(model_parts)}). This may happen if pipeline "
             f"configuration changed. Skipping warmup."
         )
+        _current_parallel_dims = None
         return
 
-    logger.info(f"Starting stage warmup for {len(model_parts)} model_parts...")
+    logger.info(
+        f"Starting stage warmup for {len(model_parts)} model_parts "
+        "under FakeTensorMode..."
+    )
 
-    for stage_idx, (model_part, stage_metadata) in enumerate(
-        zip(model_parts, recorded_stages)
-    ):
-        if stage_metadata is None:
-            logger.warning(f"No recorded inputs for stage {stage_idx}, skipping")
-            continue
+    # Disable Inductor's on-disk FX graph cache during warmup so we neither
+    # read poisoned artifacts from prior warmups nor write new ones.
+    prev_fx_graph_cache = inductor_config.fx_graph_cache
+    inductor_config.fx_graph_cache = False
 
-        synthetic_args, synthetic_kwargs = _deserialize_args(stage_metadata)
+    # allow_non_fake_inputs=True lets the real cuda tensors produced by
+    # _deserialize_args (and the real parameters inside model_part) be
+    # auto-lifted to FakeTensors on dispatch, so we don't have to manually
+    # convert every input or parameter.
+    with FakeTensorMode(allow_non_fake_inputs=True), _patch_for_fake_warmup(model_parts):
+        # Pre-compute attention_masks ONCE using the first model_part's
+        # ``get_attention_masks`` with a full-batch stub, then reuse for
+        # ALL virtual stages. This is critical for PP Interleaved1F1B
+        # where each rank has multiple virtual stages: only the first
+        # receives 2-D tokens; later ones receive 3-D activations and
+        # would fall back to ``_metadata_to_block_mask`` (which uses
+        # bare ``get_causal_mask_mod()`` rather than
+        # ``and_masks(causal, document)``). The resulting ``mask_mod``
+        # code-object mismatch triggers Dynamo recompiles on every
+        # layer. Building once ensures all stages trace against the
+        # same mask_mod closure, matching real training's single
+        # ``get_attention_masks`` call in ``forward_backward_step``.
+        shared_attention_masks = None
+        _all_split_masks = None  # list of per-microbatch masks for PP
+        model_args = getattr(model_parts[0], "model_args", None)
+        attn_type = getattr(model_args, "attn_type", "sdpa")
+        if attn_type in ("flex", "varlen"):
+            class _StubTokenizer:
+                eos_id = 0
+            device = f"cuda:{torch.cuda.current_device()}"
+            stub_tokens = torch.zeros(
+                local_batch_size,
+                seq_len,
+                dtype=torch.long,
+                device=device,
+            )
+            try:
+                # pyrefly: ignore [not-callable]
+                shared_attention_masks = model_parts[0].get_attention_masks(
+                    input_batch=stub_tokens,
+                    tokenizer=_StubTokenizer(),
+                    extra_inputs={},
+                )
+                # For PP, the pipeline schedule splits the BlockMask per
+                # microbatch via ``_split_block_mask``, wrapping each
+                # chunk's ``mask_mod`` in a ``batch_offset_mask_mod``
+                # closure (microbatch.py). Warmup must match, otherwise
+                # the Dynamo guard on ``mask_mod.__code__`` sees
+                # ``and_mask`` (from warmup) vs ``batch_offset_mask_mod``
+                # (from real training) → recompile on every layer. Split
+                # here and use a single chunk for all stages — the code
+                # object of ``batch_offset_mask_mod`` is the same across
+                # all chunks.
+                if (
+                    len(model_parts) > 1
+                    and parallel_dims is not None
+                    and getattr(parallel_dims, "pp_enabled", False)
+                    and isinstance(shared_attention_masks, BlockMask)
+                ):
+                    from torch.distributed.pipelining.microbatch import (
+                        _split_block_mask,
+                    )
+                    num_chunks = max(
+                        local_batch_size,
+                        shared_attention_masks.kv_num_blocks.size(0),
+                    )
+                    if num_chunks > 1:
+                        split = _split_block_mask(
+                            shared_attention_masks, num_chunks
+                        )
+                        _all_split_masks = split
+                        shared_attention_masks = split[0]
+                elif isinstance(shared_attention_masks, dict):
+                    # gpt_oss returns dict[str, BlockMask].
+                    # Split each value if PP.
+                    if (
+                        len(model_parts) > 1
+                        and parallel_dims is not None
+                        and getattr(parallel_dims, "pp_enabled", False)
+                    ):
+                        from torch.distributed.pipelining.microbatch import (
+                            _split_block_mask,
+                        )
+                        # Collect per-key splits for building
+                        # _all_split_masks as list of dicts.
+                        key_splits: dict[str, list] = {}
+                        max_chunks = 1
+                        new_masks = {}
+                        for k, v in shared_attention_masks.items():
+                            if isinstance(v, BlockMask):
+                                nc = max(
+                                    local_batch_size,
+                                    v.kv_num_blocks.size(0),
+                                )
+                                if nc > 1:
+                                    s = _split_block_mask(v, nc)
+                                    new_masks[k] = s[0]
+                                    key_splits[k] = s
+                                    max_chunks = max(max_chunks, len(s))
+                                else:
+                                    new_masks[k] = v
+                            else:
+                                new_masks[k] = v
+                        shared_attention_masks = new_masks
+                        if max_chunks > 1:
+                            _all_split_masks = []
+                            for ci in range(max_chunks):
+                                chunk_dict = {}
+                                for k, v in new_masks.items():
+                                    if k in key_splits:
+                                        chunk_dict[k] = key_splits[k][
+                                            min(ci, len(key_splits[k]) - 1)
+                                        ]
+                                    else:
+                                        chunk_dict[k] = v
+                                _all_split_masks.append(chunk_dict)
+            except Exception as e:
+                logger.warning(
+                    f"Fake warmup: get_attention_masks failed "
+                    f"({type(e).__name__}: {e}), using per-stage recorded masks."
+                )
+
+        # Build the list of microbatch masks to iterate. For PP with
+        # block_causal, ``_split_block_mask`` creates per-microbatch
+        # closures that capture a ``batch_offset`` constant. Dynamo
+        # specializes on this constant. We must compile with EACH
+        # distinct batch_offset so real training hits a cached entry
+        # for every microbatch. For non-PP or causal (B=1), the split
+        # short-circuits and there's just one mask.
+        microbatch_masks = (
+            _all_split_masks
+            if _all_split_masks is not None and len(_all_split_masks) > 1
+            else [shared_attention_masks]
+        )
+
+        for mb_idx, _current_microbatch_mask in enumerate(microbatch_masks):
+            if mb_idx > 0:
+                logger.info(
+                    f"Fake warmup: extra microbatch pass {mb_idx} "
+                    f"(compiling for batch_offset={mb_idx})"
+                )
+            for stage_idx, (model_part, stage_metadata) in enumerate(
+                zip(model_parts, recorded_stages)
+            ):
+                if stage_metadata is None:
+                    logger.warning(
+                        f"No recorded inputs for stage {stage_idx}, skipping"
+                    )
+                    continue
+
+                synthetic_args, synthetic_kwargs = _deserialize_args(stage_metadata)
+                try:
+                    # Override attention_masks for ALL virtual stages with
+                    # the current microbatch's mask.
+                    if (
+                        _current_microbatch_mask is not None
+                        and "attention_masks" in synthetic_kwargs
+                    ):
+                        synthetic_kwargs["attention_masks"] = (
+                            _current_microbatch_mask
+                        )
+                    output = model_part(*synthetic_args, **synthetic_kwargs)
+                    if warmup_backward:
+                        loss = None
+                        is_last_stage_module = (
+                            pp_has_last_stage
+                            and stage_idx == len(model_parts) - 1
+                        )
+                        if (
+                            is_last_stage_module
+                            and loss_fn is not None
+                            and isinstance(output, torch.Tensor)
+                        ):
+                            labels = torch.zeros(
+                                output.shape[:-1],
+                                dtype=torch.long,
+                                device=output.device,
+                            )
+                            from torch.distributed.tensor import DTensor
+
+                            if isinstance(output, DTensor):
+                                from torch.distributed.tensor.parallel import (
+                                    loss_parallel,
+                                )
+
+                                with loss_parallel():
+                                    loss = loss_fn(output, labels)
+                                    if loss is not None:
+                                        loss.backward()
+                            else:
+                                loss = loss_fn(output, labels)
+                                if loss is not None:
+                                    loss.backward()
+                        else:
+                            loss = _reduce_output_to_scalar(output)
+                            if loss is not None:
+                                loss.backward()
+
+                    del synthetic_args, synthetic_kwargs, output
+                except Exception as e:
+                    logger.warning(
+                        f"Fake warmup failed for stage {stage_idx} "
+                        f"(mb={mb_idx}): "
+                        f"{type(e).__name__}: {e}. "
+                        "This stage will pay full compile cost on the "
+                        "first real step."
+                    )
+
+                    is_cuda_err = isinstance(
+                        e, torch.AcceleratorError
+                    ) or "CUDA error" in str(e)
+                    if is_cuda_err:
+                        raise RuntimeError(
+                            f"Fake warmup poisoned CUDA context at stage "
+                            f"{stage_idx}. This usually means an op inside "
+                            "this stage (e.g. expert-parallel all-to-all) "
+                            "fell through FakeTensorMode and launched a real "
+                            "kernel with invalid arguments. Disable "
+                            "enable_stage_warmup for this model or skip "
+                            "this stage explicitly."
+                        ) from e
+                    raise e
+
+                model_part.zero_grad(set_to_none=True)
+
+    inductor_config.fx_graph_cache = prev_fx_graph_cache
+
+    # FSDP2 caches the unsharded full param across forwards in
+    # ``FSDPParam._unsharded_param`` and ``all_gather_outputs``. Under warmup,
+    # the all-gather ran under FakeTensorMode so the cached unsharded param is
+    # a FakeTensor. On subsequent real forwards, FSDP's init_unsharded_param
+    # takes the copy_ path (since ``hasattr(self, "_unsharded_param")`` is
+    # True) and keeps that fake nn.Parameter bound to ``module.weight``.
+    # Purge the cache so the next real all-gather recreates it fresh.
+    purged = 0
+    for mp in model_parts:
+        for mod in mp.modules():
+            get_state = getattr(mod, "_get_fsdp_state", None)
+            if get_state is None:
+                continue
+            try:
+                state = get_state()
+            except Exception:
+                continue
+            pg = getattr(state, "_fsdp_param_group", None)
+            if pg is None:
+                continue
+            for fp in pg.fsdp_params:
+                if hasattr(fp, "_unsharded_param"):
+                    try:
+                        del fp._unsharded_param
+                    except Exception:
+                        pass
+                fp.all_gather_outputs = []
+                if hasattr(fp, "_unsharded_inner_tensors"):
+                    fp._unsharded_inner_tensors = []
+                purged += 1
+    if purged:
+        logger.info(f"Post-warmup FSDP purge: cleared unsharded cache on {purged} FSDPParams")
+
+    # DIAGNOSTIC: walk every parameter and buffer on every model_part and
+    # report any that have been rebound to a FakeTensor during warmup.
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    def _describe_tensor(t) -> str:
+        parts = [
+            f"type={type(t).__name__}",
+            f"shape={tuple(t.shape)}",
+            f"dtype={t.dtype}",
+        ]
         try:
-            output = model_part(*synthetic_args, **synthetic_kwargs)
-            # if isinstance(output, torch.Tensor) and output.requires_grad:
-            #     output.sum().backward()
-            del synthetic_args, synthetic_kwargs, output
-        except Exception as e:
-            logger.error(f"Failed grad warmup for stage {stage_idx}: {e}")
-            raise
+            parts.append(f"device={t.device}")
+        except Exception:
+            pass
+        local = getattr(t, "_local_tensor", None)
+        if local is not None and local is not t:
+            parts.append(
+                f"_local_tensor.type={type(local).__name__}"
+                f" _local_tensor.shape={tuple(local.shape)}"
+            )
+        data = getattr(t, "data", None)
+        if data is not None and data is not t:
+            parts.append(f"data.type={type(data).__name__}")
+        parts.append(f"mro={[c.__name__ for c in type(t).__mro__[:4]]}")
+        return " ".join(parts)
 
-        # model_part.zero_grad(set_to_none=True)
+    def _is_fake(t) -> bool:
+        """Return True if ``t`` is a FakeTensor, or wraps one at any depth
+        (DTensor._local_tensor, subclass __tensor_flatten__ inner tensors, etc.)."""
+        if t is None:
+            return False
+        if isinstance(t, FakeTensor):
+            return True
+        # DTensor stores the local shard under ``_local_tensor``.
+        local = getattr(t, "_local_tensor", None)
+        if local is not None and local is not t:
+            if _is_fake(local):
+                return True
+        # Generic tensor subclass: walk inner tensors via __tensor_flatten__.
+        flatten = getattr(type(t), "__tensor_flatten__", None)
+        if flatten is not None:
+            try:
+                inner_names, _ctx = flatten(t)
+                for n in inner_names:
+                    inner = getattr(t, n, None)
+                    if inner is not None and inner is not t and _is_fake(inner):
+                        return True
+            except Exception:
+                pass
+        # ``.data`` unwrap for plain Parameters.
+        data = getattr(t, "data", None)
+        if data is not None and data is not t and isinstance(data, FakeTensor):
+            return True
+        return False
+
+    leaked: list[tuple[str, str]] = []
+    for mp_idx, mp in enumerate(model_parts):
+        for name, param in mp.named_parameters():
+            if _is_fake(param):
+                leaked.append(
+                    (f"model_part[{mp_idx}].param.{name}", _describe_tensor(param))
+                )
+        for name, buf in mp.named_buffers():
+            if _is_fake(buf):
+                leaked.append(
+                    (f"model_part[{mp_idx}].buffer.{name}", _describe_tensor(buf))
+                )
+        # Catch tensors stored as regular instance attributes (outside the
+        # Parameter/Buffer registries) on any submodule. E.g. rope_cache,
+        # custom caches, etc.
+        for mod_name, mod in mp.named_modules():
+            for attr_name, val in list(vars(mod).items()):
+                if attr_name.startswith("_"):
+                    continue
+                if isinstance(val, torch.Tensor) and _is_fake(val):
+                    leaked.append(
+                        (
+                            f"model_part[{mp_idx}].{mod_name}.{attr_name} (attr)",
+                            _describe_tensor(val),
+                        )
+                    )
+
+    if leaked:
+        logger.error("Fake warmup leaked FakeTensor into persistent module state:")
+        for name, desc in leaked:
+            logger.error(f"  {name}: {desc}")
+        raise RuntimeError(
+            f"Fake warmup leaked {len(leaked)} tensor(s) — see log above."
+        )
+    logger.info(
+        f"Post-warmup param/buffer check: all "
+        f"{sum(1 for mp in model_parts for _ in mp.parameters())} params and "
+        f"{sum(1 for mp in model_parts for _ in mp.buffers())} buffers are real tensors"
+    )
+
+    _current_parallel_dims = None
 
     torch.cuda.synchronize()
     gc.collect()
-    # Final cleanup
-    torch.cuda.empty_cache()
-
-    logger.info("Stage warmup completed successfully")
