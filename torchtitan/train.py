@@ -684,6 +684,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train(self):
         job_config = self.job_config
 
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        self._restored_step = self.step
+
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
             global_batch_size = job_config.training.local_batch_size * self._batch_degree

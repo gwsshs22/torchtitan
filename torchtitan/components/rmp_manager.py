@@ -24,6 +24,7 @@ from torchtitan.tools.utils import (
     state_dict_to_stateful
 )
 from leto.rmp.client import RmpClient, TensorSpec
+from leto.rmp.flags import FLAG_KIND_GPU
 
 
 class MetadataCircularBuffer:
@@ -252,6 +253,8 @@ class RmpManager:
             self._sync_commit(step=0)
         else:
             self._load_cpu_metadata()
+
+        self.rmp_client.set_allocation_flag(FLAG_KIND_GPU)
 
         return not allocated
 

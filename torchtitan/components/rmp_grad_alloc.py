@@ -9,6 +9,7 @@ group index so they survive ordering changes between runs.
 from typing import Sequence
 
 import torch
+from torch._guards import detect_fake_mode
 from torch.distributed._tensor import DTensor
 from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 
@@ -182,6 +183,12 @@ class RmpGradientAllocator:
             else:
                 # RS output buffer (persistent, RMP-backed)
                 pg_state.is_input = True
+                # Stage warmup runs backward under FakeTensorMode. Reconstructing
+                # a CUDA IPC tensor calls set_(cuda_storage) on a meta tensor,
+                # which fake dispatch rejects as a device mismatch. Also we
+                # must not register anything on the RMP server during warmup.
+                if detect_fake_mode() is not None:
+                    return torch.empty(*size, dtype=dtype, device=device)
                 if pg_state.cached_output is not None:
                     return pg_state.cached_output
 

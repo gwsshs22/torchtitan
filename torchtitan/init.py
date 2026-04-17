@@ -42,6 +42,7 @@ from torchtitan.components.metrics import (
     GPUMemoryMonitor,
 )
 from torchtitan.components.rmp_manager import RmpManager
+from leto.rmp.flags import FLAG_KIND_CPU, FLAG_KIND_GPU
 from torchtitan.experiments.resilient_opt.resilient_opt import ResilientOptimizer
 from torchtitan.experiments.resilient_opt.resilient_opt_cpu_snapshot import (
     AsyncCpuSnapshotOptimizer,
@@ -135,6 +136,7 @@ class InitContext:
 
     # collective manager (internal, not transferred)
     _collective_manager: Any = None
+    is_standby: bool = False
 
     def apply_to(self, trainer: Any) -> None:
         """Transfer all public fields to the trainer instance."""
@@ -224,25 +226,10 @@ def start_gpu_memory_monitor(ctx: InitContext) -> None:
 
 
 def compute_batch_info(ctx: InitContext) -> None:
-    """Reordered mode: uses get_batch_info helper."""
     ctx._global_rank = int(os.environ["RANK"])
     ctx._batch_degree, ctx._batch_rank = ctx.parallel_dims.get_batch_info(
         ctx._global_rank
     )
-
-
-def compute_batch_info_baseline(ctx: InitContext) -> None:
-    """Baseline mode: uses dp mesh directly."""
-    ctx._global_rank = int(os.environ["RANK"])
-    parallel_dims = ctx.parallel_dims
-    if parallel_dims.dp_enabled:
-        batch_mesh = parallel_dims.get_mesh("batch")
-        ctx._batch_degree, ctx._batch_rank = (
-            batch_mesh.size(),
-            batch_mesh.get_local_rank(),
-        )
-    else:
-        ctx._batch_degree, ctx._batch_rank = 1, 0
 
 
 def init_ft_manager(ctx: InitContext) -> None:
@@ -347,34 +334,6 @@ def build_metrics_processor(ctx: InitContext) -> None:
         f"{ctx._color.blue}Model {job_config.model.name} {job_config.model.flavor} "
         f"{ctx._color.red}size: {model_param_count:,} total parameters{ctx._color.reset}"
     )
-
-
-def build_metrics_processor_baseline(ctx: InitContext) -> None:
-    """Baseline mode: no gpu_memory_monitor kwarg."""
-    job_config = ctx.job_config
-    build_fn = (
-        _build_metrics_processor
-        if ctx.train_spec.build_metrics_processor_fn is None
-        else ctx.train_spec.build_metrics_processor_fn
-    )
-    ctx.metrics_processor = build_fn(
-        job_config,
-        ctx.parallel_dims,
-        ctx._model_args,
-    )
-    ctx._color = ctx.metrics_processor.color
-
-    (
-        model_param_count,
-        ctx.metrics_processor.num_flops_per_token,
-    ) = ctx._model_args.get_nparams_and_flops(
-        ctx._model, job_config.training.seq_len
-    )
-    logger.info(
-        f"{ctx._color.blue}Model {job_config.model.name} {job_config.model.flavor} "
-        f"{ctx._color.red}size: {model_param_count:,} total parameters{ctx._color.reset}"
-    )
-
 
 def build_loss_fn_and_grad_accum(ctx: InitContext) -> None:
     job_config = ctx.job_config
@@ -571,17 +530,6 @@ def build_optimizers(ctx: InitContext) -> None:
     )
 
 
-def build_optimizers_baseline(ctx: InitContext) -> None:
-    """Baseline mode: no max_steps logic."""
-    job_config = ctx.job_config
-    ctx.optimizers = ctx.train_spec.build_optimizers_fn(
-        ctx.model_parts, job_config.optimizer, ctx.parallel_dims, ctx.ft_manager
-    )
-    ctx.lr_schedulers = ctx.train_spec.build_lr_schedulers_fn(
-        ctx.optimizers, job_config.lr_scheduler, job_config.training.steps
-    )
-
-
 def init_trainer_states(ctx: InitContext) -> None:
     ctx.step = 0
     ctx.ntokens_seen = 0
@@ -605,6 +553,9 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
         dataloader=ctx.dataloader,
         device=ctx.device,
     )
+    if job_config.leto.enable_rmp_gpu and ctx.is_standby:
+        ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_GPU)
+
     ctx.rmp_restored = ctx.rmp_manager.maybe_init(ctx.buffer_device)
 
     # Resilient optimizer
@@ -658,6 +609,8 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
     collective_manager = FsdpCollectiveManager()
 
     if job_config.checkpoint.use_gemini:
+        if job_config.leto.enable_rmp_cpu and ctx.is_standby:
+            ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_CPU)
         ctx.checkpointer.lazy_init(
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,
@@ -690,41 +643,6 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
     ctx.rmp_manager.init_gradient_allocator(collective_manager, ctx.model_parts)
     collective_manager.attach(ctx.model_parts)
     ctx._collective_manager = collective_manager
-
-
-def build_checkpoint_baseline(ctx: InitContext) -> None:
-    """Baseline mode: single-shot checkpoint creation (no lazy Gemini)."""
-    job_config = ctx.job_config
-    parallel_dims = ctx.parallel_dims
-
-    ckpt_cls = CheckpointManager
-    if job_config.checkpoint.use_gemini:
-        ckpt_cls = GeminiCheckpointManager
-        assert parallel_dims.fsdp_enabled, "Gemini needs FSDP enabled."
-
-    ckpt_extra_kwargs = {}
-    if job_config.checkpoint.use_gemini:
-        ckpt_extra_kwargs["parallel_dims"] = parallel_dims
-        ckpt_extra_kwargs["rmp_restored"] = ctx.rmp_restored
-
-    ctx.checkpointer = ckpt_cls(
-        dataloader=ctx.dataloader,
-        model_parts=ctx.model_parts,
-        optimizers=ctx.optimizers,
-        lr_schedulers=ctx.lr_schedulers,
-        states={"train_state": ctx},
-        checkpoint_config=job_config.checkpoint,
-        sd_adapter=(
-            ctx.train_spec.state_dict_adapter(
-                ctx._model_args, job_config.model.hf_assets_path
-            )
-            if ctx.train_spec.state_dict_adapter
-            else None
-        ),
-        base_folder=job_config.job.dump_folder,
-        ft_manager=ctx.ft_manager,
-        **ckpt_extra_kwargs,
-    )
 
 
 def build_validator(ctx: InitContext) -> None:
@@ -762,6 +680,8 @@ def build_validator(ctx: InitContext) -> None:
 
 
 def _nccl_eager_init_enabled(ctx: InitContext) -> bool:
+    if not (_LETO_AVAILABLE and leto_is_standby()):
+        return False
     eager_list = ctx.job_config.leto.eager_init_list
     if len(eager_list) == 0 or "none" in eager_list:
         return False
@@ -815,13 +735,11 @@ def eager_init_nccl_pp(ctx: InitContext) -> None:
 def eager_init_nccl_loss(ctx: InitContext) -> None:
     _eager_init_mesh(ctx, "loss")
 
-
-def load_checkpoint(ctx: InitContext) -> None:
-    ctx.checkpointer.load(step=ctx.job_config.checkpoint.load_step)
-    ctx._restored_step = ctx.step
-
-
 def warmup_stages(ctx: InitContext) -> None:
+    if ctx.job_config.leto.enable_standby:
+        if not (_LETO_AVAILABLE and leto_is_standby()):
+            return
+
     maybe_warmup_stages(
         ctx.model_parts,
         ctx.job_config,
@@ -849,7 +767,6 @@ REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
     build_loss_fn_and_grad_accum,
     build_train_context,
     init_gemini_checkpoint_partial,
-    maybe_wait_for_resuming,
     # --- CUDA boundary ---
     activate_cuda_device,
     set_determinism,
@@ -868,17 +785,16 @@ REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
     eager_init_nccl_tp,
     eager_init_nccl_pp,
     eager_init_nccl_loss,
-    load_checkpoint,
     warmup_stages,
 ]
 
 BASELINE_SEQUENCE: list[Callable[[InitContext], None]] = [
-    maybe_wait_for_resuming,
     activate_cuda_device,
     # --- CUDA context set immediately ---
     init_distributed,
     set_device_attr,
-    compute_batch_info_baseline,
+    start_gpu_memory_monitor,
+    compute_batch_info,
     init_ft_manager,
     init_garbage_collection,
     set_determinism,
@@ -886,24 +802,25 @@ BASELINE_SEQUENCE: list[Callable[[InitContext], None]] = [
     build_tokenizer_and_dataloader,
     build_model_on_meta,
     apply_model_converters,
-    build_metrics_processor_baseline,
-    compute_init_device,
+    build_metrics_processor,
     build_loss_fn_and_grad_accum,
+    build_train_context,
+    init_gemini_checkpoint_partial,
+    compute_init_device,
     apply_parallelisms_and_init_weights,
     log_device_memory_stats,
-    build_optimizers_baseline,
+    build_optimizers,
     init_trainer_states,
     init_rmp_and_resilient_opt,
     register_model_converter_hooks,
-    build_checkpoint_baseline,
-    build_train_context,
+    init_expert_dist_tracker,
+    init_collective_manager_and_checkpoint,
     build_validator,
     eager_init_nccl_fsdp,
     eager_init_nccl_ep,
     eager_init_nccl_tp,
     eager_init_nccl_pp,
     eager_init_nccl_loss,
-    load_checkpoint,
     warmup_stages,
 ]
 
@@ -912,21 +829,29 @@ _NVML_STATE: dict | None = None
 
 
 def _get_gpu_mem_mb() -> float | None:
-    """Return GPU memory used (MiB) for LOCAL_RANK via pynvml, or None.
+    """Return GPU memory used (MiB) by the current PID via pynvml, or None.
 
     Caches the NVML init + device handle across calls so profiling many
     init tasks does not repeatedly pay the handle-lookup cost.
     """
     global _NVML_STATE
     try:
-        from pynvml import nvmlDeviceGetMemoryInfo, nvmlMemory_v2
+        from pynvml import nvmlDeviceGetComputeRunningProcesses_v3
         if _NVML_STATE is None:
             from pynvml import nvmlDeviceGetHandleByIndex, nvmlInit
             nvmlInit()
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-            _NVML_STATE = {"handle": nvmlDeviceGetHandleByIndex(local_rank)}
-        info = nvmlDeviceGetMemoryInfo(_NVML_STATE["handle"], version=nvmlMemory_v2)
-        return info.used / (1024 * 1024)
+            _NVML_STATE = {
+                "handle": nvmlDeviceGetHandleByIndex(local_rank),
+                "pid": os.getpid(),
+            }
+        procs = nvmlDeviceGetComputeRunningProcesses_v3(_NVML_STATE["handle"])
+        my_pid = _NVML_STATE["pid"]
+        used = 0
+        for p in procs:
+            if p.pid == my_pid and p.usedGpuMemory is not None:
+                used += p.usedGpuMemory
+        return used / (1024 * 1024)
     except Exception:
         return None
 
@@ -942,12 +867,16 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
         raise ValueError(
             f"Unknown init_mode: {mode!r}. Expected one of {list(sequences.keys())}"
         )
+    is_standby = _LETO_AVAILABLE and leto_is_standby()
+    profile = job_config.leto.profile_init and is_standby
+    if profile:
+        time.sleep(10)
 
-    profile = job_config.leto.profile_init
     profile_records: list[dict] = []
     t0 = time.monotonic()
 
     ctx = InitContext(job_config=job_config)
+    ctx.is_standby = is_standby
     for task_fn in sequences[mode]:
         if profile:
             mem_before = _get_gpu_mem_mb()
@@ -981,4 +910,5 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
             }, f, indent=2)
         logger.info(f"Init profile written to {path}")
 
+    maybe_wait_for_resuming(ctx)
     return ctx

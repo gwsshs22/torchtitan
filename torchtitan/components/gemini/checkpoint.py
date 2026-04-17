@@ -30,6 +30,7 @@ class GeminiCheckpointManager:
         states: dict[str, Any],
         checkpoint_config: CheckpointConfig,
         base_folder: str = "",
+        **kwargs: Any,
     ) -> None:
         self.interval = checkpoint_config.interval
         self.enable = checkpoint_config.enable

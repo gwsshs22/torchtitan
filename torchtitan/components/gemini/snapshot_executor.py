@@ -20,6 +20,8 @@ from torchtitan.components.gemini.snapshot_strategy import get_snapshot_strategy
 from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
 
+from leto.rmp.flags import FLAG_KIND_CPU
+
 try:
     from leto.launch.worker_controller_client import (
         report_duration,
@@ -83,8 +85,6 @@ class SnapshotExecutor:
         self._metadata_path = os.path.join(self.mem_fs_folder, f"rank_{self._global_rank}_metadata.json")
         self.tmp_checkpoint_path = os.path.join(self.mem_fs_folder, f"rank_{self._global_rank}_tmp.pt")
         self.container_log_dir = os.path.join(self.mem_fs_folder, "logs")
-
-        self.has_checkpoint = self._check_has_checkpoint()
 
         self.snapshot_container = SnapshotContainer(
             self.mem_fs_folder,
@@ -159,6 +159,44 @@ class SnapshotExecutor:
         # Distributed setup - compute ranks within FSDP group
         self._peer_global_rank = self.snapshot_group.peer_global_rank
 
+        self.rank = self.snapshot_group._global_rank
+        self.model_wrapper.reset_cached_state_dict()
+
+        t0 = time.monotonic()
+        self.local_curr.init_cpu_tensors()
+        logger.info(f"[Gemini R{self.rank}] local_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
+        self.local_prev.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{self.rank}] local_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
+        self.remote_curr.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{self.rank}] remote_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
+        self.remote_prev.init_cpu_tensors()
+        logger.info(f"[Gemini Load R{self.rank}] remote_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
+
+        if self.enable_rmp_cpu and self.rmp_manager is not None:
+            self.rmp_manager.rmp_client.set_allocation_flag(FLAG_KIND_CPU)
+
+        t0 = time.monotonic()
+        self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)
+        self.remote_prev.compute_tensor_blocks(self.block_size)
+        logger.info(f"[Gemini Load R{self.rank}] compute_tensor_blocks: {time.monotonic() - t0:.3f}s")
+
+        self._total_blocks = len(self._gpu_blocks)
+        self._block_sizes = [t.numel() for t in self._gpu_blocks]
+
+        t0 = time.monotonic()
+        self._load_gaps_and_compute_strategy()
+        logger.info(f"[Gemini Load R{self.rank}] _load_gaps_and_compute_strategy: {time.monotonic() - t0:.3f}s")
+
+        t0 = time.monotonic()
+        self._init_sendrecv() # Warmup
+        logger.info(f"[Gemini Load R{self.rank}] _init_sendrecv: {time.monotonic() - t0:.3f}s")
+
     @property
     def local_curr(self) -> InMemState:
         return self.in_mem_states[LOCAL][self._curr_version]
@@ -205,14 +243,6 @@ class SnapshotExecutor:
         # e.g. standby activated after active's SnapshotContainer dumped state)
         self.has_checkpoint = self._check_has_checkpoint()
 
-        rank = self.snapshot_group._global_rank
-        load_start = time.monotonic()
-
-        self.model_wrapper.reset_cached_state_dict()
-
-        t0 = time.monotonic()
-        self.local_curr.init_cpu_tensors()
-        logger.info(f"[Gemini Load R{rank}] local_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
 
         # --- ckpt_loading: load checkpoint from mem_fs ---
         loading_start = time.monotonic()
@@ -220,7 +250,7 @@ class SnapshotExecutor:
         if not self.rmp_restored:
             t0 = time.monotonic()
             loaded = self._load_snapshot()
-            logger.info(f"[Gemini Load R{rank}] _load_snapshot: {time.monotonic() - t0:.3f}s (loaded={loaded})")
+            logger.info(f"[Gemini Load R{self.rank}] _load_snapshot: {time.monotonic() - t0:.3f}s (loaded={loaded})")
             if not loaded:
                 # Manually reset .step values in the optimizer states if not loaded.
                 for k, v in self.optimizers.state_dict().items():
@@ -233,35 +263,7 @@ class SnapshotExecutor:
             report_duration(DURATION_CHECKPOINT_LOADING, loading_duration,
                             checkpoint_loading_type=get_checkpoint_loading_type())
 
-        t0 = time.monotonic()
-        self.local_prev.init_cpu_tensors()
-        logger.info(f"[Gemini Load R{rank}] local_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
-
-        t0 = time.monotonic()
-        self.remote_curr.init_cpu_tensors()
-        logger.info(f"[Gemini Load R{rank}] remote_curr.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
-
-        t0 = time.monotonic()
-        self.remote_prev.init_cpu_tensors()
-        logger.info(f"[Gemini Load R{rank}] remote_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
-
-        t0 = time.monotonic()
-        self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)
-        self.remote_prev.compute_tensor_blocks(self.block_size)
-        logger.info(f"[Gemini Load R{rank}] compute_tensor_blocks: {time.monotonic() - t0:.3f}s")
-
-        self._total_blocks = len(self._gpu_blocks)
-        self._block_sizes = [t.numel() for t in self._gpu_blocks]
-
-        t0 = time.monotonic()
-        self._load_gaps_and_compute_strategy()
-        logger.info(f"[Gemini Load R{rank}] _load_gaps_and_compute_strategy: {time.monotonic() - t0:.3f}s")
-
-        t0 = time.monotonic()
-        self._init_sendrecv() # Warmup
-        logger.info(f"[Gemini Load R{rank}] _init_sendrecv: {time.monotonic() - t0:.3f}s")
-
-        logger.info(f"[Gemini Load R{rank}] total load time: {time.monotonic() - load_start:.3f}s")
+        logger.info(f"[Gemini Load R{self.rank}] total load time: {loading_duration:.3f}s")
         return loaded
 
     def _load_snapshot(self):
