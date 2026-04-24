@@ -104,6 +104,18 @@ class MetadataCircularBuffer:
         payload_bytes = bytes(payload_view[:data_len].numpy())
         return best_step, pickle.loads(payload_bytes)
 
+    def load_at_step(self, step: int) -> dict:
+        """Return metadata committed at *step*. Raises if no slot matches."""
+        for step_view, len_view, payload_view in self._slots:
+            if step_view.item() != step:
+                continue
+            data_len = len_view.item()
+            payload_bytes = bytes(payload_view[:data_len].numpy())
+            return pickle.loads(payload_bytes)
+        raise RuntimeError(
+            f"No slot in metadata circular buffer holds step={step}"
+        )
+
 def _ms(t_start, t_end):
     return (t_end - t_start) * 1000
 
@@ -249,11 +261,6 @@ class RmpManager:
                     model_part.init_weights(buffer_device=buffer_device)
             model_part.train()
 
-        if allocated:
-            self._sync_commit(step=0)
-        else:
-            self._load_cpu_metadata()
-
         self.rmp_client.set_allocation_flag(FLAG_KIND_GPU)
 
         return not allocated
@@ -330,7 +337,7 @@ class RmpManager:
     def _sync_commit(self, step: int):
         """Inline commit on the main thread. Used when rmp_commit_sync=True
         and for the init-time bootstrap commit in maybe_init."""
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         optim_metadata = {}
@@ -343,52 +350,64 @@ class RmpManager:
             if not isinstance(v, torch.Tensor):
                 optim_metadata[name] = v
 
-        t_snapshot = time.perf_counter()
+        # t_snapshot = time.perf_counter()
 
         num_bytes = self._meta_buffer.commit(step, metadata)
 
-        t_commit = time.perf_counter()
+        # t_commit = time.perf_counter()
 
         # Ensure all ranks have committed metadata before any rank proceeds
-        if self._gloo_warmup is not None:
-            self._gloo_warmup.wait()
-            self._gloo_warmup = None
-        dist.barrier(group=self._gloo_group)
+        # if self._gloo_warmup is not None:
+        #     self._gloo_warmup.wait()
+        #     self._gloo_warmup = None
+        # dist.barrier(group=self._gloo_group)
 
-        t_barrier = time.perf_counter()
-        logger.info(
-            f"Metadata commit: step={step}, {num_bytes} bytes, "
-            f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
-            f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
-            f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
-            f"total={_ms(t0, t_barrier):.2f} ms"
-        )
+        # t_barrier = time.perf_counter()
+        # logger.info(
+        #     f"Metadata commit: step={step}, {num_bytes} bytes, "
+        #     f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
+        #     f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
+        #     f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
+        #     f"total={_ms(t0, t_barrier):.2f} ms"
+        # )
 
     def maybe_commit(self, step: int):
         if not self.enabled or self.skip_commit:
             return
-        if self.rmp_commit_sync:
-            self._sync_commit(step)
-            return
-        assert self._commit_future is not None, (
-            "schedule_commit must be called before maybe_commit in async mode"
-        )
-        self._commit_future.result()  # propagates worker exceptions
-        self._commit_future = None
+        self._sync_commit(step)
 
-    def _load_cpu_metadata(self):
+        # if self.rmp_commit_sync:
+        #     self._sync_commit(step)
+        #     return
+        # assert self._commit_future is not None, (
+        #     "schedule_commit must be called before maybe_commit in async mode"
+        # )
+        # self._commit_future.result()  # propagates worker exceptions
+        # self._commit_future = None
+
+    def has_committed_metadata(self) -> bool:
+        """True if any rank-local metadata slot holds a valid commit."""
+        if not self.enabled:
+            return False
+        return self._meta_buffer.load_latest() is not None
+
+    def load_cpu_metadata(self, resume_step):
         if self.skip_commit:
             return
-        result = self._meta_buffer.load_latest()
-        if result is None:
-            raise RuntimeError("No committed metadata found in circular buffer")
-        step, committed_metadata = result
-        logger.info(f"Loaded metadata from circular buffer (step={step})")
+        committed_metadata = self._meta_buffer.load_at_step(resume_step)
+        logger.info(f"Loaded metadata from circular buffer (step={resume_step})")
         state_dict_to_stateful(self.states, committed_metadata["TRAIN"])
 
-        optim_state_dict = self.optimizers.state_dict()
-        optim_state_dict.update(committed_metadata["OPTIM"])
-        self.optimizers.load_state_dict(optim_state_dict)
+        # Tensor states (params, exp_avg, exp_avg_sq, step) are already
+        # correct in RMP-GPU from the previous active — do NOT route them
+        # through optimizer.load_state_dict, whose set_optimizer_state_dict
+        # path can mint fresh CUDA tensors and sever the RMP backing that
+        # ResilientOptimizer's bind() then captures (same class of bug as
+        # the gemini in_mem_state.py fix).  The non-tensor optim state
+        # (param_groups: lr, betas, ...) is reconstructed by the next
+        # lr_scheduler.step() call (the scheduler's last_epoch was just
+        # restored above via state_dict_to_stateful), so we don't need to
+        # apply committed_metadata["OPTIM"] either.
 
     def init_gradient_allocator(self, collective_manager, model_parts):
         """Register RMP gradient allocator on the collective manager."""

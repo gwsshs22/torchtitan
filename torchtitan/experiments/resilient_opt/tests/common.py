@@ -71,6 +71,43 @@ def create_optimizer_from_info(
     return all_params, optimizer
 
 
+class HookTracker:
+    """Pre/post hook tracker for ResilientOptimizer correctness tests.
+
+    The pre-hook mutates `p.grad` so that AdamW operates on different
+    inputs depending on whether the hook fired — making any missed or
+    duplicated invocation observable as a state mismatch (in addition to
+    the explicit call-count assertions in the tests).
+    """
+
+    def __init__(self, grad_bump: float = 0.01):
+        self._grad_bump = grad_bump
+        self.pre_calls = 0
+        self.post_calls = 0
+
+    def reset(self):
+        self.pre_calls = 0
+        self.post_calls = 0
+
+    def pre_hook(self, optimizer, args, kwargs):
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    get_local(p.grad).add_(self._grad_bump)
+        self.pre_calls += 1
+
+    def post_hook(self, optimizer, args, kwargs):
+        self.post_calls += 1
+
+
+def install_hooks(optimizer) -> HookTracker:
+    """Register the tracker's hooks on `optimizer` and return the tracker."""
+    tracker = HookTracker()
+    optimizer.register_step_pre_hook(tracker.pre_hook)
+    optimizer.register_step_post_hook(tracker.post_hook)
+    return tracker
+
+
 def populate_grads(params, seed):
     """Fill gradients with deterministic random values."""
     gen = torch.Generator(device=params[0].device)
@@ -142,7 +179,13 @@ class MockRmpClient:
         self._gpu_tensors.clear()
 
 class OptimizerList:
-    """Minimal wrapper so ResilientOptimizer can iterate over optimizers."""
+    """Minimal wrapper so ResilientOptimizer can iterate over optimizers.
+
+    Forwards `_optimizer_step_pre_hooks` / `_optimizer_step_post_hooks` from
+    the inner optimizer so tests that register hooks via the standard
+    `optimizer.register_step_pre_hook(...)` API are visible to
+    ResilientOptimizer (which reads hooks off the container at step time).
+    """
 
     def __init__(self, optimizer):
         self._opt = optimizer
@@ -152,6 +195,18 @@ class OptimizerList:
 
     def step(self, *args, **kwargs):
         self._opt.step(*args, **kwargs)
+
+    @property
+    def _optimizer_step_pre_hooks(self):
+        return self._opt._optimizer_step_pre_hooks
+
+    @property
+    def _optimizer_step_post_hooks(self):
+        return self._opt._optimizer_step_post_hooks
+
+    @property
+    def param_groups(self):
+        return self._opt.param_groups
 
 
 def load_optimizer_info(path: str) -> dict:

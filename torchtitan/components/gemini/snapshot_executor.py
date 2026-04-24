@@ -103,7 +103,6 @@ class SnapshotExecutor:
         pp_process_group: dist.ProcessGroup | None = None,
         tp_process_group: dist.ProcessGroup | None = None,
         fsdp_process_group: dist.ProcessGroup | None = None,
-        rmp_restored: bool = False,
         rmp_manager=None,
         enable_rmp_cpu: bool = False,
     ) -> None:
@@ -115,7 +114,6 @@ class SnapshotExecutor:
         self.states = states
         self.pp_process_group = pp_process_group
         self.tp_process_group = tp_process_group
-        self.rmp_restored = rmp_restored
         self.rmp_manager = rmp_manager
         self.enable_rmp_cpu = enable_rmp_cpu
 
@@ -246,17 +244,15 @@ class SnapshotExecutor:
 
         # --- ckpt_loading: load checkpoint from mem_fs ---
         loading_start = time.monotonic()
-        loaded = False
-        if not self.rmp_restored:
-            t0 = time.monotonic()
-            loaded = self._load_snapshot()
-            logger.info(f"[Gemini Load R{self.rank}] _load_snapshot: {time.monotonic() - t0:.3f}s (loaded={loaded})")
-            if not loaded:
-                # Manually reset .step values in the optimizer states if not loaded.
-                for k, v in self.optimizers.state_dict().items():
-                    if k.endswith(".step") and isinstance(v, torch.Tensor):
-                        assert v.numel() == 1, f"Expected .step to be a single scalar tensor, got {v.shape}"
-                        v.zero_()
+        t0 = time.monotonic()
+        loaded = self._load_snapshot()
+        logger.info(f"[Gemini Load R{self.rank}] _load_snapshot: {time.monotonic() - t0:.3f}s (loaded={loaded})")
+        if not loaded:
+            # Manually reset .step values in the optimizer states if not loaded.
+            for k, v in self.optimizers.state_dict().items():
+                if k.endswith(".step") and isinstance(v, torch.Tensor):
+                    assert v.numel() == 1, f"Expected .step to be a single scalar tensor, got {v.shape}"
+                    v.zero_()
 
         loading_duration = time.monotonic() - loading_start
         if _LETO_AVAILABLE:

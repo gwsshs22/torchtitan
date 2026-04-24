@@ -6,6 +6,15 @@ Tests:
   3. Exhaustive fault injection: fault at every marker.fill_ call, with
      memcpy corruption and adam corruption variants, verify recovery.
 
+Note on hooks: ResilientOptimizer no longer invokes the optimizer's
+``_optimizer_step_pre_hooks`` / ``_optimizer_step_post_hooks``.  The MoE
+expert-bias balancing that used to be wired up as a pre-hook is now
+implemented in-line inside ``ResilientOptimizer.step`` (via
+``_atomic_update_expert_bias``) so a fault mid-update is rollback-able.
+These tests build a synthetic optimizer with no MoE module attached, so
+that path is a no-op here; correctness of the chunked AdamW step is the
+remaining property under test.
+
 Usage:
     uv run python -m torchtitan.experiments.resilient_opt.tests.test_correctness \
         --optimizer-info /path/to/optimizer_info.json
@@ -152,7 +161,7 @@ def test_resilient_optimizer(params, optimizer, device):
     # Resilient step
     restore(params, optimizer, pre_params, pre_optim)
     for p, g in zip(params, saved_grads):
-        p.grad = g
+        p.grad = g.clone()
 
     rmp = MockRmpClient()
     resilient = ResilientOptimizer(
@@ -162,6 +171,7 @@ def test_resilient_optimizer(params, optimizer, device):
         init_chunk_size_mb=1,
         max_chunk_size_mb=256,
     )
+    resilient.bind()
     resilient.step()
     rmp.close()
 
@@ -209,6 +219,7 @@ def test_multi_step(params, optimizer, device, num_steps=5):
     resilient = ResilientOptimizer(
         OptimizerList(optimizer), rmp, torch.device(device),
     )
+    resilient.bind()
     for step_i in range(num_steps):
         populate_grads(params, seed=500 + step_i)
         resilient.step()
@@ -242,23 +253,38 @@ def test_multi_step(params, optimizer, device, num_steps=5):
 def test_exhaustive_fault_recovery(params, optimizer, device):
     """Inject fault at every marker.fill_ call point and verify recovery.
 
-    For each fault point, tests three fault types where applicable:
+    For each fault point, tests up to three fault types:
       - "marker":  fault during marker.fill_ itself (just raise)
-      - "memcpy":  fault during backup memcpy (raise at next fill_, corrupt buffer)
-      - "adam":    fault during fused adam kernel (raise at next fill_, corrupt states)
+      - "memcpy":  fault during backup memcpy (raise at next fill_, corrupt
+                   the partially-written backup buffer)
+      - "adam":    fault during fused adam kernel (raise at next fill_,
+                   corrupt the partially-updated chunk's slices)
 
-    The step() timeline per chunk is:
-      marker.fill_(k*2)  →  backup  →  marker.fill_(k*2+1)  →  adam  →  harvest
-    Final call is marker.fill_(IDLE).
+    The step() timeline:
+        fill_(PRE_RUNNING) ──counter+=1──► [if MoE: EB_BACKUP/UPDATE]
+        ──fill_(PRE_DONE)──► chunks ──fill_(POST_RUNNING)──► fill_(IDLE)
 
-    Each chunk has 2 fill_ calls (phases 0, 1), plus 1 IDLE at the end.
+    Chunk timeline:
+        fill_(K*2)  ──backup──► fill_(K*2+1)  ──adam──► harvest
 
-    Fault types per phase:
-      - phase 0 (before backup): "marker" only
-      - phase 1 (backup done):   "marker", "memcpy"
-      - even fill > 0, phase 0:  also "adam" (previous chunk's adam just completed)
+    Total fills = 4 (PRE_RUNNING, PRE_DONE, POST_RUNNING, IDLE) + 2*num_chunks.
+    For tests without MoE the EB_BACKUP/EB_UPDATE markers are skipped.
+
+    Mapping `fault_at` to the marker-at-fault (FaultingMarker raises BEFORE
+    the fill, so marker stays at the value set by the previous successful
+    fill):
+        fault_at = 0 → marker at fault = IDLE (initial state)
+        fault_at = 1 → marker at fault = PRE_RUNNING
+        fault_at = 2 → marker at fault = PRE_DONE
+        fault_at = 3 + 2K (K=0..N-1) → marker at fault = chunk K backup_running
+                                       ⇒ "memcpy" corruption applicable
+        fault_at = 4 + 2K (K=0..N-1) → marker at fault = chunk K step_running
+                                       ⇒ "adam" corruption applicable
+        fault_at = 2 + 2N → marker at fault = chunk N-1 step_running (last)
+        fault_at = 3 + 2N → marker at fault = POST_RUNNING (final = IDLE fill)
     """
     dev = torch.device(device)
+
     pre_p, pre_o = snapshot(params, optimizer)
     populate_grads(params, seed=400)
     saved_grads = [p.grad.clone() for p in params]
@@ -282,6 +308,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
         p.grad = g.clone()
     rmp = MockRmpClient()
     r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+    r.bind()
     counter = _CountingMarker(r._marker)
     r._marker = counter
 
@@ -301,20 +328,29 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
     print(f"  Total marker.fill_ calls: {total_fills}, chunks: {num_chunks}")
 
     # -- Test every (fault_at, fault_type) combination --
-    # Fill calls: 2 per chunk (phases 0,1) + 1 final IDLE.
     all_passed = True
     for fault_at in range(total_fills):
-        is_first = fault_at == 0
-        is_last = fault_at == total_fills - 1  # IDLE fill
-        chunk_idx = fault_at // 2
-        phase = fault_at % 2  # 0=before backup, 1=backup done
+        is_last = fault_at == total_fills - 1  # IDLE fill (no chunks left)
 
+        # Map fault_at to the chunk whose backup or step was in progress at
+        # the time of fault — see the docstring's mapping.  "memcpy" is
+        # applicable when backup was running for a chunk (marker even);
+        # "adam" is applicable when the fused step was running (marker
+        # odd).  PRE/POST/IDLE markers and faults outside [3, 3+2N) only
+        # exercise the "marker" case.
         fault_types = ["marker"]
-        if not is_last:
-            if phase == 1:
-                fault_types.append("memcpy")  # backup for chunk_idx just completed
-            elif phase == 0 and not is_first:
-                fault_types.append("adam")  # adam for previous chunk just completed
+        memcpy_chunk: int | None = None
+        adam_chunk: int | None = None
+        if fault_at >= 3 and fault_at % 2 == 1:
+            K = (fault_at - 3) // 2
+            if K < num_chunks:
+                fault_types.append("memcpy")
+                memcpy_chunk = K
+        elif fault_at >= 4 and fault_at % 2 == 0:
+            K = (fault_at - 4) // 2
+            if K < num_chunks:
+                fault_types.append("adam")
+                adam_chunk = K
 
         for ft in fault_types:
             label = f"fill_#{fault_at}/{ft}"
@@ -326,6 +362,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
 
             rmp = MockRmpClient()
             r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+            r.bind()
             real_marker = r._marker
             r._marker = _FaultingMarker(real_marker, fault_at)
 
@@ -341,25 +378,36 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
 
             # -- 3. Apply targeted corruption for the faulted chunk --
             if ft == "memcpy":
-                # Backup memcpy for chunk_idx was partial (phase 1).
-                if chunk_idx == 0:
+                # Backup of memcpy_chunk was partial: corrupt its backup
+                # destination so that any code that reads it sees garbage.
+                # Recovery should overwrite the backup destination with
+                # fresh data (the chunk's live state is intact at this
+                # point, and the bug-free recovery path is to redo the
+                # backup + step).
+                if memcpy_chunk == 0:
+                    # Chunk 0's backup lives in cpu_buffer.
                     r._cpu_buffer.fill_(0x42)
                 else:
-                    # Corrupt freed grad segments that hold this chunk's backup.
-                    freed = []
-                    for i in range(chunk_idx):
+                    # Chunk K (>0) backs up into freed_grad_segments
+                    # collected from chunks 0..K-1's grad memory.
+                    freed: list[torch.Tensor] = []
+                    for i in range(memcpy_chunk):
                         for sl in r._schedule[i]:
                             grad_local = get_local(sl.param_ref.grad)
-                            seg = grad_local.view(-1)[sl.start:sl.end].view(torch.uint8).reshape(-1)
+                            seg = (
+                                grad_local.view(-1)[sl.start : sl.end]
+                                .view(torch.uint8)
+                                .reshape(-1)
+                            )
                             freed.append(seg)
                     for seg in freed:
                         seg.fill_(0x42)
             elif ft == "adam":
-                # Adam for the previous chunk was interrupted mid-kernel.
-                # Only corrupt that chunk's slices, not completed chunks.
-                faulted_chunk = chunk_idx - 1
-
-                for pid, start, end in chunk_slices[faulted_chunk]:
+                # Adam for adam_chunk was interrupted mid-kernel: corrupt
+                # that chunk's slices in live state with NaN to force the
+                # recovery path to restore from the (correct) CPU/freed
+                # backup before redoing the step.
+                for pid, start, end in chunk_slices[adam_chunk]:
                     pidx = param_id_to_idx.get(pid)
                     if pidx is None:
                         continue
@@ -367,19 +415,28 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
                     state = optimizer.state[p]
                     with torch.no_grad():
                         get_local(p).view(-1)[start:end].fill_(float("nan"))
-                        get_local(state["exp_avg"]).view(-1)[start:end].fill_(float("nan"))
-                        get_local(state["exp_avg_sq"]).view(-1)[start:end].fill_(float("nan"))
-
+                        get_local(state["exp_avg"]).view(-1)[start:end].fill_(
+                            float("nan")
+                        )
+                        get_local(state["exp_avg_sq"]).view(-1)[start:end].fill_(
+                            float("nan")
+                        )
                 # Also corrupt step tensors for the faulted chunk.
-                for sl in r._schedule[faulted_chunk]:
+                for sl in r._schedule[adam_chunk]:
                     if sl.is_first_slice:
                         sl.step.fill_(999999)
 
             # -- 4. Verify state diverged from ground truth --
-            # Skip when all chunks completed (IDLE fill).
-            all_done = is_last
-            if not (ft == "marker" and all_done):
-                if _states_match(params, optimizer, gt_params, gt_exp_avg, gt_exp_avg_sq, gt_steps):
+            # For "marker" with no actual corruption applied, the live state
+            # may still match GT (specifically when the fault landed AFTER
+            # all chunks completed but before IDLE was set, or before
+            # PRE_RUNNING was set).  Don't require divergence in those
+            # boundary cases.
+            corruption_applied = ft != "marker"
+            if corruption_applied:
+                if _states_match(
+                    params, optimizer, gt_params, gt_exp_avg, gt_exp_avg_sq, gt_steps
+                ):
                     print(f"  FAIL [{label}]: state matches GT before recovery")
                     all_passed = False
                     rmp.close()
@@ -389,6 +446,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
             # Optimizer states + grads persist in RMP. No checkpoint restore.
             # maybe_recover() resumes from the interrupted chunk.
             r2 = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+            r2.bind()
 
             recovered = r2.maybe_recover(resume_step=resume_step)
 

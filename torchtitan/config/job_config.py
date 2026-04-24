@@ -1033,7 +1033,7 @@ class Debug:
 class Leto:
     init_mode: str = "baseline"
     """Initialization mode: 'baseline' (original order, CUDA immediately),
-    'reordered' (default, defers CUDA until after standby poll)."""
+    'reordered' (defers CUDA until after standby poll)."""
 
     profile_init: bool = False
     """If True, profile each init task's wall time and GPU memory usage (via pynvml).
@@ -1082,6 +1082,21 @@ class Leto:
 
     standby_poll_interval: float = 0.5
     """Polling interval in seconds for standby processes checking activation status."""
+
+    progressive_init: bool = False
+    """If True, standby advances through init tasks gated on the active's free-GPU
+    signal (see init_profile/{mode}/solution.json). Requires enable_standby."""
+
+    progressive_safety_mb: float = 512.0
+    """Per-rank safety margin (MiB) subtracted from free GPU memory when the
+    standby decides whether to run the next task under progressive_init."""
+
+    progressive_poll_interval_ms: int = 10
+    """Standby poll interval (ms) on the shared-memory advance signal."""
+
+    progressive_zero_delta_threshold_mb: float = 1.0
+    """Tasks with delta_mb below this threshold are treated as CPU-only and
+    bypass the gated wait under progressive_init."""
 
     fault_injection_step_enabled: bool = False
     """Enable step-based fault injection (worker self-injects faults at specific steps)."""

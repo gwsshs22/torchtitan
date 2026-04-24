@@ -23,6 +23,9 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
+from torchtitan.components.init.progressive import (
+    start_signal_thread as _progressive_start_signal_thread,
+)
 from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.components.skip_shape_infer import maybe_record_stage_inputs
 from torchtitan.config import ConfigManager, JobConfig
@@ -151,12 +154,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.rmp_manager.states["train_state"] = self
         if hasattr(self, "checkpointer") and self.checkpointer is not None:
             self.checkpointer.states["train_state"] = self
-
-        # Resilient optimizer recovery requires Trainer methods (_resilient_opt_recover),
-        # so it must happen after apply_to.
-        if job_config.leto.enable_rmp_gpu and self.rmp_restored:
-            self.rmp_manager.restore_param_gradients(self.model_parts)
-            self._resilient_opt_recover()
 
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
@@ -288,34 +285,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self._prev_step_faulted = False
 
-    def _resilient_opt_recover(self):
+    def _resilient_opt_recover(self, resume_step: int):
         """Recover resilient optimizer state on RMP resume.
 
-        Each rank reads its local step from the metadata buffer, then all
-        ranks agree on the minimum step via an all-reduce.  The minimum
-        is used as resume_step for maybe_recover().
+        ``resume_step`` is the globally agreed-on step (MAX of every rank's
+        ``_step_counter``); train() computes it alongside the metadata-vote
+        so we don't need a second all-reduce here.
         """
-        result = self.rmp_manager._meta_buffer.load_latest()
-        if result is None:
-            raise RuntimeError("Cannot recover: no committed metadata")
-        local_step = result[0]
+        self.rmp_manager.load_cpu_metadata(resume_step)
+        self._resilient_opt.bind()
 
-        # MIN all-reduce across all ranks to find the globally consistent step
-        step_tensor = torch.tensor([local_step], dtype=torch.int64, device=self.device)
-        dist.all_reduce(step_tensor, op=dist.ReduceOp.MIN)
-        resume_step = step_tensor.item()
-
-        logger.info(
-            f"[ResilientOpt] local_step={local_step}, "
-            f"resume_step={resume_step} (global min)"
-        )
+        logger.info(f"[ResilientOpt] resume_step={resume_step} (global max)")
 
         recovered = self._resilient_opt.maybe_recover(resume_step)
         if recovered:
             logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
+
         self.lr_schedulers.step()
+        self.step = resume_step
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -604,10 +593,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
-        # All microbatches' forward/backward have been dispatched. Kick off the
-        # async RMP metadata commit now so pickle/shm_write/barrier overlap
-        # with clip_grad_norm_ and in-flight GPU work. No-op in sync mode.
-        self.rmp_manager.schedule_commit(self.step)
+        self.rmp_manager.maybe_commit(self.step)
 
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
@@ -626,7 +612,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # non-faulting ranks barrier then continue normally)
         if self.job_config.leto.fault_injection_step_barrier:
             dist.barrier()
-        self.rmp_manager.maybe_commit(self.step)
+        
 
         if not fault_triggered:
             if self._resilient_opt is not None:
@@ -639,8 +625,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.maybe_dump_optimizer_info()
 
         self.lr_schedulers.step()
-
-
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -684,8 +668,42 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train(self):
         job_config = self.job_config
 
-        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        if job_config.leto.enable_rmp_gpu:
+            # One all_reduce instead of two: pack the metadata-vote and
+            # resume_step into a single MAX-reduced tensor.
+            #   buf[0] = 1 if this rank lacks metadata else 0. After MAX,
+            #     buf[0]==1 means at least one rank lacks metadata, so every
+            #     rank must fall back to gemini to avoid divergence.
+            #   buf[1] = _step_counter when this rank has metadata, else 0.
+            #     After MAX, equals the global-max step counter (= resume
+            #     step) when every rank has metadata; ignored otherwise.
+
+
+            has_md = self.rmp_manager.has_committed_metadata()
+            local_step = self._resilient_opt.get_step() if has_md else 0
+            buf = torch.tensor(
+                [0 if has_md else 1, local_step],
+                dtype=torch.int64, device=self.device,
+            )
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            any_lacks = bool(buf[0].item())
+            resume_step = int(buf[1].item())
+
+            if not any_lacks:
+                self._resilient_opt_recover(resume_step)
+            else:
+                self.checkpointer.load(step=job_config.checkpoint.load_step)
+                self._resilient_opt.bind()
+                self._resilient_opt.resync_after_external_load()
+        else:
+            self.checkpointer.load(step=job_config.checkpoint.load_step)
+
         self._restored_step = self.step
+
+        # Track whether this train() call has started the progressive signal
+        # thread yet. Reset per train() invocation, so post-recovery (where
+        # self.step starts > 1) still triggers it after the first executed iter.
+        progressive_signal_started = False
 
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
@@ -802,6 +820,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     report_duration(DURATION_ITERATION, time.monotonic() - _iter_start, step=self.step)
                     report_event(EVENT_STEP_DONE, step=self.step)
 
+                if (
+                    not progressive_signal_started
+                    and job_config.leto.progressive_init
+                    and job_config.leto.enable_standby
+                ):
+                    _progressive_start_signal_thread(
+                        int(os.environ["RANK"]),
+                        int(os.environ["LOCAL_RANK"]),
+                    )
+                    progressive_signal_started = True
+
 
         # Wait for any pending checkpoint tracking to complete
         if hasattr(self, "checkpointer") and self.checkpointer:
@@ -872,6 +901,8 @@ def main(trainer_class: type[Trainer]) -> None:
     init_logger()
     import torchtitan
 
+    rank = int(os.environ.get("RANK", -1))
+    logger.info(f"Process rank={rank}, pid={os.getpid()}")
     logger.info(
         "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
         torchtitan.__version__,
@@ -915,6 +946,7 @@ def main(trainer_class: type[Trainer]) -> None:
 
 if __name__ == "__main__":
     if _LETO_AVAILABLE:
-            register_training_process(rank=int(os.environ["RANK"]))
+            rank = int(os.environ["RANK"])
+            register_training_process(rank=rank)
             report_event(EVENT_PROCESS_STARTED)
     main(Trainer)

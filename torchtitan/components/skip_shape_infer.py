@@ -1065,6 +1065,21 @@ def warmup_stages(
     prev_fx_graph_cache = inductor_config.fx_graph_cache
     inductor_config.fx_graph_cache = False
 
+    # Snapshot real grads before warmup. RMP restores param.grad from the
+    # active's last step on standby ranks (init.py:restore_param_gradients),
+    # and resilient_opt's recovery path reads param.grad. The per-stage
+    # zero_grad(set_to_none=True) below would wipe those, so we save here and
+    # restore after warmup. Detaching to None during warmup also prevents the
+    # fake backward from accumulating fake tensors into real grad slots.
+    saved_grads: list[dict[int, torch.Tensor]] = []
+    for mp in model_parts:
+        grads_for_mp: dict[int, torch.Tensor] = {}
+        for p in mp.parameters():
+            if p.grad is not None:
+                grads_for_mp[id(p)] = p.grad
+                p.grad = None
+        saved_grads.append(grads_for_mp)
+
     # allow_non_fake_inputs=True lets the real cuda tensors produced by
     # _deserialize_args (and the real parameters inside model_part) be
     # auto-lifted to FakeTensors on dispatch, so we don't have to manually
@@ -1284,6 +1299,12 @@ def warmup_stages(
                     raise e
 
                 model_part.zero_grad(set_to_none=True)
+
+    # Restore the real grads we snapshotted before warmup. Params whose grad
+    # was None before warmup stay None.
+    for mp, grads_for_mp in zip(model_parts, saved_grads):
+        for p in mp.parameters():
+            p.grad = grads_for_mp.get(id(p))
 
     inductor_config.fx_graph_cache = prev_fx_graph_cache
 

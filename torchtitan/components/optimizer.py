@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import os
 from typing import Any, Generic, Iterator, TypeVar
 
 import torch

@@ -70,6 +70,8 @@ def benchmark(params, optimizer, device, warmup=3, repeats=10):
         restore(params, optimizer, pre_p, pre_o)
         populate_grads(params, seed=999)
         r = make_resilient()
+        if hasattr(r, "bind"):
+            r.bind()
 
         def setup():
             restore(params, optimizer, pre_p, pre_o)

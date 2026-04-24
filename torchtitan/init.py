@@ -138,6 +138,9 @@ class InitContext:
     _collective_manager: Any = None
     is_standby: bool = False
 
+    # standby-only CPU gloo PG used for cross-rank coordination during init
+    standby_gloo_pg: Any = None
+
     def apply_to(self, trainer: Any) -> None:
         """Transfer all public fields to the trainer instance."""
         for f in dataclasses.fields(self):
@@ -414,6 +417,70 @@ def maybe_wait_for_resuming(ctx: InitContext) -> None:
         time.sleep(poll_interval)
 
 
+def _standby_wait_for_allocation_flag(
+    rmp_client,
+    kind: str,
+    poll_interval: float = 0.1,
+) -> None:
+    """Standby-side wait on an RMP allocation flag with controller fallback.
+
+    Polls ``rmp_client.get_allocation_flag(kind)``; the wait ends when:
+      * the flag reads >= 1 (active completed allocation), OR
+      * ``poll_standby_status()`` returns STANDBY_ACTION_ACTIVATE
+        (worker controller is promoting us — keep going so the caller
+        can do the allocation itself).
+
+    On STANDBY_ACTION_TERMINATE (or a poll error), logs and ``sys.exit(0)``.
+
+    No-op if leto isn't available or this isn't a standby.
+    """
+    if not (_LETO_AVAILABLE and leto_is_standby()):
+        # Not standby; just check the flag once for parity.
+        if rmp_client.get_allocation_flag(kind) < 1:
+            logger.warning(
+                f"[RMP] non-standby called wait for {kind} flag, but flag != 1"
+            )
+        return
+
+    if rmp_client.get_allocation_flag(kind) >= 1:
+        logger.info(f"[RMP] {kind} allocation flag already = 1, no wait")
+        return
+
+    logger.info(f"[RMP] waiting for {kind} allocation flag (poll={poll_interval}s)")
+    start = time.monotonic()
+    while True:
+        if rmp_client.get_allocation_flag(kind) >= 1:
+            elapsed = time.monotonic() - start
+            logger.info(f"[RMP] {kind} allocation flag = 1, waited {elapsed:.2f}s")
+            return
+
+        try:
+            action = poll_standby_status()
+        except Exception:
+            logger.error(
+                f"Error polling standby status while waiting for {kind} flag",
+                exc_info=True,
+            )
+            sys.exit(1)
+
+        if action == STANDBY_ACTION_ACTIVATE:
+            elapsed = time.monotonic() - start
+            logger.info(
+                f"[RMP] {kind} allocation flag wait released by ACTIVATE "
+                f"after {elapsed:.2f}s"
+            )
+            return
+        if action == STANDBY_ACTION_TERMINATE:
+            elapsed = time.monotonic() - start
+            logger.error(
+                f"[RMP] standby TERMINATE while waiting for {kind} allocation "
+                f"flag after {elapsed:.2f}s"
+            )
+            sys.exit(0)
+
+        time.sleep(poll_interval)
+
+
 def activate_cuda_device(ctx: InitContext) -> None:
     """Set the CUDA device — this is the CUDA context boundary."""
     if ctx._device_module is None:
@@ -535,10 +602,7 @@ def init_trainer_states(ctx: InitContext) -> None:
     ctx.ntokens_seen = 0
     ctx._prev_step_faulted = False
 
-    job_config = ctx.job_config
-    ctx._include_rng_in_state_dict = not (
-        job_config.leto.enable_rmp_gpu and not job_config.leto.rmp_commit_sync
-    )
+    ctx._include_rng_in_state_dict = True
 
 
 def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
@@ -554,13 +618,13 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
         device=ctx.device,
     )
     if job_config.leto.enable_rmp_gpu and ctx.is_standby:
-        ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_GPU)
+        _standby_wait_for_allocation_flag(
+            ctx.rmp_manager.rmp_client, FLAG_KIND_GPU,
+        )
 
     ctx.rmp_restored = ctx.rmp_manager.maybe_init(ctx.buffer_device)
 
-    # Resilient optimizer
-    ctx._resilient_opt = None
-    ctx._cpu_snapshot_opt = None
+    # Wrap optimizers with resilient optimizer if RMP GPU is enabled
     assert not (
         job_config.leto.enable_rmp_gpu and job_config.leto.enable_cpu_snapshot_opt
     ), "enable_rmp_gpu and enable_cpu_snapshot_opt are mutually exclusive"
@@ -570,9 +634,11 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
             ctx.optimizers,
             ctx.rmp_manager.rmp_client,
             ctx.device,
+            model_parts=ctx.model_parts,
+            parallel_dims=ctx.parallel_dims,
         )
-        # Note: rmp_restored recovery (restore_param_gradients + _resilient_opt_recover)
-        # is handled by Trainer after apply_to, since it needs self._resilient_opt_recover()
+        if ctx.rmp_restored:
+            ctx.rmp_manager.restore_param_gradients(ctx.model_parts)
         if job_config.leto.resilient_opt_fault_injection:
             ctx._resilient_opt.enable_fault_injection(
                 job_config.leto.resilient_opt_fault_injection_prob,
@@ -610,12 +676,13 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
 
     if job_config.checkpoint.use_gemini:
         if job_config.leto.enable_rmp_cpu and ctx.is_standby:
-            ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_CPU)
+            _standby_wait_for_allocation_flag(
+                ctx.rmp_manager.rmp_client, FLAG_KIND_CPU,
+            )
         ctx.checkpointer.lazy_init(
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,
             lr_schedulers=ctx.lr_schedulers,
-            rmp_restored=ctx.rmp_restored,
             parallel_dims=ctx.parallel_dims,
             rmp_manager=ctx.rmp_manager,
             enable_rmp_cpu=job_config.leto.enable_rmp_cpu,
@@ -736,24 +803,13 @@ def eager_init_nccl_loss(ctx: InitContext) -> None:
     _eager_init_mesh(ctx, "loss")
 
 def warmup_stages(ctx: InitContext) -> None:
-    if ctx.job_config.leto.enable_standby:
-        if not (_LETO_AVAILABLE and leto_is_standby()):
-            return
-
-    maybe_warmup_stages(
-        ctx.model_parts,
-        ctx.job_config,
-        loss_fn=ctx.loss_fn,
-        pp_has_last_stage=getattr(ctx, "pp_has_last_stage", True),
-        parallel_dims=ctx.parallel_dims,
-    )
+    return
 
 # ---------------------------------------------------------------------------
 # Initialization sequences
 # ---------------------------------------------------------------------------
 
 REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
-    init_distributed,
     set_device_attr,
     start_gpu_memory_monitor,
     compute_batch_info,
@@ -791,7 +847,6 @@ REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
 BASELINE_SEQUENCE: list[Callable[[InitContext], None]] = [
     activate_cuda_device,
     # --- CUDA context set immediately ---
-    init_distributed,
     set_device_attr,
     start_gpu_memory_monitor,
     compute_batch_info,
@@ -856,6 +911,88 @@ def _get_gpu_mem_mb() -> float | None:
         return None
 
 
+def _run_progressive_sequence(
+    ctx: InitContext,
+    sequence: list[Callable[[InitContext], None]],
+    mode: str,
+) -> None:
+    """Run the init sequence in solver-scheduled order, gated per-task on the
+    active's advance signal. Only called on standby ranks when progressive_init
+    is on."""
+    from torchtitan.components.init.progressive import (
+        load_rank_deltas,
+        load_solution,
+        try_advance,
+    )
+
+    job_config = ctx.job_config
+    dump_folder = job_config.job.dump_folder
+    rank = int(os.environ.get("RANK", "0"))
+
+    name_to_fn = {fn.__name__: fn for fn in sequence}
+    logger.info(f"[progressive] rank={rank} loading solution + profile from {dump_folder}/init_profile/{mode}")
+    ordered_names = load_solution(dump_folder, mode)
+    deltas = load_rank_deltas(dump_folder, mode, rank)
+    logger.info(f"[progressive] rank={rank} loaded: {len(ordered_names)} tasks")
+
+    missing_fn = [n for n in ordered_names if n not in name_to_fn]
+    if missing_fn:
+        raise RuntimeError(
+            f"solution.json references tasks not in {mode} sequence: {missing_fn}"
+        )
+    missing_name = [n for n in name_to_fn if n not in set(ordered_names)]
+    if missing_name:
+        raise RuntimeError(
+            f"{mode} sequence has tasks not in solution.json: {missing_name}. "
+            f"Re-run profiling to refresh the schedule."
+        )
+
+    safety_mb = float(job_config.leto.progressive_safety_mb)
+    threshold_mb = float(job_config.leto.progressive_zero_delta_threshold_mb)
+    poll_s = float(job_config.leto.progressive_poll_interval_ms) / 1000.0
+
+    def _status_check() -> int:
+        try:
+            return poll_standby_status()
+        except Exception:
+            logger.warning("Error polling standby status", exc_info=True)
+            return STANDBY_ACTION_TERMINATE
+
+    activated = False
+    for name in ordered_names:
+        if not activated:
+            delta_mb = deltas.get(name, 0.0)
+            logger.info(f"[progressive] rank={rank} next_task={name} delta_mb={delta_mb:.1f}")
+            while True:
+                outcome, extra = try_advance(
+                    ctx.standby_gloo_pg,
+                    delta_mb,
+                    safety_mb,
+                    threshold_mb,
+                    poll_s,
+                    status_check=_status_check,
+                )
+                if outcome == "advance":
+                    break
+                if outcome == "retry":
+                    continue
+                if outcome == "status":
+                    if extra == STANDBY_ACTION_ACTIVATE:
+                        logger.info(
+                            f"[progressive] activated during task={name}; "
+                            f"running remaining tasks unconditionally"
+                        )
+                        activated = True
+                        break
+                    if extra == STANDBY_ACTION_TERMINATE:
+                        logger.info("[progressive] standby terminated")
+                        sys.exit(0)
+            logger.info(
+                f"[progressive] task={name} delta_mb={delta_mb:.1f} → running"
+            )
+        name_to_fn[name](ctx)
+
+
 def run_init_sequence(job_config: JobConfig) -> InitContext:
     """Execute the initialization sequence for the configured mode."""
     mode = job_config.leto.init_mode
@@ -877,24 +1014,50 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
 
     ctx = InitContext(job_config=job_config)
     ctx.is_standby = is_standby
-    for task_fn in sequences[mode]:
-        if profile:
-            mem_before = _get_gpu_mem_mb()
-            t_start = time.monotonic() - t0
 
-        task_fn(ctx)
+    # init_distributed always runs first; not part of the schedulable sequence.
+    init_distributed(ctx)
 
-        if profile:
-            t_end = time.monotonic() - t0
-            mem_after = _get_gpu_mem_mb()
-            profile_records.append({
-                "task": task_fn.__name__,
-                "t_start_s": round(t_start, 4),
-                "t_end_s": round(t_end, 4),
-                "duration_s": round(t_end - t_start, 4),
-                "gpu_mem_before_mb": round(mem_before, 1) if mem_before is not None else None,
-                "gpu_mem_after_mb": round(mem_after, 1) if mem_after is not None else None,
-            })
+    # Standby ranks need a CPU-only gloo PG to vote on advance decisions
+    # between init tasks.
+    if job_config.leto.enable_standby and is_standby:
+        logger.info(f"[progressive] rank={os.environ.get('RANK')} creating gloo PG...")
+        ctx.standby_gloo_pg = dist.new_group(backend="gloo")
+        logger.info(f"[progressive] rank={os.environ.get('RANK')} gloo PG ready")
+
+    progressive = (
+        job_config.leto.progressive_init
+        and is_standby
+        and not profile
+    )
+
+    if progressive:
+        _run_progressive_sequence(ctx, sequences[mode], mode)
+    else:
+        for task_fn in sequences[mode]:
+            if profile:
+                mem_before = _get_gpu_mem_mb()
+                t_start = time.monotonic() - t0
+
+            task_fn(ctx)
+
+            if profile:
+                t_end = time.monotonic() - t0
+                mem_after = _get_gpu_mem_mb()
+                delta_mb = (
+                    round(max(0.0, mem_after - mem_before), 1)
+                    if mem_before is not None and mem_after is not None
+                    else None
+                )
+                profile_records.append({
+                    "task": task_fn.__name__,
+                    "t_start_s": round(t_start, 4),
+                    "t_end_s": round(t_end, 4),
+                    "duration_s": round(t_end - t_start, 4),
+                    "gpu_mem_before_mb": round(mem_before, 1) if mem_before is not None else None,
+                    "gpu_mem_after_mb": round(mem_after, 1) if mem_after is not None else None,
+                    "delta_mb": delta_mb,
+                })
 
     if profile and profile_records:
         rank = int(os.environ.get("RANK", "0"))
@@ -909,6 +1072,26 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
                 "tasks": profile_records,
             }, f, indent=2)
         logger.info(f"Init profile written to {path}")
+
+        if rank == 0:
+            from torchtitan.components.init.solver import solve
+            result = solve(path, time_limit=60)
+            names = result["names"]
+            durations = result["durations"]
+            solution_path = os.path.join(profile_dir, "solution.json")
+            with open(solution_path, "w") as f:
+                json.dump({
+                    "mode": mode,
+                    "solver_cost": result["cost"],
+                    "tasks": [
+                        {
+                            "name": names[i],
+                            "duration_s": durations[i],
+                        }
+                        for i in result["order"]
+                    ],
+                }, f, indent=2)
+            logger.info(f"Init schedule solution written to {solution_path}")
 
     maybe_wait_for_resuming(ctx)
     return ctx

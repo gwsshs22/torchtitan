@@ -58,14 +58,17 @@ def profile_resilient(params, optimizer, device, output_path, warmup=2):
     exp_1_256 = ResilientOptimizer(
         opt_list, new_rmp(), dev, init_chunk_size_mb=1, max_chunk_size_mb=256,
     )
+    exp_1_256.bind()
     reset_and_grad()
     exp_2_256 = ResilientOptimizer(
         opt_list, new_rmp(), dev, init_chunk_size_mb=2, max_chunk_size_mb=256,
     )
+    exp_2_256.bind()
     reset_and_grad()
     exp_4_512 = ResilientOptimizer(
         opt_list, new_rmp(), dev, init_chunk_size_mb=4, max_chunk_size_mb=512,
     )
+    exp_4_512.bind()
     reset_and_grad()
     chunked_32 = ResilientOptimizerChunked(
         opt_list, new_rmp(), dev, chunk_size_mb=32, use_cuda_graph=False,

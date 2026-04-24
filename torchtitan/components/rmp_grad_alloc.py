@@ -201,7 +201,7 @@ class RmpGradientAllocator:
                     device=device_idx,
                 )
                 pg_state.cached_output = tensor
-                logger.info(
+                logger.debug(
                     f"[RmpGradAlloc] Allocated RS output buffer '{pg_state.key}': "
                     f"numel={tensor.numel()}, dtype={dtype}, device={device}"
                 )
