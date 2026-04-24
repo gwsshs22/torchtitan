@@ -23,6 +23,9 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
+from torchtitan.components.init.progressive import (
+    start_signal_thread as _progressive_start_signal_thread,
+)
 from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.components.skip_shape_infer import maybe_record_stage_inputs
 from torchtitan.config import ConfigManager, JobConfig
@@ -316,6 +319,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
         self.lr_schedulers.step()
+        self.step = resume_step
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -687,6 +691,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         self._restored_step = self.step
 
+        # Track whether this train() call has started the progressive signal
+        # thread yet. Reset per train() invocation, so post-recovery (where
+        # self.step starts > 1) still triggers it after the first executed iter.
+        progressive_signal_started = False
+
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
             global_batch_size = job_config.training.local_batch_size * self._batch_degree
@@ -801,6 +810,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if _LETO_AVAILABLE:
                     report_duration(DURATION_ITERATION, time.monotonic() - _iter_start, step=self.step)
                     report_event(EVENT_STEP_DONE, step=self.step)
+
+                if (
+                    not progressive_signal_started
+                    and job_config.leto.progressive_init
+                    and job_config.leto.enable_standby
+                ):
+                    _progressive_start_signal_thread(
+                        int(os.environ["RANK"]),
+                        int(os.environ["LOCAL_RANK"]),
+                    )
+                    progressive_signal_started = True
 
 
         # Wait for any pending checkpoint tracking to complete

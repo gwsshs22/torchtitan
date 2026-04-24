@@ -74,6 +74,20 @@ gptoss_configs = {
             load_balance_coeff=1e-3,
         ),
     ),
+    "5b": GptOssModelArgs(
+        n_layers=6,
+        moe_args=MoEArgs(
+            num_experts=32,
+            num_shared_experts=0,
+            score_func="softmax",
+            route_norm=False,
+            route_scale=1.0,
+            score_before_experts=False,
+            top_k=4,
+            use_grouped_mm=True,
+            load_balance_coeff=1e-3,
+        ),
+    ),
     "20b": GptOssModelArgs(
         n_layers=24,
         moe_args=MoEArgs(
