@@ -561,9 +561,7 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
 
     ctx.rmp_restored = ctx.rmp_manager.maybe_init(ctx.buffer_device)
 
-    # Resilient optimizer
-    ctx._resilient_opt = None
-    ctx._cpu_snapshot_opt = None
+    # Wrap optimizers with resilient optimizer if RMP GPU is enabled
     assert not (
         job_config.leto.enable_rmp_gpu and job_config.leto.enable_cpu_snapshot_opt
     ), "enable_rmp_gpu and enable_cpu_snapshot_opt are mutually exclusive"
@@ -574,8 +572,8 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
             ctx.rmp_manager.rmp_client,
             ctx.device,
         )
-        # Note: rmp_restored recovery (restore_param_gradients + _resilient_opt_recover)
-        # is handled by Trainer after apply_to, since it needs self._resilient_opt_recover()
+        if ctx.rmp_restored:
+            ctx.rmp_manager.restore_param_gradients(ctx.model_parts)
         if job_config.leto.resilient_opt_fault_injection:
             ctx._resilient_opt.enable_fault_injection(
                 job_config.leto.resilient_opt_fault_injection_prob,

@@ -155,12 +155,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if hasattr(self, "checkpointer") and self.checkpointer is not None:
             self.checkpointer.states["train_state"] = self
 
-        # Resilient optimizer recovery requires Trainer methods (_resilient_opt_recover),
-        # so it must happen after apply_to.
-        if job_config.leto.enable_rmp_gpu and self.rmp_restored:
-            self.rmp_manager.restore_param_gradients(self.model_parts)
-            self._resilient_opt_recover()
-
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
@@ -687,6 +681,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+
+        if job_config.leto.enable_rmp_gpu and self.rmp_restored:
+            self._resilient_opt_recover()
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         self._restored_step = self.step

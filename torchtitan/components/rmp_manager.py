@@ -375,6 +375,7 @@ class RmpManager:
         )
         self._commit_future.result()  # propagates worker exceptions
         self._commit_future = None
+        torch.cuda.synchronize()
 
     def _load_cpu_metadata(self):
         if self.skip_commit:
