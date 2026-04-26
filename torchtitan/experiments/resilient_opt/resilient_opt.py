@@ -203,15 +203,17 @@ class ResilientOptimizer:
             self._hook_state.fill_(_HOOK_STATE_NONE)
             torch.cuda.current_stream().synchronize()
 
-        # -- Step counter (RMP-backed CPU) ------------------------------------
-        step_cnt_storage, step_cnt_allocated = rmp_client.get_or_allocate_cpu_memory(
-            "resilient/step_counter", 8,  # int64
+        # -- Step counter (RMP-backed GPU) ------------------------------------
+        step_cnt_tensors, step_cnt_allocated = rmp_client.get_or_allocate_tensors(
+            [TensorSpec(
+                name="resilient/step_counter", shape=(1,),
+                dtype=torch.int64, device=device_idx,
+            )]
         )
-        self._cpu_step_counter = torch.empty(0, dtype=torch.int64).set_(
-            source=step_cnt_storage, storage_offset=0, size=(1,),
-        )
+        self._step_counter = step_cnt_tensors["resilient/step_counter"]
         if step_cnt_allocated:
-            self._cpu_step_counter.fill_(int(all_params[0].step.item()))
+            self._step_counter.fill_(int(all_params[0].step.item()))
+            torch.cuda.current_stream().synchronize()
 
         # -- Precompute chunk schedule --------------------------------------
         self._schedule = self._build_schedule()
@@ -237,7 +239,7 @@ class ResilientOptimizer:
         Hook state is recorded between phases so maybe_recover() can
         replay the right subset on resume.
         """
-        self._cpu_step_counter += 1
+        self._step_counter += 1
         self._run_pre_hooks()
         # Mark AFTER pre-hook so a fault that prevents the fill_ leaves
         # state==NONE and recovery re-runs pre-hook (correct for synthetic
@@ -298,7 +300,7 @@ class ResilientOptimizer:
 
         Args:
             resume_step: the step number this recovery should produce.
-                Must equal cpu_step_counter or cpu_step_counter + 1.
+                Must equal step_counter or step_counter + 1.
 
         Assumes optimizer states, gradients, and hook-mutated buffers
         (e.g. expert_bias, tokens_per_expert) persist in RMP across faults.
@@ -312,7 +314,7 @@ class ResilientOptimizer:
         invoked only when hook_state confirms it has not yet run for the
         current step.
         """
-        stored = self._cpu_step_counter.item()
+        stored = self._step_counter.item()
         marker_val = self._marker.item()
         hook_state = self._hook_state.item()
 
@@ -587,7 +589,7 @@ class ResilientOptimizer:
     @torch.no_grad()
     def _step_chunk(self, chunk: list[_SliceEntry]):
         """Run fused AdamW on one chunk's slices."""
-        step_val = self._cpu_step_counter.item()
+        step_val = self._step_counter.item()
         for sl in chunk:
             if sl.is_first_slice:
                 sl.step.fill_(step_val)

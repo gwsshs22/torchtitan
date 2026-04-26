@@ -330,7 +330,7 @@ class RmpManager:
     def _sync_commit(self, step: int):
         """Inline commit on the main thread. Used when rmp_commit_sync=True
         and for the init-time bootstrap commit in maybe_init."""
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         optim_metadata = {}
@@ -343,11 +343,11 @@ class RmpManager:
             if not isinstance(v, torch.Tensor):
                 optim_metadata[name] = v
 
-        t_snapshot = time.perf_counter()
+        # t_snapshot = time.perf_counter()
 
         num_bytes = self._meta_buffer.commit(step, metadata)
 
-        t_commit = time.perf_counter()
+        # t_commit = time.perf_counter()
 
         # Ensure all ranks have committed metadata before any rank proceeds
         # if self._gloo_warmup is not None:
@@ -355,27 +355,28 @@ class RmpManager:
         #     self._gloo_warmup = None
         # dist.barrier(group=self._gloo_group)
 
-        t_barrier = time.perf_counter()
-        logger.info(
-            f"Metadata commit: step={step}, {num_bytes} bytes, "
-            f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
-            f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
-            f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
-            f"total={_ms(t0, t_barrier):.2f} ms"
-        )
+        # t_barrier = time.perf_counter()
+        # logger.info(
+        #     f"Metadata commit: step={step}, {num_bytes} bytes, "
+        #     f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
+        #     f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
+        #     f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
+        #     f"total={_ms(t0, t_barrier):.2f} ms"
+        # )
 
     def maybe_commit(self, step: int):
         if not self.enabled or self.skip_commit:
             return
-        if self.rmp_commit_sync:
-            self._sync_commit(step)
-            return
-        assert self._commit_future is not None, (
-            "schedule_commit must be called before maybe_commit in async mode"
-        )
-        self._commit_future.result()  # propagates worker exceptions
-        self._commit_future = None
-        torch.cuda.synchronize()
+        self._sync_commit(step)
+
+        # if self.rmp_commit_sync:
+        #     self._sync_commit(step)
+        #     return
+        # assert self._commit_future is not None, (
+        #     "schedule_commit must be called before maybe_commit in async mode"
+        # )
+        # self._commit_future.result()  # propagates worker exceptions
+        # self._commit_future = None
 
     def _load_cpu_metadata(self):
         if self.skip_commit:
