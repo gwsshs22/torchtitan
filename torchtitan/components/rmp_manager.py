@@ -350,10 +350,10 @@ class RmpManager:
         t_commit = time.perf_counter()
 
         # Ensure all ranks have committed metadata before any rank proceeds
-        if self._gloo_warmup is not None:
-            self._gloo_warmup.wait()
-            self._gloo_warmup = None
-        dist.barrier(group=self._gloo_group)
+        # if self._gloo_warmup is not None:
+        #     self._gloo_warmup.wait()
+        #     self._gloo_warmup = None
+        # dist.barrier(group=self._gloo_group)
 
         t_barrier = time.perf_counter()
         logger.info(

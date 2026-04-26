@@ -21,6 +21,7 @@ from torchtitan.experiments.resilient_opt.tests.common import (
     OptimizerList,
     create_optimizer_from_info,
     get_local,
+    install_hooks,
     load_optimizer_info,
     make_parser,
     populate_grads,
@@ -138,12 +139,16 @@ def test_manual_fault_recovery(params, optimizer):
 
 def test_resilient_optimizer(params, optimizer, device):
     """Test ResilientOptimizer (exp bootstrap) step matches optimizer.step()."""
+    tracker = install_hooks(optimizer)
+
     pre_params, pre_optim = snapshot(params, optimizer)
     populate_grads(params, seed=300)
     saved_grads = [p.grad.clone() for p in params]
 
     # Ground truth
+    tracker.reset()
     optimizer.step()
+    gt_pre, gt_post = tracker.pre_calls, tracker.post_calls
     correct_params = [p.data.clone() for p in params]
     correct_exp_avg = [optimizer.state[p]["exp_avg"].clone() for p in params]
     correct_exp_avg_sq = [optimizer.state[p]["exp_avg_sq"].clone() for p in params]
@@ -152,8 +157,9 @@ def test_resilient_optimizer(params, optimizer, device):
     # Resilient step
     restore(params, optimizer, pre_params, pre_optim)
     for p, g in zip(params, saved_grads):
-        p.grad = g
+        p.grad = g.clone()
 
+    tracker.reset()
     rmp = MockRmpClient()
     resilient = ResilientOptimizer(
         OptimizerList(optimizer),
@@ -186,18 +192,35 @@ def test_resilient_optimizer(params, optimizer, device):
             )
             step_match = False
 
+    hook_match = (
+        gt_pre == 1 and gt_post == 1
+        and tracker.pre_calls == 1 and tracker.post_calls == 1
+    )
+    if not hook_match:
+        print(
+            f"  [hooks] GT (pre, post)=({gt_pre}, {gt_post}) "
+            f"resilient (pre, post)=({tracker.pre_calls}, {tracker.post_calls}) "
+            f"— expected (1, 1) for both"
+        )
+    else:
+        print("  Pre/post hooks fired exactly once each")
+
     print(f"  Chunked step matches optimizer.step(): {step_match}")
-    return step_match
+    return step_match and hook_match
 
 
 def test_multi_step(params, optimizer, device, num_steps=5):
     """Test that N consecutive resilient steps match N vanilla optimizer steps."""
+    tracker = install_hooks(optimizer)
+
     pre_params, pre_optim = snapshot(params, optimizer)
 
     # Ground truth: N vanilla steps with different grads each iteration
+    tracker.reset()
     for step_i in range(num_steps):
         populate_grads(params, seed=500 + step_i)
         optimizer.step()
+    gt_pre, gt_post = tracker.pre_calls, tracker.post_calls
     gt_params = [p.data.clone() for p in params]
     gt_exp_avg = [optimizer.state[p]["exp_avg"].clone() for p in params]
     gt_exp_avg_sq = [optimizer.state[p]["exp_avg_sq"].clone() for p in params]
@@ -205,6 +228,7 @@ def test_multi_step(params, optimizer, device, num_steps=5):
 
     # Resilient: N steps with the same grad sequence
     restore(params, optimizer, pre_params, pre_optim)
+    tracker.reset()
     rmp = MockRmpClient()
     resilient = ResilientOptimizer(
         OptimizerList(optimizer), rmp, torch.device(device),
@@ -214,7 +238,18 @@ def test_multi_step(params, optimizer, device, num_steps=5):
         resilient.step()
     rmp.close()
 
-    all_match = True
+    hook_match = (
+        gt_pre == num_steps and gt_post == num_steps
+        and tracker.pre_calls == num_steps and tracker.post_calls == num_steps
+    )
+    if not hook_match:
+        print(
+            f"  [hooks] GT=({gt_pre}, {gt_post}) "
+            f"resilient=({tracker.pre_calls}, {tracker.post_calls}) "
+            f"— expected ({num_steps}, {num_steps}) for both"
+        )
+
+    all_match = hook_match
     for i, p in enumerate(params):
         if not torch.equal(gt_params[i], p.data):
             diff = (gt_params[i] - p.data).abs().max().item()
@@ -259,6 +294,8 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
       - even fill > 0, phase 0:  also "adam" (previous chunk's adam just completed)
     """
     dev = torch.device(device)
+    tracker = install_hooks(optimizer)
+
     pre_p, pre_o = snapshot(params, optimizer)
     populate_grads(params, seed=400)
     saved_grads = [p.grad.clone() for p in params]
@@ -269,7 +306,13 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
     resume_step = pre_step_val + 1
 
     # -- Ground truth --
+    tracker.reset()
     optimizer.step()
+    if (tracker.pre_calls, tracker.post_calls) != (1, 1):
+        print(
+            f"  FAIL [GT]: hooks fired (pre, post)="
+            f"({tracker.pre_calls}, {tracker.post_calls}), expected (1, 1)"
+        )
     gt_params = [p.data.clone() for p in params]
     gt_exp_avg = [optimizer.state[p]["exp_avg"].clone() for p in params]
     gt_exp_avg_sq = [optimizer.state[p]["exp_avg_sq"].clone() for p in params]
@@ -290,7 +333,13 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
     for chunk in r._schedule:
         chunk_slices.append([(id(sl.param_ref), sl.start, sl.end) for sl in chunk])
 
+    tracker.reset()
     r.step()
+    if (tracker.pre_calls, tracker.post_calls) != (1, 1):
+        print(
+            f"  FAIL [counting pass]: hooks fired (pre, post)="
+            f"({tracker.pre_calls}, {tracker.post_calls}), expected (1, 1)"
+        )
     total_fills = counter.count
     num_chunks = len(chunk_slices)
     rmp.close()
@@ -324,6 +373,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
             for p, g in zip(params, saved_grads):
                 p.grad = g.clone()
 
+            tracker.reset()
             rmp = MockRmpClient()
             r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
             real_marker = r._marker
@@ -338,6 +388,18 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
                 continue
             except FaultInjected:
                 pass
+
+            # Pre-hook always runs first in step(), before any marker fill,
+            # so it must have fired exactly once before any injected fault.
+            if tracker.pre_calls != 1 or tracker.post_calls != 0:
+                print(
+                    f"  FAIL [{label}]: hooks after fault "
+                    f"(pre, post)=({tracker.pre_calls}, {tracker.post_calls}), "
+                    f"expected (1, 0)"
+                )
+                all_passed = False
+                rmp.close()
+                continue
 
             # -- 3. Apply targeted corruption for the faulted chunk --
             if ft == "memcpy":
@@ -395,6 +457,19 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
             if not recovered:
                 assert ft == "marker" and all_done
                 print(f"  SKIP [{label}] (maybe_recover returned False)")
+                rmp.close()
+                continue
+
+            # Recovery must complete the step's hook lifecycle exactly once:
+            # pre-hook total stays at 1 (already ran in r.step()), post-hook
+            # fires exactly once during recovery.
+            if tracker.pre_calls != 1 or tracker.post_calls != 1:
+                print(
+                    f"  FAIL [{label}]: hooks after recovery "
+                    f"(pre, post)=({tracker.pre_calls}, {tracker.post_calls}), "
+                    f"expected (1, 1)"
+                )
+                all_passed = False
                 rmp.close()
                 continue
 

@@ -605,7 +605,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # All microbatches' forward/backward have been dispatched. Kick off the
         # async RMP metadata commit now so pickle/shm_write/barrier overlap
         # with clip_grad_norm_ and in-flight GPU work. No-op in sync mode.
-        self.rmp_manager.schedule_commit(self.step)
+        # self.rmp_manager.schedule_commit(self.step)
 
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
@@ -624,7 +624,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # non-faulting ranks barrier then continue normally)
         if self.job_config.leto.fault_injection_step_barrier:
             dist.barrier()
-        self.rmp_manager.maybe_commit(self.step)
+        # self.rmp_manager.maybe_commit(self.step)
 
         if not fault_triggered:
             if self._resilient_opt is not None:
@@ -637,8 +637,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.maybe_dump_optimizer_info()
 
         self.lr_schedulers.step()
-
-
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
