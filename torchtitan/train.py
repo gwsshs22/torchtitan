@@ -288,23 +288,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def _resilient_opt_recover(self):
         """Recover resilient optimizer state on RMP resume.
 
-        Each rank reads its local step from the metadata buffer, then all
-        ranks agree on the minimum step via an all-reduce.  The minimum
-        is used as resume_step for maybe_recover().
+        Each rank reads its local step from the resilient optimizer's
+        step_counter, then all ranks agree on the maximum step via an
+        all-reduce.  The maximum is used as resume_step for maybe_recover().
         """
-        result = self.rmp_manager._meta_buffer.load_latest()
-        if result is None:
-            raise RuntimeError("Cannot recover: no committed metadata")
-        local_step = result[0]
+        local_step = self._resilient_opt.get_step()
 
-        # MIN all-reduce across all ranks to find the globally consistent step
+        # MAX all-reduce across all ranks to find the globally consistent step
         step_tensor = torch.tensor([local_step], dtype=torch.int64, device=self.device)
-        dist.all_reduce(step_tensor, op=dist.ReduceOp.MIN)
+        dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)
         resume_step = step_tensor.item()
 
         logger.info(
             f"[ResilientOpt] local_step={local_step}, "
-            f"resume_step={resume_step} (global min)"
+            f"resume_step={resume_step} (global max)"
         )
 
         recovered = self._resilient_opt.maybe_recover(resume_step)
@@ -312,6 +309,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
+        self.rmp_manager.load_cpu_metadata(resume_step)
         self.lr_schedulers.step()
         self.step = resume_step
 
@@ -884,6 +882,8 @@ def main(trainer_class: type[Trainer]) -> None:
     init_logger()
     import torchtitan
 
+    rank = int(os.environ.get("RANK", -1))
+    logger.info(f"Process rank={rank}, pid={os.getpid()}")
     logger.info(
         "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
         torchtitan.__version__,
@@ -927,6 +927,7 @@ def main(trainer_class: type[Trainer]) -> None:
 
 if __name__ == "__main__":
     if _LETO_AVAILABLE:
-            register_training_process(rank=int(os.environ["RANK"]))
+            rank = int(os.environ["RANK"])
+            register_training_process(rank=rank)
             report_event(EVENT_PROCESS_STARTED)
     main(Trainer)

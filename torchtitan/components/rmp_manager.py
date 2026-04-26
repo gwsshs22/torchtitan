@@ -104,6 +104,18 @@ class MetadataCircularBuffer:
         payload_bytes = bytes(payload_view[:data_len].numpy())
         return best_step, pickle.loads(payload_bytes)
 
+    def load_at_step(self, step: int) -> dict:
+        """Return metadata committed at *step*. Raises if no slot matches."""
+        for step_view, len_view, payload_view in self._slots:
+            if step_view.item() != step:
+                continue
+            data_len = len_view.item()
+            payload_bytes = bytes(payload_view[:data_len].numpy())
+            return pickle.loads(payload_bytes)
+        raise RuntimeError(
+            f"No slot in metadata circular buffer holds step={step}"
+        )
+
 def _ms(t_start, t_end):
     return (t_end - t_start) * 1000
 
@@ -251,8 +263,6 @@ class RmpManager:
 
         if allocated:
             self._sync_commit(step=0)
-        else:
-            self._load_cpu_metadata()
 
         self.rmp_client.set_allocation_flag(FLAG_KIND_GPU)
 
@@ -378,14 +388,11 @@ class RmpManager:
         # self._commit_future.result()  # propagates worker exceptions
         # self._commit_future = None
 
-    def _load_cpu_metadata(self):
+    def load_cpu_metadata(self, resume_step):
         if self.skip_commit:
             return
-        result = self._meta_buffer.load_latest()
-        if result is None:
-            raise RuntimeError("No committed metadata found in circular buffer")
-        step, committed_metadata = result
-        logger.info(f"Loaded metadata from circular buffer (step={step})")
+        committed_metadata = self._meta_buffer.load_at_step(resume_step)
+        logger.info(f"Loaded metadata from circular buffer (step={resume_step})")
         state_dict_to_stateful(self.states, committed_metadata["TRAIN"])
 
         optim_state_dict = self.optimizers.state_dict()

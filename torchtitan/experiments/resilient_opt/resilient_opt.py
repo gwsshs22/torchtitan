@@ -230,6 +230,10 @@ class ResilientOptimizer:
     # Public API
     # ------------------------------------------------------------------
 
+    def get_step(self) -> int:
+        """Return the current step counter value."""
+        return self._step_counter.item()
+
     def step(self):
         """Fault-tolerant optimizer step with 3-step doubling.
 
@@ -327,7 +331,7 @@ class ResilientOptimizer:
             if hook_state == _HOOK_STATE_PRE_DONE:
                 self._hook_state.fill_(_HOOK_STATE_NONE)
             self.step()
-            logger.info("[ResilientOpt] Full step executed")
+            logger.info(f"[ResilientOpt] Full step executed stored={stored}")
             return True
 
         # stored == resume_step: counter already bumped — step is in flight.
@@ -354,7 +358,7 @@ class ResilientOptimizer:
             self._run_chunks(resume_from=fault_chunk)
             self._run_post_hooks()
             self._hook_state.fill_(_HOOK_STATE_NONE)
-            logger.info("[ResilientOpt] Recovery complete")
+            logger.info(f"[ResilientOpt] Recovery complete stored={stored}")
             return True
 
         # marker IDLE — either step fully done, or counter bumped but
@@ -364,7 +368,7 @@ class ResilientOptimizer:
             if params_step == resume_step:
                 # pre-hook ran, chunks ran, post-hook ran, hook_state reset:
                 # full step is on disk. Nothing to do.
-                logger.info("[ResilientOpt] Step fully complete, no recovery needed")
+                logger.info(f"[ResilientOpt] Step fully complete, no recovery needed stored={stored}")
                 return False
             # Counter bumped but pre-hook never landed (e.g. fault between
             # the counter increment and pre-hook execution). Run the full
@@ -374,7 +378,7 @@ class ResilientOptimizer:
             self._run_chunks(resume_from=0)
             self._run_post_hooks()
             self._hook_state.fill_(_HOOK_STATE_NONE)
-            logger.info("[ResilientOpt] Full step executed")
+            logger.info(f"[ResilientOpt] Full step executed stored={stored}")
             return True
 
         # hook_state == _HOOK_STATE_PRE_DONE
