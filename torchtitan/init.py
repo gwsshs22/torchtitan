@@ -602,10 +602,7 @@ def init_trainer_states(ctx: InitContext) -> None:
     ctx.ntokens_seen = 0
     ctx._prev_step_faulted = False
 
-    job_config = ctx.job_config
-    ctx._include_rng_in_state_dict = not (
-        job_config.leto.enable_rmp_gpu and not job_config.leto.rmp_commit_sync
-    )
+    ctx._include_rng_in_state_dict = True
 
 
 def init_rmp_and_resilient_opt(ctx: InitContext) -> None:

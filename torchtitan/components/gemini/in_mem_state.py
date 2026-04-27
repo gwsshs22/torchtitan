@@ -13,7 +13,6 @@ from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import (
     _to_local_tensor,
-    _to_dtensor,
     stateful_to_state_dict,
     state_dict_to_stateful
 )
@@ -330,33 +329,41 @@ class InMemState:
             model_cpu_tensors = state_dict["_model_cpu_tensors"]
             optim_cpu_tensors = state_dict["_optim_cpu_tensors"]
 
+        # Model: write values *into* the existing GPU tensors (which may be
+        # RMP-backed by RmpManager.maybe_init).  Reference identity must be
+        # preserved so any other component holding the same tensor (e.g.
+        # ResilientOptimizer's chunk schedule, RMP shared memory) keeps
+        # observing the right storage.
         for gpu_tensor, cpu_tensor in zip(
             self._model_gpu_tensors, model_cpu_tensors
         ):
             gpu_tensor.copy_(cpu_tensor, non_blocking=True)
 
-        optim_new_state_dict = cpu_metadata["OPTIM"]
-        optim_state_dict = self._optimizers.state_dict()
-
-        for k, cpu_tensor in zip(
-            self._optim_tensor_keys, optim_cpu_tensors
+        # Optim non-step tensors: same in-place pattern as model tensors.
+        # Previously this used optim.load_state_dict(...) with newly-built
+        # CPU DTensors, which forced PyTorch's _cast to mint fresh CUDA
+        # tensors via .to(device=cuda, ...) — severing the RMP backing of
+        # exp_avg / exp_avg_sq / step that RmpManager.maybe_init had set
+        # up.  Subsequent ResilientOptimizer._step_chunk writes then went
+        # to non-RMP tensors and the RMP-backed copies stayed frozen at
+        # the gemini-loaded values, breaking transient-fault recovery.
+        for gpu_tensor, cpu_tensor in zip(
+            self._optim_gpu_tensors, optim_cpu_tensors
         ):
-            optim_new_state_dict[k] = _to_dtensor(cpu_tensor, optim_state_dict[k])
+            gpu_tensor.copy_(cpu_tensor, non_blocking=True)
 
-        # Manually setting "*.step" values to avoid handling such small tensors.
+        # Optim step tensors: fill the existing (RMP-backed) tensor in
+        # place.  Same RMP-preservation reason as above.
+        optim_state_dict = self._optimizers.state_dict()
         for k, tensor in optim_state_dict.items():
             if k.endswith(".step"):
-                cpu_tensor = torch.tensor(checkpointed_step, dtype=tensor.dtype, device="cpu")
-                optim_new_state_dict[k] = _to_dtensor(cpu_tensor, tensor)
+                _to_local_tensor(tensor).fill_(checkpointed_step)
 
-        self._optimizers.load_state_dict(optim_new_state_dict)
-
-        # Reset gpu tensor references.
-        self._optim_gpu_tensors = []
-        optim_tensor_keys = []
-        for k, tensor in self._optimizers.state_dict().items():
-            if isinstance(tensor, torch.Tensor) and not k.endswith(".step"):
-                local_tensor = _to_local_tensor(tensor)
-                self._optim_gpu_tensors.append(local_tensor)
-                optim_tensor_keys.append(k)
-        assert optim_tensor_keys == self._optim_tensor_keys
+        # Apply non-tensor optim metadata (param_groups: lr, betas, ...).
+        # Pass the *current* state_dict (RMP-backed tensor refs) to
+        # load_state_dict and overlay the non-tensor entries from the
+        # checkpoint — PyTorch's _cast does .to(dtype, device) which is a
+        # no-op for already-on-device tensors, so the tensor refs survive
+        # the round trip.
+        optim_state_dict.update(cpu_metadata["OPTIM"])
+        self._optimizers.load_state_dict(optim_state_dict)
