@@ -41,18 +41,24 @@ from torch.distributed._tensor import DTensor
 from leto.rmp.client import RmpClient, TensorSpec
 from torchtitan.tools.logging import logger
 
+# Unified marker values.  Negative = "phase" sentinel; non-negative encodes
+# chunk progress as before (K*2 = backup pending for chunk K, K*2+1 = backup
+# done / step pending).  Distinct from chunk values because chunk indices
+# are ≥ 0.
+#
+# Lifecycle within step():
+#   IDLE  ──fill──► PRE_RUNNING ──counter+=1──► (still PRE_RUNNING)
+#                   ──pre_hook──► fill─► PRE_DONE ──chunks──► POST_RUNNING
+#                   ──post_hook──► fill─► IDLE
+#
+# The PRE_RUNNING claim is set *before* the counter bump.  That makes
+# (counter=N+1, mark=IDLE) reachable only at step-N+1 completion (not
+# during the next step's pre-bump window), which is what eliminates the
+# old (counter, marker, hook_state, params_step)-witness disambiguation.
 _MARKER_IDLE = -1
-
-# Hook state values stored in self._hook_state.
-#   NONE     = pre-hook not yet run for the current step (or post-hook
-#              completed and reset for the next step).
-#   PRE_DONE = pre-hook completed; chunks may or may not have run yet.
-# Faults inside hook execution itself are out of scope of the synthetic
-# fault model (faults inject only at _marker.fill_); the existing real-RMP
-# storage of expert_bias / tokens_per_expert handles persistence across
-# crashes, but partial in-kernel hook execution is not recovered.
-_HOOK_STATE_NONE = 0
-_HOOK_STATE_PRE_DONE = 1
+_MARKER_PRE_RUNNING = -2
+_MARKER_PRE_DONE = -3
+_MARKER_POST_RUNNING = -4
 
 
 def _get_local(tensor):
@@ -155,19 +161,6 @@ class ResilientOptimizer:
             self._marker.fill_(_MARKER_IDLE)
             torch.cuda.current_stream().synchronize()
 
-        # -- Hook state tracker (separate allocation so existing deployments
-        # without hook_state can roll forward without re-initing the marker).
-        hook_state_tensors, hook_state_allocated = rmp_client.get_or_allocate_tensors(
-            [TensorSpec(
-                name="resilient/hook_state", shape=(1,),
-                dtype=torch.int64, device=device_idx,
-            )]
-        )
-        self._hook_state = hook_state_tensors["resilient/hook_state"]
-        if hook_state_allocated:
-            self._hook_state.fill_(_HOOK_STATE_NONE)
-            torch.cuda.current_stream().synchronize()
-
         # -- Step counter (RMP-backed GPU) ------------------------------------
         step_cnt_tensors, step_cnt_allocated = rmp_client.get_or_allocate_tensors(
             [TensorSpec(
@@ -263,17 +256,16 @@ class ResilientOptimizer:
     def resync_after_external_load(self):
         """Re-sync RMP-backed scalars to the just-loaded optimizer state.
 
-        Step counter, chunk marker, and hook-state are kept in RMP so they
-        survive faults; they are otherwise initialized only on fresh
-        allocation. After an external load (e.g. gemini.load()) overwrites
-        params and optim state but leaves these scalars at whatever the
-        prior active left, the step counter would be ahead of params.step,
-        and the next AdamW update would use the wrong bias-correction step.
-        Must be called after bind().
+        Step counter and marker are kept in RMP so they survive faults;
+        they are otherwise initialized only on fresh allocation. After an
+        external load (e.g. gemini.load()) overwrites params and optim
+        state but leaves these scalars at whatever the prior active left,
+        the step counter would be ahead of params.step and the next AdamW
+        update would use the wrong bias-correction step.  Must be called
+        after bind().
         """
         self._step_counter.fill_(int(self._all_params[0].step.item()))
         self._marker.fill_(_MARKER_IDLE)
-        self._hook_state.fill_(_HOOK_STATE_NONE)
         torch.cuda.current_stream().synchronize()
 
     def step(self):
@@ -282,18 +274,20 @@ class ResilientOptimizer:
         Order matches torch.optim.Optimizer.step():
             pre-hooks → param/state update → post-hooks.
 
-        Hook state is recorded between phases so maybe_recover() can
-        replay the right subset on resume.
+        The marker walks through PRE_RUNNING → PRE_DONE → chunk markers →
+        POST_RUNNING → IDLE so each phase is unambiguously identifiable on
+        recovery. PRE_RUNNING is claimed *before* the counter bump so the
+        post-completion (counter=N+1, mark=IDLE) state can't be confused
+        with the next step's pre-bump window.
         """
+        self._marker.fill_(_MARKER_PRE_RUNNING)
         self._step_counter += 1
         self._run_pre_hooks()
-        # Mark AFTER pre-hook so a fault that prevents the fill_ leaves
-        # state==NONE and recovery re-runs pre-hook (correct for synthetic
-        # fault model where faults inject only at marker.fill_).
-        self._hook_state.fill_(_HOOK_STATE_PRE_DONE)
+        self._marker.fill_(_MARKER_PRE_DONE)
         self._run_chunks(resume_from=0)
+        self._marker.fill_(_MARKER_POST_RUNNING)
         self._run_post_hooks()
-        self._hook_state.fill_(_HOOK_STATE_NONE)
+        self._marker.fill_(_MARKER_IDLE)
 
     def _run_pre_hooks(self):
         container = self._optimizers
@@ -319,6 +313,9 @@ class ResilientOptimizer:
 
         Chunks before resume_from are treated as committed — only their
         freed grad memory is harvested for scratch space.
+
+        Caller is responsible for the post-chunks marker transition
+        (POST_RUNNING) and the eventual IDLE.
         """
         freed_grad_segments: list[torch.Tensor] = []
 
@@ -339,8 +336,6 @@ class ResilientOptimizer:
             self._step_chunk(chunk)
             self._harvest_grads(chunk, freed_grad_segments)
 
-        self._marker.fill_(_MARKER_IDLE)
-
     def maybe_recover(self, resume_step: int) -> bool:
         """Detect mid-step fault and resume from the interrupted phase.
 
@@ -356,89 +351,109 @@ class ResilientOptimizer:
         _model_converters.post_optimizer_hook, no-op for bf16 / safe to
         re-run for mxfp8 weight reconversion); it is re-invoked on any
         recovery that produces step `resume_step` to keep the path simple.
-        Pre-hook (e.g. _update_expert_bias) is non-idempotent and is
-        invoked only when hook_state confirms it has not yet run for the
-        current step.
+        Pre-hook (e.g. _update_expert_bias) is non-idempotent and
+        contains an all_reduce; on a PRE_RUNNING fault we use the
+        params-step witness to distinguish "claim made, counter never
+        bumped" (skip pre-hook) from "counter bumped, fault in pre-hook"
+        (re-run), so cross-rank consistency holds — otherwise the all_reduce
+        deadlocks when ranks diverge.
         """
         stored = self._step_counter.item()
         marker_val = self._marker.item()
-        hook_state = self._hook_state.item()
 
         if stored + 1 == resume_step:
-            # Counter hasn't been bumped → fresh step. If a previous step's
-            # post-hook completed but the trailing hook_state.fill_(NONE)
-            # never landed, hook_state is left at PRE_DONE; reset it so the
-            # new step's pre-hook will run.
-            assert marker_val == _MARKER_IDLE
-            if hook_state == _HOOK_STATE_PRE_DONE:
-                self._hook_state.fill_(_HOOK_STATE_NONE)
+            # Counter not bumped on this rank → run a fresh step.  Marker
+            # should be IDLE in the common case; under the fault model the
+            # only other reachable value here is PRE_RUNNING (mark.fill_
+            # landed but counter+=1 didn't, which the fault model excludes
+            # because faults only inject at fill_).  step() unconditionally
+            # re-fills PRE_RUNNING, so a stale value is harmless.
+            assert marker_val in (_MARKER_IDLE, _MARKER_PRE_RUNNING), (
+                f"unexpected marker={marker_val} with stored+1==resume_step"
+            )
             self.step()
             logger.info(f"[ResilientOpt] Full step executed stored={stored}")
             return True
 
-        # stored == resume_step: counter already bumped — step is in flight.
         assert stored == resume_step, (
             f"step counter mismatch: stored={stored}, resume_step={resume_step}"
         )
 
-        params_step = int(self._all_params[0].step.item())
-
-        if marker_val != _MARKER_IDLE:
-            # Fault during chunk processing. Pre-hook must have run before
-            # any chunk could have started touching _marker.
-            assert hook_state == _HOOK_STATE_PRE_DONE, (
-                f"chunk marker non-idle but hook_state={hook_state}"
+        if marker_val == _MARKER_IDLE:
+            # Step fully done. The pre-claim invariant (PRE_RUNNING is set
+            # before the next step's counter bump) means IDLE at this
+            # counter value can only come from the trailing fill_(IDLE) of
+            # the just-completed step — no witness check needed.
+            logger.info(
+                f"[ResilientOpt] Step fully complete, no recovery needed stored={stored}"
             )
-            fault_chunk = marker_val // 2
-            backup_done = (marker_val % 2 == 1)
-            logger.warning(
-                f"[ResilientOpt] Fault detected (marker={marker_val}, "
-                f"chunk={fault_chunk}, backup_done={backup_done}), recovering"
-            )
-            if backup_done:
-                self._restore_faulted_chunk(fault_chunk)
-            self._run_chunks(resume_from=fault_chunk)
-            self._run_post_hooks()
-            self._hook_state.fill_(_HOOK_STATE_NONE)
-            logger.info(f"[ResilientOpt] Recovery complete stored={stored}")
-            return True
+            return False
 
-        # marker IDLE — either step fully done, or counter bumped but
-        # chunks haven't started, or chunks completed but post-hook didn't
-        # run / didn't reset hook_state.
-        if hook_state == _HOOK_STATE_NONE:
-            if params_step == resume_step:
-                # pre-hook ran, chunks ran, post-hook ran, hook_state reset:
-                # full step is on disk. Nothing to do.
-                logger.info(f"[ResilientOpt] Step fully complete, no recovery needed stored={stored}")
+        if marker_val == _MARKER_PRE_RUNNING:
+            # PRE_RUNNING is set *before* the counter bump, so its
+            # presence with stored==resume_step is ambiguous:
+            #   * counter never bumped (claim made, then SIGKILL hit
+            #     before counter += 1 — narrow window).  params[0].step
+            #     is at the prior step's value == stored.  No work to do
+            #     beyond resetting the mark.
+            #   * counter bumped, fault landed in/around pre-hook.
+            #     params[0].step is at stored - 1 (chunks for the new
+            #     step haven't run yet).  Run the full pipeline.
+            #
+            # This is the one branch that still needs the params-step
+            # witness; cross-rank consistency depends on it because
+            # _run_pre_hooks does an all_reduce (expert-bias balancing)
+            # that would deadlock if some ranks took this branch and
+            # others were at IDLE.
+            params_step = int(self._all_params[0].step.item())
+            if params_step == stored:
+                self._marker.fill_(_MARKER_IDLE)
+                logger.info(
+                    f"[ResilientOpt] PRE_RUNNING claim with no counter "
+                    f"bump; reset and skip recovery stored={stored}"
+                )
                 return False
-            # Counter bumped but pre-hook never landed (e.g. fault between
-            # the counter increment and pre-hook execution). Run the full
-            # post-bump pipeline.
+
             self._run_pre_hooks()
-            self._hook_state.fill_(_HOOK_STATE_PRE_DONE)
+            self._marker.fill_(_MARKER_PRE_DONE)
             self._run_chunks(resume_from=0)
+            self._marker.fill_(_MARKER_POST_RUNNING)
             self._run_post_hooks()
-            self._hook_state.fill_(_HOOK_STATE_NONE)
+            self._marker.fill_(_MARKER_IDLE)
             logger.info(f"[ResilientOpt] Full step executed stored={stored}")
             return True
 
-        # hook_state == _HOOK_STATE_PRE_DONE
-        if params_step == resume_step:
-            # Chunks finished. Post-hook may or may not have run; idempotent
-            # so re-running is safe.
-            logger.info(
-                "[ResilientOpt] Resuming after chunks complete: re-running post-hook"
-            )
+        if marker_val == _MARKER_PRE_DONE:
+            # Pre-hook done, chunks not yet started.
+            self._run_chunks(resume_from=0)
+            self._marker.fill_(_MARKER_POST_RUNNING)
             self._run_post_hooks()
-            self._hook_state.fill_(_HOOK_STATE_NONE)
+            self._marker.fill_(_MARKER_IDLE)
+            logger.info(f"[ResilientOpt] Resumed from chunk 0 after pre-hook stored={stored}")
             return True
 
-        # Pre-hook done, chunks not yet started.
-        self._run_chunks(resume_from=0)
+        if marker_val == _MARKER_POST_RUNNING:
+            # Chunks done; post-hook may or may not have run.  Idempotent,
+            # so re-run.
+            self._run_post_hooks()
+            self._marker.fill_(_MARKER_IDLE)
+            logger.info(f"[ResilientOpt] Re-ran post-hook stored={stored}")
+            return True
+
+        # marker_val >= 0: chunk in flight.
+        fault_chunk = marker_val // 2
+        backup_done = (marker_val % 2 == 1)
+        logger.warning(
+            f"[ResilientOpt] Fault detected (marker={marker_val}, "
+            f"chunk={fault_chunk}, backup_done={backup_done}), recovering"
+        )
+        if backup_done:
+            self._restore_faulted_chunk(fault_chunk)
+        self._run_chunks(resume_from=fault_chunk)
+        self._marker.fill_(_MARKER_POST_RUNNING)
         self._run_post_hooks()
-        self._hook_state.fill_(_HOOK_STATE_NONE)
-        logger.info("[ResilientOpt] Resumed from chunk 0 after pre-hook")
+        self._marker.fill_(_MARKER_IDLE)
+        logger.info(f"[ResilientOpt] Recovery complete stored={stored}")
         return True
 
     def enable_fault_injection(self, prob: float):

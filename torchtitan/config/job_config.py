@@ -1033,7 +1033,7 @@ class Debug:
 class Leto:
     init_mode: str = "baseline"
     """Initialization mode: 'baseline' (original order, CUDA immediately),
-    'reordered' (default, defers CUDA until after standby poll)."""
+    'reordered' (defers CUDA until after standby poll)."""
 
     profile_init: bool = False
     """If True, profile each init task's wall time and GPU memory usage (via pynvml).
