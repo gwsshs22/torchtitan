@@ -26,6 +26,7 @@ Memory budget:
 
 Usage:
     resilient_opt = ResilientOptimizer(optimizers, rmp_client, device)
+    resilient_opt.bind()  # also call again after optimizer.load_state_dict()
     resilient_opt.step()
 """
 
@@ -118,11 +119,85 @@ class ResilientOptimizer:
         self._device = device
         self._init_chunk_size = init_chunk_size_mb * 1024 * 1024
         self._max_chunk_size = max_chunk_size_mb * 1024 * 1024
+        self._init_chunk_size_mb = init_chunk_size_mb
+        self._max_chunk_size_mb = max_chunk_size_mb
 
-        # -- collect per-param info ----------------------------------------
+        # Populated by bind(). step()/maybe_recover() require bind() first.
+        self._all_params: list[_ParamInfo] = []
+        self._num_params = 0
+        self._schedule: list[list[_SliceEntry]] = []
+
+        # -- CPU buffer: init_chunk_size × 3 × 3 --------------------------
+        # Backs up (init_chunk_size × 3) worth of params in one copy.
+        # Allocated via RMP so it survives faults and is accessible on recovery.
+        cpu_buffer_bytes = self._init_chunk_size * 3 * 3
+        cpu_storage, cpu_allocated = rmp_client.get_or_allocate_cpu_memory(
+            "resilient/cpu_buffer", cpu_buffer_bytes,
+        )
+        pin_memory(cpu_storage.data_ptr(), cpu_storage.nbytes())
+        self._cpu_buffer = torch.empty(0, dtype=torch.uint8).set_(
+            source=cpu_storage, storage_offset=0, size=(cpu_buffer_bytes,),
+        )
+        self._cpu_buffer_bytes = cpu_buffer_bytes
+        # The CPU phase updates this many param bytes:
+        self._cpu_phase_param_bytes = self._init_chunk_size * 3
+
+        # -- RMP marker ----------------------------------------------------
+        device_idx = device.index if hasattr(device, "index") else 0
+        marker_tensors, gpu_allocated = rmp_client.get_or_allocate_tensors(
+            [TensorSpec(
+                name="resilient/marker", shape=(1,),
+                dtype=torch.int64, device=device_idx,
+            )]
+        )
+        self._marker = marker_tensors["resilient/marker"]
+        if gpu_allocated:
+            self._marker.fill_(_MARKER_IDLE)
+            torch.cuda.current_stream().synchronize()
+
+        # -- Hook state tracker (separate allocation so existing deployments
+        # without hook_state can roll forward without re-initing the marker).
+        hook_state_tensors, hook_state_allocated = rmp_client.get_or_allocate_tensors(
+            [TensorSpec(
+                name="resilient/hook_state", shape=(1,),
+                dtype=torch.int64, device=device_idx,
+            )]
+        )
+        self._hook_state = hook_state_tensors["resilient/hook_state"]
+        if hook_state_allocated:
+            self._hook_state.fill_(_HOOK_STATE_NONE)
+            torch.cuda.current_stream().synchronize()
+
+        # -- Step counter (RMP-backed GPU) ------------------------------------
+        step_cnt_tensors, step_cnt_allocated = rmp_client.get_or_allocate_tensors(
+            [TensorSpec(
+                name="resilient/step_counter", shape=(1,),
+                dtype=torch.int64, device=device_idx,
+            )]
+        )
+        self._step_counter = step_cnt_tensors["resilient/step_counter"]
+        # Initialized from optim.state["step"] on the first bind() after a
+        # fresh allocation; deferred because the source tensor lives in
+        # optimizer state, which we don't traverse in __init__.
+        self._step_counter_needs_init = step_cnt_allocated
+
+    def bind(self):
+        """(Re)bind to the optimizer's current state and rebuild the schedule.
+
+        Captures fresh references to ``optimizer.state[param][...]`` tensors
+        and to each ``param_group`` dict, then rebuilds the chunk schedule.
+
+        Must be called once after construction (so step()/maybe_recover() can
+        run), and again after any operation that replaces
+        ``optimizer.state`` or ``optimizer.param_groups`` — most importantly
+        ``optimizer.load_state_dict``, which deep-copies state tensors and
+        installs new param_group dicts. Without rebinding, cached references
+        from a previous bind point at the now-detached objects (lr in
+        particular stops tracking lr_scheduler.step()).
+        """
         all_params: list[_ParamInfo] = []
 
-        for optimizer in optimizers:
+        for optimizer in self._optimizers:
             for group in optimizer.param_groups:
                 for param in group["params"]:
                     if param not in optimizer.state:
@@ -162,68 +237,19 @@ class ResilientOptimizer:
 
         self._all_params = all_params
         self._num_params = len(all_params)
-
-        # -- CPU buffer: init_chunk_size × 3 × 3 --------------------------
-        # Backs up (init_chunk_size × 3) worth of params in one copy.
-        # Allocated via RMP so it survives faults and is accessible on recovery.
-        cpu_buffer_bytes = self._init_chunk_size * 3 * 3
-        cpu_storage, cpu_allocated = rmp_client.get_or_allocate_cpu_memory(
-            "resilient/cpu_buffer", cpu_buffer_bytes,
-        )
-        pin_memory(cpu_storage.data_ptr(), cpu_storage.nbytes())
-        self._cpu_buffer = torch.empty(0, dtype=torch.uint8).set_(
-            source=cpu_storage, storage_offset=0, size=(cpu_buffer_bytes,),
-        )
-        # The CPU phase updates this many param bytes:
-        self._cpu_phase_param_bytes = self._init_chunk_size * 3
-
-        # -- RMP marker ----------------------------------------------------
-        device_idx = device.index if hasattr(device, "index") else 0
-        marker_tensors, gpu_allocated = rmp_client.get_or_allocate_tensors(
-            [TensorSpec(
-                name="resilient/marker", shape=(1,),
-                dtype=torch.int64, device=device_idx,
-            )]
-        )
-        self._marker = marker_tensors["resilient/marker"]
-        if gpu_allocated:
-            self._marker.fill_(_MARKER_IDLE)
-            torch.cuda.current_stream().synchronize()
-
-        # -- Hook state tracker (separate allocation so existing deployments
-        # without hook_state can roll forward without re-initing the marker).
-        hook_state_tensors, hook_state_allocated = rmp_client.get_or_allocate_tensors(
-            [TensorSpec(
-                name="resilient/hook_state", shape=(1,),
-                dtype=torch.int64, device=device_idx,
-            )]
-        )
-        self._hook_state = hook_state_tensors["resilient/hook_state"]
-        if hook_state_allocated:
-            self._hook_state.fill_(_HOOK_STATE_NONE)
-            torch.cuda.current_stream().synchronize()
-
-        # -- Step counter (RMP-backed GPU) ------------------------------------
-        step_cnt_tensors, step_cnt_allocated = rmp_client.get_or_allocate_tensors(
-            [TensorSpec(
-                name="resilient/step_counter", shape=(1,),
-                dtype=torch.int64, device=device_idx,
-            )]
-        )
-        self._step_counter = step_cnt_tensors["resilient/step_counter"]
-        if step_cnt_allocated:
-            self._step_counter.fill_(int(all_params[0].step.item()))
-            torch.cuda.current_stream().synchronize()
-
-        # -- Precompute chunk schedule --------------------------------------
         self._schedule = self._build_schedule()
 
+        if self._step_counter_needs_init:
+            self._step_counter.fill_(int(all_params[0].step.item()))
+            torch.cuda.current_stream().synchronize()
+            self._step_counter_needs_init = False
+
         logger.info(
-            f"[ResilientOpt] {self._num_params} params, "
+            f"[ResilientOpt] bound {self._num_params} params, "
             f"{len(self._schedule)} chunks, "
-            f"init_chunk: {init_chunk_size_mb} MB, "
-            f"max_chunk: {max_chunk_size_mb} MB, "
-            f"CPU buffer: {cpu_buffer_bytes / (1024**2):.1f} MB"
+            f"init_chunk: {self._init_chunk_size_mb} MB, "
+            f"max_chunk: {self._max_chunk_size_mb} MB, "
+            f"CPU buffer: {self._cpu_buffer_bytes / (1024**2):.1f} MB"
         )
 
     # ------------------------------------------------------------------
@@ -602,7 +628,7 @@ class ResilientOptimizer:
         for sl in chunk:
             by_group[id(sl.group)].append(sl)
 
-        for group_slices in by_group.values():
+        for group_slices in by_group.values():                
             group = group_slices[0].group
             params = []
             grads = []

@@ -292,12 +292,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         step_counter, then all ranks agree on the maximum step via an
         all-reduce.  The maximum is used as resume_step for maybe_recover().
         """
+        if not self.rmp_restored:
+            self._resilient_opt.bind()
+            return
+
         local_step = self._resilient_opt.get_step()
 
         # MAX all-reduce across all ranks to find the globally consistent step
         step_tensor = torch.tensor([local_step], dtype=torch.int64, device=self.device)
         dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)
         resume_step = step_tensor.item()
+        self.rmp_manager.load_cpu_metadata(resume_step)
+        # load_cpu_metadata calls optimizer.load_state_dict, which deep-copies
+        # state tensors and installs new param_group dicts. Rebind so the
+        # resilient optimizer sees the post-load state (esp. lr).
+        self._resilient_opt.bind()
 
         logger.info(
             f"[ResilientOpt] local_step={local_step}, "
@@ -309,7 +318,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
-        self.rmp_manager.load_cpu_metadata(resume_step)
+
         self.lr_schedulers.step()
         self.step = resume_step
 
@@ -675,10 +684,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train(self):
         job_config = self.job_config
 
-        if job_config.leto.enable_rmp_gpu and self.rmp_restored:
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+
+        if job_config.leto.enable_rmp_gpu:
             self._resilient_opt_recover()
 
-        self.checkpointer.load(step=job_config.checkpoint.load_step)
         self._restored_step = self.step
 
         # Track whether this train() call has started the progressive signal
