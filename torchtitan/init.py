@@ -417,6 +417,70 @@ def maybe_wait_for_resuming(ctx: InitContext) -> None:
         time.sleep(poll_interval)
 
 
+def _standby_wait_for_allocation_flag(
+    rmp_client,
+    kind: str,
+    poll_interval: float = 0.1,
+) -> None:
+    """Standby-side wait on an RMP allocation flag with controller fallback.
+
+    Polls ``rmp_client.get_allocation_flag(kind)``; the wait ends when:
+      * the flag reads >= 1 (active completed allocation), OR
+      * ``poll_standby_status()`` returns STANDBY_ACTION_ACTIVATE
+        (worker controller is promoting us — keep going so the caller
+        can do the allocation itself).
+
+    On STANDBY_ACTION_TERMINATE (or a poll error), logs and ``sys.exit(0)``.
+
+    No-op if leto isn't available or this isn't a standby.
+    """
+    if not (_LETO_AVAILABLE and leto_is_standby()):
+        # Not standby; just check the flag once for parity.
+        if rmp_client.get_allocation_flag(kind) < 1:
+            logger.warning(
+                f"[RMP] non-standby called wait for {kind} flag, but flag != 1"
+            )
+        return
+
+    if rmp_client.get_allocation_flag(kind) >= 1:
+        logger.info(f"[RMP] {kind} allocation flag already = 1, no wait")
+        return
+
+    logger.info(f"[RMP] waiting for {kind} allocation flag (poll={poll_interval}s)")
+    start = time.monotonic()
+    while True:
+        if rmp_client.get_allocation_flag(kind) >= 1:
+            elapsed = time.monotonic() - start
+            logger.info(f"[RMP] {kind} allocation flag = 1, waited {elapsed:.2f}s")
+            return
+
+        try:
+            action = poll_standby_status()
+        except Exception:
+            logger.error(
+                f"Error polling standby status while waiting for {kind} flag",
+                exc_info=True,
+            )
+            sys.exit(1)
+
+        if action == STANDBY_ACTION_ACTIVATE:
+            elapsed = time.monotonic() - start
+            logger.info(
+                f"[RMP] {kind} allocation flag wait released by ACTIVATE "
+                f"after {elapsed:.2f}s"
+            )
+            return
+        if action == STANDBY_ACTION_TERMINATE:
+            elapsed = time.monotonic() - start
+            logger.error(
+                f"[RMP] standby TERMINATE while waiting for {kind} allocation "
+                f"flag after {elapsed:.2f}s"
+            )
+            sys.exit(0)
+
+        time.sleep(poll_interval)
+
+
 def activate_cuda_device(ctx: InitContext) -> None:
     """Set the CUDA device — this is the CUDA context boundary."""
     if ctx._device_module is None:
@@ -557,7 +621,9 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
         device=ctx.device,
     )
     if job_config.leto.enable_rmp_gpu and ctx.is_standby:
-        ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_GPU)
+        _standby_wait_for_allocation_flag(
+            ctx.rmp_manager.rmp_client, FLAG_KIND_GPU,
+        )
 
     ctx.rmp_restored = ctx.rmp_manager.maybe_init(ctx.buffer_device)
 
@@ -611,7 +677,9 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
 
     if job_config.checkpoint.use_gemini:
         if job_config.leto.enable_rmp_cpu and ctx.is_standby:
-            ctx.rmp_manager.rmp_client.wait_for_allocation_flag(FLAG_KIND_CPU)
+            _standby_wait_for_allocation_flag(
+                ctx.rmp_manager.rmp_client, FLAG_KIND_CPU,
+            )
         ctx.checkpointer.lazy_init(
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,
