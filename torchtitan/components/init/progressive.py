@@ -177,6 +177,7 @@ def try_advance(
     """
     rank = int(os.environ.get("RANK", "0"))
 
+    local_status = 0
     if delta_mb < threshold_mb:
         local_ok = 1
         logger.info(f"[progressive] rank={rank} delta_mb={delta_mb:.1f} < threshold, skip wait")
@@ -185,15 +186,32 @@ def try_advance(
         kind, val = wait_for_signal(rank, poll_interval_s, status_check)
         if kind == "status":
             logger.info(f"[progressive] rank={rank} status={val} during wait")
-            return ("status", val)
-        free_mb = val
-        local_ok = 1 if (free_mb - delta_mb - safety_mb) >= 0 else 0
-        logger.info(
-            f"[progressive] rank={rank} free_mb={free_mb} - delta={delta_mb:.1f} - "
-            f"safety={safety_mb:.1f} → local_ok={local_ok}"
-        )
+            # Don't return yet — every rank must enter the all_reduce below,
+            # otherwise peers that already got a signal hang in gloo. Carry
+            # the status code into the reduce and bail in unison.
+            local_status = int(val)
+            local_ok = 0
+        else:
+            free_mb = val
+            local_ok = 1 if (free_mb - delta_mb - safety_mb) >= 0 else 0
+            logger.info(
+                f"[progressive] rank={rank} free_mb={free_mb} - delta={delta_mb:.1f} - "
+                f"safety={safety_mb:.1f} → local_ok={local_ok}"
+            )
 
-    logger.info(f"[progressive] rank={rank} entering all_reduce local_ok={local_ok}")
+    logger.info(
+        f"[progressive] rank={rank} entering all_reduce "
+        f"local_ok={local_ok} local_status={local_status}"
+    )
+    s = torch.tensor([local_status], dtype=torch.int32)
+    dist.all_reduce(s, op=dist.ReduceOp.MAX, group=gloo_pg)
+    global_status = int(s.item())
+    if global_status > 0:
+        logger.info(
+            f"[progressive] rank={rank} all_reduce done → status={global_status}"
+        )
+        return ("status", global_status)
+
     t = torch.tensor([local_ok], dtype=torch.int32)
     dist.all_reduce(t, op=dist.ReduceOp.MIN, group=gloo_pg)
     result = "advance" if t.item() == 1 else "retry"
