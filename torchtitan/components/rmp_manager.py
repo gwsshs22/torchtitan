@@ -398,9 +398,16 @@ class RmpManager:
         logger.info(f"Loaded metadata from circular buffer (step={resume_step})")
         state_dict_to_stateful(self.states, committed_metadata["TRAIN"])
 
-        optim_state_dict = self.optimizers.state_dict()
-        optim_state_dict.update(committed_metadata["OPTIM"])
-        self.optimizers.load_state_dict(optim_state_dict)
+        # Tensor states (params, exp_avg, exp_avg_sq, step) are already
+        # correct in RMP-GPU from the previous active — do NOT route them
+        # through optimizer.load_state_dict, whose set_optimizer_state_dict
+        # path can mint fresh CUDA tensors and sever the RMP backing that
+        # ResilientOptimizer's bind() then captures (same class of bug as
+        # the gemini in_mem_state.py fix).  The non-tensor optim state
+        # (param_groups: lr, betas, ...) is reconstructed by the next
+        # lr_scheduler.step() call (the scheduler's last_epoch was just
+        # restored above via state_dict_to_stateful), so we don't need to
+        # apply committed_metadata["OPTIM"] either.
 
     def init_gradient_allocator(self, collective_manager, model_parts):
         """Register RMP gradient allocator on the collective manager."""

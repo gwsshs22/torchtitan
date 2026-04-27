@@ -293,9 +293,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         so we don't need a second all-reduce here.
         """
         self.rmp_manager.load_cpu_metadata(resume_step)
-        # load_cpu_metadata calls optimizer.load_state_dict, which deep-copies
-        # state tensors and installs new param_group dicts. Rebind so the
-        # resilient optimizer sees the post-load state (esp. lr).
+        # load_cpu_metadata leaves optimizer tensor state (params, exp_avg,
+        # exp_avg_sq, step) untouched in RMP-GPU; rebind to refresh the
+        # resilient optimizer's cached views (param_groups dict identity
+        # is unchanged, but bind is cheap and keeps the contract that any
+        # external load is followed by bind()).
         self._resilient_opt.bind()
 
         logger.info(f"[ResilientOpt] resume_step={resume_step} (global max)")
