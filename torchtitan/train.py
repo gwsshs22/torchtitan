@@ -285,33 +285,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self._prev_step_faulted = False
 
-    def _resilient_opt_recover(self):
+    def _resilient_opt_recover(self, resume_step: int):
         """Recover resilient optimizer state on RMP resume.
 
-        Each rank reads its local step from the resilient optimizer's
-        step_counter, then all ranks agree on the maximum step via an
-        all-reduce.  The maximum is used as resume_step for maybe_recover().
+        ``resume_step`` is the globally agreed-on step (MAX of every rank's
+        ``_step_counter``); train() computes it alongside the metadata-vote
+        so we don't need a second all-reduce here.
         """
-        if not self.rmp_restored:
-            self._resilient_opt.bind()
-            return
-
-        local_step = self._resilient_opt.get_step()
-
-        # MAX all-reduce across all ranks to find the globally consistent step
-        step_tensor = torch.tensor([local_step], dtype=torch.int64, device=self.device)
-        dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)
-        resume_step = step_tensor.item()
         self.rmp_manager.load_cpu_metadata(resume_step)
         # load_cpu_metadata calls optimizer.load_state_dict, which deep-copies
         # state tensors and installs new param_group dicts. Rebind so the
         # resilient optimizer sees the post-load state (esp. lr).
         self._resilient_opt.bind()
 
-        logger.info(
-            f"[ResilientOpt] local_step={local_step}, "
-            f"resume_step={resume_step} (global max)"
-        )
+        logger.info(f"[ResilientOpt] resume_step={resume_step} (global max)")
 
         recovered = self._resilient_opt.maybe_recover(resume_step)
         if recovered:
@@ -684,10 +671,33 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train(self):
         job_config = self.job_config
 
-        self.checkpointer.load(step=job_config.checkpoint.load_step)
-
         if job_config.leto.enable_rmp_gpu:
-            self._resilient_opt_recover()
+            # One all_reduce instead of two: pack the metadata-vote and
+            # resume_step into a single MAX-reduced tensor.
+            #   buf[0] = 1 if this rank lacks metadata else 0. After MAX,
+            #     buf[0]==1 means at least one rank lacks metadata, so every
+            #     rank must fall back to gemini to avoid divergence.
+            #   buf[1] = _step_counter when this rank has metadata, else 0.
+            #     After MAX, equals the global-max step counter (= resume
+            #     step) when every rank has metadata; ignored otherwise.
+            has_md = self.rmp_manager.has_committed_metadata()
+            local_step = self._resilient_opt.get_step() if has_md else 0
+            buf = torch.tensor(
+                [0 if has_md else 1, local_step],
+                dtype=torch.int64, device=self.device,
+            )
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            any_lacks = bool(buf[0].item())
+            resume_step = int(buf[1].item())
+
+            if not any_lacks:
+                self._resilient_opt_recover(resume_step)
+            else:
+                self.checkpointer.load(step=job_config.checkpoint.load_step)
+                self._resilient_opt.bind()
+                self._resilient_opt.resync_after_external_load()
+        else:
+            self.checkpointer.load(step=job_config.checkpoint.load_step)
 
         self._restored_step = self.step
 

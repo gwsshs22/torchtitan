@@ -261,9 +261,6 @@ class RmpManager:
                     model_part.init_weights(buffer_device=buffer_device)
             model_part.train()
 
-        if allocated:
-            self._sync_commit(step=0)
-
         self.rmp_client.set_allocation_flag(FLAG_KIND_GPU)
 
         return not allocated
@@ -387,6 +384,12 @@ class RmpManager:
         # )
         # self._commit_future.result()  # propagates worker exceptions
         # self._commit_future = None
+
+    def has_committed_metadata(self) -> bool:
+        """True if any rank-local metadata slot holds a valid commit."""
+        if not self.enabled:
+            return False
+        return self._meta_buffer.load_latest() is not None
 
     def load_cpu_metadata(self, resume_step):
         if self.skip_commit:

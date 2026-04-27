@@ -684,7 +684,6 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,
             lr_schedulers=ctx.lr_schedulers,
-            rmp_restored=ctx.rmp_restored,
             parallel_dims=ctx.parallel_dims,
             rmp_manager=ctx.rmp_manager,
             enable_rmp_cpu=job_config.leto.enable_rmp_cpu,

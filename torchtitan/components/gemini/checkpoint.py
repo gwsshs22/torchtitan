@@ -62,7 +62,6 @@ class GeminiCheckpointManager:
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
         parallel_dims: ParallelDims | None = None,
-        rmp_restored: bool = False,
         rmp_manager=None,
         enable_rmp_cpu: bool = False,
         collective_manager=None,
@@ -91,7 +90,6 @@ class GeminiCheckpointManager:
             tp_process_group=tp_pg,
             fsdp_process_group=fsdp_pg,
             pp_process_group=pp_pg,
-            rmp_restored=rmp_restored,
             rmp_manager=rmp_manager,
             enable_rmp_cpu=enable_rmp_cpu,
         )

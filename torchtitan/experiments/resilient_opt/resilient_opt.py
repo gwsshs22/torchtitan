@@ -260,6 +260,22 @@ class ResilientOptimizer:
         """Return the current step counter value."""
         return self._step_counter.item()
 
+    def resync_after_external_load(self):
+        """Re-sync RMP-backed scalars to the just-loaded optimizer state.
+
+        Step counter, chunk marker, and hook-state are kept in RMP so they
+        survive faults; they are otherwise initialized only on fresh
+        allocation. After an external load (e.g. gemini.load()) overwrites
+        params and optim state but leaves these scalars at whatever the
+        prior active left, the step counter would be ahead of params.step,
+        and the next AdamW update would use the wrong bias-correction step.
+        Must be called after bind().
+        """
+        self._step_counter.fill_(int(self._all_params[0].step.item()))
+        self._marker.fill_(_MARKER_IDLE)
+        self._hook_state.fill_(_HOOK_STATE_NONE)
+        torch.cuda.current_stream().synchronize()
+
     def step(self):
         """Fault-tolerant optimizer step with 3-step doubling.
 
