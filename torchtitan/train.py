@@ -568,214 +568,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             json.dump(dump, f, indent=2)
         logger.info(f"Dumped optimizer info to {dump_path}")
 
-    def _dump_state(self, tag: str, include_grad: bool = False) -> None:
-        """Per-step diagnostic dump.
-
-        - Rank 0 logs everything (full eb / tpe lists, per-buffer fingerprints,
-          optimizer aggregates, grads).
-        - Non-zero ranks log a SLIM per-MoE-layer tpe fingerprint and a
-          NP_BUF aggregate so we can spot per-rank divergence (e.g. stale
-          tokens_per_expert leftover from a killed step on a non-zero rank).
-        """
-        rank = int(os.environ.get("RANK", "0"))
-
-        from torchtitan.models.moe.moe import MoE
-
-        # Per-rank slim MoE fingerprint (sum/abs/sq + tpe per-element on
-        # rank 0 only). On non-zero ranks we still emit the integer tpe
-        # tolist so we can compare it across runs.
-        moe_idx = 0
-        for mp_idx, mp in enumerate(self.model_parts):
-            for module in mp.modules():
-                if not (isinstance(module, MoE) and module.expert_bias is not None):
-                    continue
-                eb = module.expert_bias
-                tpe = module.tokens_per_expert
-                eb_l = eb._local_tensor if hasattr(eb, "_local_tensor") else eb
-                tpe_l = tpe._local_tensor if hasattr(tpe, "_local_tensor") else tpe
-                if rank == 0:
-                    logger.info(
-                        f"[STATE/{tag}] rank={rank} step={self.step} mp={mp_idx} moe_idx={moe_idx} "
-                        f"eb_sum={eb_l.sum().item():.10e} eb_abs={eb_l.abs().sum().item():.10e} "
-                        f"eb_sq={eb_l.float().pow(2).sum().item():.10e} "
-                        f"eb={eb_l.tolist()} "
-                        f"tpe_sum={tpe_l.sum().item():.10e} "
-                        f"tpe={tpe_l.tolist()}"
-                    )
-                else:
-                    logger.info(
-                        f"[STATE/{tag}] rank={rank} step={self.step} mp={mp_idx} moe_idx={moe_idx} "
-                        f"eb_sum={eb_l.sum().item():.10e} eb_abs={eb_l.abs().sum().item():.10e} "
-                        f"eb_sq={eb_l.float().pow(2).sum().item():.10e} "
-                        f"tpe_sum={tpe_l.sum().item():.10e} "
-                        f"tpe={tpe_l.tolist()}"
-                    )
-                moe_idx += 1
-
-        # Per-rank GLOBAL aggregate of params + optimizer state + grads.
-        # This is the critical per-shard fingerprint: a non-rank-0 shard
-        # can drift while rank 0's shard matches normal_run, which would
-        # only show up in a per-rank global.
-        global_param_sum = 0.0
-        global_param_abs = 0.0
-        global_param_sq = 0.0
-        global_grad_sum = 0.0
-        global_grad_abs = 0.0
-        global_grad_sq = 0.0
-        global_ea_sum = 0.0
-        global_ea_abs = 0.0
-        global_ea_sq = 0.0
-        global_eas_sum = 0.0
-        for opt in self.optimizers:
-            for group in opt.param_groups:
-                for p in group["params"]:
-                    p_local = (
-                        p._local_tensor if hasattr(p, "_local_tensor") else p
-                    )
-                    pf = p_local.float()
-                    global_param_sum += pf.sum().item()
-                    global_param_abs += pf.abs().sum().item()
-                    global_param_sq += pf.pow(2).sum().item()
-                    if include_grad and p.grad is not None:
-                        g_local = (
-                            p.grad._local_tensor
-                            if hasattr(p.grad, "_local_tensor")
-                            else p.grad
-                        )
-                        gf = g_local.float()
-                        global_grad_sum += gf.sum().item()
-                        global_grad_abs += gf.abs().sum().item()
-                        global_grad_sq += gf.pow(2).sum().item()
-                    state = opt.state.get(p, {})
-                    ea = state.get("exp_avg")
-                    eas = state.get("exp_avg_sq")
-                    if ea is not None:
-                        ea_local = (
-                            ea._local_tensor
-                            if hasattr(ea, "_local_tensor")
-                            else ea
-                        )
-                        eaf = ea_local.float()
-                        global_ea_sum += eaf.sum().item()
-                        global_ea_abs += eaf.abs().sum().item()
-                        global_ea_sq += eaf.pow(2).sum().item()
-                    if eas is not None:
-                        eas_local = (
-                            eas._local_tensor
-                            if hasattr(eas, "_local_tensor")
-                            else eas
-                        )
-                        global_eas_sum += eas_local.float().sum().item()
-        msg = (
-            f"[STATE/{tag}] rank={rank} step={self.step} RANK_GLOBAL "
-            f"param_sum={global_param_sum:.10e} param_abs={global_param_abs:.10e} "
-            f"param_sq={global_param_sq:.10e} "
-            f"exp_avg_sum={global_ea_sum:.10e} exp_avg_abs={global_ea_abs:.10e} "
-            f"exp_avg_sq={global_ea_sq:.10e} "
-            f"exp_avg_sq_sum={global_eas_sum:.10e}"
-        )
-        if include_grad:
-            msg += (
-                f" grad_sum={global_grad_sum:.10e} "
-                f"grad_abs={global_grad_abs:.10e} grad_sq={global_grad_sq:.10e}"
-            )
-        logger.info(msg)
-
-        # Non-zero ranks stop here. Rest of dump (full buffer walk +
-        # per-param sample) is rank-0 only.
-        if rank != 0:
-            return
-
-        # Fingerprint EVERY buffer (persistent and non-persistent) across
-        # all model parts. Walk via named_buffers(remove_duplicate=False) so
-        # we don't miss any buffer (FSDP wrappers, AC wrappers, etc.). Tag
-        # each entry with persistence so we can grep/diff easily.
-        seen_buf_ids = set()
-        np_sum = np_abs = np_sq = 0.0
-        np_count = 0
-        p_sum = p_abs = p_sq = 0.0
-        p_count = 0
-        for mp_idx, mp in enumerate(self.model_parts):
-            for mod_name, module in mp.named_modules(remove_duplicate=False):
-                non_persistent = getattr(
-                    module, "_non_persistent_buffers_set", set()
-                )
-                buffers_dict = getattr(module, "_buffers", {})
-                for buf_name, buf in buffers_dict.items():
-                    if buf is None:
-                        continue
-                    bid = id(buf)
-                    if bid in seen_buf_ids:
-                        continue
-                    seen_buf_ids.add(bid)
-                    b_local = (
-                        buf._local_tensor if hasattr(buf, "_local_tensor") else buf
-                    )
-                    bf = b_local.float() if b_local.numel() else b_local
-                    s = bf.sum().item() if b_local.numel() else 0.0
-                    a = bf.abs().sum().item() if b_local.numel() else 0.0
-                    sq = bf.pow(2).sum().item() if b_local.numel() else 0.0
-                    persist = "np" if buf_name in non_persistent else "p"
-                    if persist == "np":
-                        np_sum += s; np_abs += a; np_sq += sq; np_count += 1
-                    else:
-                        p_sum += s; p_abs += a; p_sq += sq; p_count += 1
-                    full = f"{mod_name}.{buf_name}" if mod_name else buf_name
-                    logger.info(
-                        f"[STATE/{tag}] step={self.step} mp={mp_idx} {persist}_buf={full} "
-                        f"sum={s:.10e} abs={a:.10e} sq={sq:.10e} "
-                        f"shape={list(b_local.shape)} dtype={str(b_local.dtype).split('.')[-1]}"
-                    )
-        logger.info(
-            f"[STATE/{tag}] step={self.step} NP_BUF_GLOBAL count={np_count} "
-            f"sum={np_sum:.10e} abs={np_abs:.10e} sq={np_sq:.10e}"
-        )
-        logger.info(
-            f"[STATE/{tag}] step={self.step} P_BUF_GLOBAL count={p_count} "
-            f"sum={p_sum:.10e} abs={p_abs:.10e} sq={p_sq:.10e}"
-        )
-
-        def _fp(t):
-            if t is None:
-                return "(none)"
-            x = t._local_tensor if hasattr(t, "_local_tensor") else t
-            return f"sum={x.sum().item():.10e} abs={x.abs().sum().item():.10e}"
-
-        # Per-param sample (rank-0 only): first / middle / last param of
-        # each (opt, group) pair. Global aggregate is now in RANK_GLOBAL
-        # above (per-rank, covers all optimizers).
-        for opt_idx, opt in enumerate(self.optimizers):
-            for g_idx, group in enumerate(opt.param_groups):
-                params = group["params"]
-                n = len(params)
-                if n == 0:
-                    continue
-                idxs = sorted(set([0, n // 2, n - 1]))
-                for p_idx in idxs:
-                    p = params[p_idx]
-                    state = opt.state.get(p, {})
-                    ea = state.get("exp_avg")
-                    eas = state.get("exp_avg_sq")
-                    step_val = state.get("step")
-                    step_str = (
-                        step_val.item()
-                        if hasattr(step_val, "item")
-                        else step_val
-                    )
-                    msg = (
-                        f"[STATE/{tag}] step={self.step} opt={opt_idx} "
-                        f"g={g_idx} p={p_idx}/{n} param[{_fp(p)}] "
-                        f"exp_avg[{_fp(ea)}] exp_avg_sq[{_fp(eas)}] "
-                        f"step_val={step_str}"
-                    )
-                    if include_grad:
-                        msg += f" grad[{_fp(p.grad)}]"
-                    logger.info(msg)
-
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
-        self._dump_state("entry")
         self.optimizers.zero_grad()
         if self._cpu_snapshot_opt is not None:
             self._cpu_snapshot_opt.begin_snapshot()
@@ -795,21 +590,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         for _microbatch in range(self.gradient_accumulation_steps):
             # pyrefly: ignore [no-matching-overload]
             input_dict, labels = next(data_iterator)
-            inp = input_dict.get("input")
-            if inp is not None:
-                logger.info(
-                    f"[STATE/data] rank={int(os.environ.get('RANK', '0'))} "
-                    f"step={self.step} mb={_microbatch} "
-                    f"input_sum={inp.sum().item()} "
-                    f"input_first8={inp.flatten()[:8].tolist()} "
-                    f"label_sum={labels.sum().item()} "
-                    f"label_first8={labels.flatten()[:8].tolist()}"
-                )
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
         self.rmp_manager.maybe_commit(self.step)
-        logger.info(f"[Step={self.step}] RMP CPU metadata committed.")
 
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
@@ -821,7 +605,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
-        self._dump_state("post_bwd", include_grad=True)
         self.checkpointer.maybe_wait_for_staging()
 
         fault_triggered = self.maybe_inject_fault()
@@ -838,8 +621,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self._cpu_snapshot_opt.step()
             else:
                 self.optimizers.step()
-
-        self._dump_state("post_opt")
 
         self.maybe_dump_optimizer_info()
 
