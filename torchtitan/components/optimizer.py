@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import os
 from typing import Any, Generic, Iterator, TypeVar
 
 import torch
@@ -426,6 +427,41 @@ def build_optimizers_with_moe_load_balancing(
                         tokens_per_expert.mean() - tokens_per_expert
                     )
                     expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
+                    # [DEBUG] Pre-hook diagnostic: print full state for EVERY
+                    # MoE layer so we can diff per-layer between normal and
+                    # recovery runs.
+                    if int(os.environ.get("RANK", "0")) == 0:
+                        from torchtitan.tools.logging import logger as _logger
+                        tpe_local = transformer_block.moe.tokens_per_expert
+                        tpe_local_t = (
+                            tpe_local._local_tensor
+                            if hasattr(tpe_local, "_local_tensor")
+                            else tpe_local
+                        )
+                        eb_local = moe.expert_bias
+                        eb_local_t = (
+                            eb_local._local_tensor
+                            if hasattr(eb_local, "_local_tensor")
+                            else eb_local
+                        )
+                        delta_local_t = (
+                            expert_bias_delta._local_tensor
+                            if hasattr(expert_bias_delta, "_local_tensor")
+                            else expert_bias_delta
+                        )
+                        tpe_post_local_t = (
+                            tokens_per_expert._local_tensor
+                            if hasattr(tokens_per_expert, "_local_tensor")
+                            else tokens_per_expert
+                        )
+                        _logger.info(
+                            f"[EXPERT_BIAS_DEBUG] layer_idx={moe_layer_idx - 1} "
+                            f"tpe_pre_allreduce={tpe_local_t.tolist()} "
+                            f"tpe_post_allreduce={tpe_post_local_t.tolist()} "
+                            f"delta_sum={delta_local_t.sum().item():.10e} "
+                            f"delta={delta_local_t.tolist()} "
+                            f"expert_bias_pre={eb_local_t.tolist()}"
+                        )
                     moe.expert_bias.add_(expert_bias_delta)
                     moe.tokens_per_expert.zero_()
 
