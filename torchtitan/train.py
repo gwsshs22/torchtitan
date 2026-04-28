@@ -776,6 +776,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self._dump_state("entry")
+        # Reset tokens_per_expert at every step entry. In normal flow this is a
+        # no-op (it's already zeroed at the tail of _update_expert_bias). On the
+        # first step after a TRANSIENT recovery the dying process may have been
+        # killed mid-forward, leaving leftover counts in the RMP-backed buffer;
+        # zeroing here restores the invariant that tpe == 0 before forward.
+        from torchtitan.models.moe.moe import MoE
+        with torch.no_grad():
+            for mp in self.model_parts:
+                for module in mp.modules():
+                    if isinstance(module, MoE) and module.tokens_per_expert is not None:
+                        module.tokens_per_expert.zero_()
         self.optimizers.zero_grad()
         if self._cpu_snapshot_opt is not None:
             self._cpu_snapshot_opt.begin_snapshot()
@@ -831,15 +842,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dist.barrier()
         
 
-        # if not fault_triggered:
-        #     if self._resilient_opt is not None:
-        #         self._resilient_opt.step()
-        #     elif self._cpu_snapshot_opt is not None:
-        #         self._cpu_snapshot_opt.step()
-        #     else:
-        #         self.optimizers.step()
-        self.optimizers.step()
-        self._resilient_opt._step_counter += 1
+        if not fault_triggered:
+            if self._resilient_opt is not None:
+                self._resilient_opt.step()
+            elif self._cpu_snapshot_opt is not None:
+                self._cpu_snapshot_opt.step()
+            else:
+                self.optimizers.step()
 
         self._dump_state("post_opt")
 
@@ -911,10 +920,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             resume_step = int(buf[1].item())
 
             if not any_lacks:
-                # self._resilient_opt_recover(resume_step)
-                self.rmp_manager.load_cpu_metadata(resume_step)
-                self.lr_schedulers.step()
-                self.step = resume_step
+                self._resilient_opt_recover(resume_step)
             else:
                 self.checkpointer.load(step=job_config.checkpoint.load_step)
                 self._resilient_opt.bind()
