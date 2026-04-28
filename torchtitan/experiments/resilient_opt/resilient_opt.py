@@ -32,11 +32,14 @@ Usage:
 
 import random
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch.cuda._pin_memory_utils import pin_memory
 from torch.distributed._tensor import DTensor
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+from torch.distributed.tensor import Replicate
 
 from leto.rmp.client import RmpClient, TensorSpec
 from torchtitan.tools.logging import logger
@@ -48,17 +51,25 @@ from torchtitan.tools.logging import logger
 #
 # Lifecycle within step():
 #   IDLE  ──fill──► PRE_RUNNING ──counter+=1──► (still PRE_RUNNING)
-#                   ──pre_hook──► fill─► PRE_DONE ──chunks──► POST_RUNNING
-#                   ──post_hook──► fill─► IDLE
+#     [if MoE balancing] ──fill─► EB_BACKUP_RUNNING ──copy tpe+eb to CPU──►
+#                        ──fill─► EB_UPDATE_RUNNING ──compute+apply+zero tpe──►
+#     ──fill─► PRE_DONE ──chunks──► POST_RUNNING ──fill─► IDLE
 #
 # The PRE_RUNNING claim is set *before* the counter bump.  That makes
 # (counter=N+1, mark=IDLE) reachable only at step-N+1 completion (not
 # during the next step's pre-bump window), which is what eliminates the
 # old (counter, marker, hook_state, params_step)-witness disambiguation.
+#
+# EB_BACKUP_RUNNING / EB_UPDATE_RUNNING split the manual MoE expert-bias
+# update so a fault mid-update can be rolled back to the pre-update CPU
+# snapshot and re-applied deterministically — replacing the previous
+# generic pre-hook invocation that had no rollback guarantee.
 _MARKER_IDLE = -1
 _MARKER_PRE_RUNNING = -2
 _MARKER_PRE_DONE = -3
 _MARKER_POST_RUNNING = -4
+_MARKER_EB_BACKUP_RUNNING = -5
+_MARKER_EB_UPDATE_RUNNING = -6
 
 
 def _get_local(tensor):
@@ -86,6 +97,25 @@ class _ParamInfo:
     flat_param: torch.Tensor = None  # type: ignore[assignment]
     flat_exp_avg: torch.Tensor = None  # type: ignore[assignment]
     flat_exp_avg_sq: torch.Tensor = None  # type: ignore[assignment]
+
+
+@dataclass
+class _MoEEntry:
+    """One MoE layer's worth of (expert_bias, tokens_per_expert) state.
+
+    Captured at construction time so the atomic update path doesn't need to
+    re-walk the model.
+    """
+
+    expert_bias: torch.Tensor  # persistent buffer, replicated across EP/TP
+    tokens_per_expert: torch.Tensor  # non-persistent buffer, accumulated in fwd
+    load_balance_coeff: float
+    ac_enabled: bool  # if True, tpe was double-counted by activation checkpoint
+    # Pre-computed flat byte views of the local tensors (for backup/restore).
+    eb_flat_uint8: torch.Tensor = None  # type: ignore[assignment]
+    tpe_flat_uint8: torch.Tensor = None  # type: ignore[assignment]
+    eb_bytes: int = 0
+    tpe_bytes: int = 0
 
 
 @dataclass
@@ -120,6 +150,8 @@ class ResilientOptimizer:
         device: torch.device,
         init_chunk_size_mb: int = 1,
         max_chunk_size_mb: int = 256,
+        model_parts: list | None = None,
+        parallel_dims: Any | None = None,
     ):
         self._optimizers = optimizers
         self._device = device
@@ -127,11 +159,27 @@ class ResilientOptimizer:
         self._max_chunk_size = max_chunk_size_mb * 1024 * 1024
         self._init_chunk_size_mb = init_chunk_size_mb
         self._max_chunk_size_mb = max_chunk_size_mb
+        self._model_parts = model_parts or []
+        self._parallel_dims = parallel_dims
+        self._loss_mesh = (
+            parallel_dims.get_optional_mesh("loss")
+            if parallel_dims is not None
+            else None
+        )
 
         # Populated by bind(). step()/maybe_recover() require bind() first.
         self._all_params: list[_ParamInfo] = []
         self._num_params = 0
         self._schedule: list[list[_SliceEntry]] = []
+
+        # MoE expert-bias state — populated below if any layer has
+        # load_balance_coeff set; otherwise stays empty and the manual
+        # update path becomes a no-op.
+        self._moe_entries: list[_MoEEntry] = self._collect_moe_entries()
+        self._has_moe = bool(self._moe_entries)
+        self._eb_backup_buffer: torch.Tensor | None = None
+        if self._has_moe:
+            self._setup_eb_backup_buffer(rmp_client)
 
         # -- CPU buffer: init_chunk_size × 3 × 3 --------------------------
         # Backs up (init_chunk_size × 3) worth of params in one copy.
@@ -173,6 +221,187 @@ class ResilientOptimizer:
         # fresh allocation; deferred because the source tensor lives in
         # optimizer state, which we don't traverse in __init__.
         self._step_counter_needs_init = step_cnt_allocated
+
+    # ------------------------------------------------------------------
+    # MoE expert-bias load balancing (manual, atomic, fault-tolerant)
+    # ------------------------------------------------------------------
+    #
+    # The auxiliary-loss-free balancing scheme (Wang et al. 2024) updates
+    # `expert_bias` from `tokens_per_expert` once per optimizer step.  It
+    # used to be wired up as a torch.optim pre-hook on the optimizer
+    # container; ResilientOptimizer would invoke it via _run_pre_hooks at
+    # step time.  But that path is non-rollbackable: a fault landing in
+    # the middle of the all-reduce or the per-layer `expert_bias.add_`
+    # leaves expert_bias / tokens_per_expert in a partially-applied state
+    # that the recovery side has no way to roll back, and replaying the
+    # pre-hook on top of zero'd or partial tpe produces a different delta.
+    #
+    # Instead we copy `(expert_bias, tokens_per_expert)` of every MoE
+    # layer into a small RMP-backed CPU buffer first, then apply the
+    # update.  Two markers split the operation:
+    #
+    #   EB_BACKUP_RUNNING : copy phase (live state untouched). On
+    #                       recovery: re-do backup + update.
+    #   EB_UPDATE_RUNNING : apply phase (live state mutated). On
+    #                       recovery: restore live from CPU, then redo
+    #                       update.
+    #
+    # If no layer has load_balance_coeff configured this whole subsystem
+    # is a no-op — _moe_entries stays empty and the markers are skipped.
+
+    def _collect_moe_entries(self) -> list[_MoEEntry]:
+        """Walk model_parts for MoE blocks with load_balance_coeff set."""
+        entries: list[_MoEEntry] = []
+        for model_part in self._model_parts:
+            layers = getattr(model_part, "layers", None)
+            if layers is None:
+                continue
+            for transformer_block in layers.values():
+                if not getattr(transformer_block, "moe_enabled", False):
+                    continue
+                moe = getattr(transformer_block, "moe", None)
+                if moe is None or moe.expert_bias is None:
+                    continue
+                coeff = getattr(moe, "load_balance_coeff", None)
+                if not coeff:
+                    continue
+                ac_enabled = (
+                    getattr(transformer_block, "checkpoint_impl", None)
+                    is CheckpointImpl.NO_REENTRANT
+                )
+                eb_local = _get_local(moe.expert_bias)
+                tpe_local = _get_local(moe.tokens_per_expert)
+                eb_bytes = eb_local.numel() * eb_local.element_size()
+                tpe_bytes = tpe_local.numel() * tpe_local.element_size()
+                entries.append(
+                    _MoEEntry(
+                        expert_bias=moe.expert_bias,
+                        tokens_per_expert=moe.tokens_per_expert,
+                        load_balance_coeff=float(coeff),
+                        ac_enabled=ac_enabled,
+                        eb_flat_uint8=eb_local.view(torch.uint8).reshape(-1),
+                        tpe_flat_uint8=tpe_local.view(torch.uint8).reshape(-1),
+                        eb_bytes=eb_bytes,
+                        tpe_bytes=tpe_bytes,
+                    )
+                )
+        return entries
+
+    def _setup_eb_backup_buffer(self, rmp_client: RmpClient) -> None:
+        """Allocate the RMP-backed CPU snapshot buffer for tpe + expert_bias."""
+        total_bytes = sum(e.eb_bytes + e.tpe_bytes for e in self._moe_entries)
+        # Tiny in absolute terms (a few KB for typical configs) but kept in
+        # RMP CPU memory so it survives a TRANSIENT recovery.
+        eb_storage, _ = rmp_client.get_or_allocate_cpu_memory(
+            "resilient/eb_backup", total_bytes,
+        )
+        pin_memory(eb_storage.data_ptr(), eb_storage.nbytes())
+        self._eb_backup_buffer = torch.empty(0, dtype=torch.uint8).set_(
+            source=eb_storage, storage_offset=0, size=(total_bytes,),
+        )
+        self._eb_backup_total_bytes = total_bytes
+
+    @torch.no_grad()
+    def _backup_moe_state(self) -> None:
+        """Copy live `(expert_bias, tokens_per_expert)` of every MoE layer to CPU."""
+        offset = 0
+        buf = self._eb_backup_buffer
+        for entry in self._moe_entries:
+            buf[offset : offset + entry.eb_bytes].copy_(
+                entry.eb_flat_uint8, non_blocking=True
+            )
+            offset += entry.eb_bytes
+            buf[offset : offset + entry.tpe_bytes].copy_(
+                entry.tpe_flat_uint8, non_blocking=True
+            )
+            offset += entry.tpe_bytes
+
+    @torch.no_grad()
+    def _restore_moe_state(self) -> None:
+        """Restore live `(expert_bias, tokens_per_expert)` from the CPU snapshot."""
+        offset = 0
+        buf = self._eb_backup_buffer
+        for entry in self._moe_entries:
+            entry.eb_flat_uint8.copy_(
+                buf[offset : offset + entry.eb_bytes], non_blocking=True
+            )
+            offset += entry.eb_bytes
+            entry.tpe_flat_uint8.copy_(
+                buf[offset : offset + entry.tpe_bytes], non_blocking=True
+            )
+            offset += entry.tpe_bytes
+
+    def _atomic_update_expert_bias(self) -> None:
+        """Backup → marker transition → apply update.
+
+        No-op when no MoE layer has load_balance_coeff configured.  When
+        called as part of `step()`, this leaves the marker at
+        EB_UPDATE_RUNNING; the caller is responsible for transitioning to
+        PRE_DONE once the apply completes.
+        """
+        if not self._has_moe:
+            return
+        self._marker.fill_(_MARKER_EB_BACKUP_RUNNING)
+        self._backup_moe_state()
+        self._marker.fill_(_MARKER_EB_UPDATE_RUNNING)
+        self._do_expert_bias_update()
+
+    @torch.no_grad()
+    def _do_expert_bias_update(self) -> None:
+        """Compute and apply the per-layer expert_bias delta, then zero tpe.
+
+        Mirrors `_update_expert_bias` from torchtitan.components.optimizer
+        but operates on the precomputed `_MoEEntry` list — no model walk
+        and no `_optimizer_step_pre_hooks` lookup.
+        """
+        if not self._moe_entries:
+            return
+
+        tpe_list = []
+        for entry in self._moe_entries:
+            tpe = entry.tokens_per_expert
+            if entry.ac_enabled:
+                # Selective AC double-counts in fwd+bwd-recompute, so halve.
+                # We use *float* division (not `// 2`) so the half is exact:
+                # the upstream pre-hook used `// 2` (integer floor), which
+                # breaks `sign(mean(tpe) - tpe)` invariance under the
+                # `(leftover + 2x) / 2` arithmetic that arises when a
+                # mid-step kill leaves a per-layer leftover proportional
+                # to one or two forward passes.  Floor rounding on odd
+                # 3x perturbs `mean - per_expert` by up to ±0.5 and can
+                # flip the sign for experts close to the mean.  Float /2
+                # keeps every per-expert value at exactly `(c+2)/2 * x_i`
+                # for c ∈ {0,1,2}, so `mean - per_expert` is a uniform
+                # (c+2)/2 scaling of the fault-free expression and the
+                # sign — and therefore the delta — matches the no-fault
+                # path bit-identically.
+                tpe = tpe.float() * 0.5
+            tpe_list.append(tpe)
+
+        tokens_per_expert_by_layer = torch.vstack(tpe_list)
+
+        if self._loss_mesh is not None:
+            if isinstance(
+                tokens_per_expert_by_layer, torch.distributed.tensor.DTensor
+            ):
+                tokens_per_expert_by_layer = tokens_per_expert_by_layer.redistribute(
+                    placements=[Replicate()]
+                    * tokens_per_expert_by_layer.device_mesh.ndim
+                )
+            else:
+                pg = self._loss_mesh.get_group()
+                torch.distributed.all_reduce(
+                    tokens_per_expert_by_layer,
+                    group=pg,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+
+        for layer_idx, entry in enumerate(self._moe_entries):
+            tpe = tokens_per_expert_by_layer[layer_idx].float()
+            delta = entry.load_balance_coeff * torch.sign(tpe.mean() - tpe)
+            delta = delta - delta.mean()
+            entry.expert_bias.add_(delta)
+            entry.tokens_per_expert.zero_()
 
     def bind(self):
         """(Re)bind to the optimizer's current state and rebuild the schedule.
@@ -271,42 +500,31 @@ class ResilientOptimizer:
     def step(self):
         """Fault-tolerant optimizer step with 3-step doubling.
 
-        Order matches torch.optim.Optimizer.step():
-            pre-hooks → param/state update → post-hooks.
+        Order:
+            (claim) → counter bump → MoE expert-bias update → chunked AdamW.
 
-        The marker walks through PRE_RUNNING → PRE_DONE → chunk markers →
-        POST_RUNNING → IDLE so each phase is unambiguously identifiable on
-        recovery. PRE_RUNNING is claimed *before* the counter bump so the
+        The marker walks through PRE_RUNNING → (EB_BACKUP_RUNNING →
+        EB_UPDATE_RUNNING) → PRE_DONE → chunk markers → POST_RUNNING →
+        IDLE so each phase is unambiguously identifiable on recovery.
+        PRE_RUNNING is claimed *before* the counter bump so the
         post-completion (counter=N+1, mark=IDLE) state can't be confused
         with the next step's pre-bump window.
+
+        We do NOT invoke `_optimizer_step_pre_hooks` /
+        `_optimizer_step_post_hooks` from here.  The expert-bias balancing
+        — the only pre-hook that matters in production — is implemented
+        in-line via `_atomic_update_expert_bias()` so a fault mid-update
+        can be rolled back to the CPU snapshot.  Post-hooks are
+        intentionally skipped (the only registered one is the model
+        converter post-hook, which is a no-op for bf16).
         """
         self._marker.fill_(_MARKER_PRE_RUNNING)
         self._step_counter += 1
-        self._run_pre_hooks()
+        self._atomic_update_expert_bias()
         self._marker.fill_(_MARKER_PRE_DONE)
         self._run_chunks(resume_from=0)
         self._marker.fill_(_MARKER_POST_RUNNING)
-        self._run_post_hooks()
         self._marker.fill_(_MARKER_IDLE)
-
-    def _run_pre_hooks(self):
-        container = self._optimizers
-        if not hasattr(container, "_optimizer_step_pre_hooks"):
-            return
-        for hook in container._optimizer_step_pre_hooks.values():
-            result = hook(container, (), {})
-            if result is not None:
-                raise RuntimeError(
-                    "ResilientOptimizer does not support pre-hooks that "
-                    "rewrite step() args/kwargs"
-                )
-
-    def _run_post_hooks(self):
-        container = self._optimizers
-        if not hasattr(container, "_optimizer_step_post_hooks"):
-            return
-        for hook in container._optimizer_step_post_hooks.values():
-            hook(container, (), {})
 
     def _run_chunks(self, resume_from: int):
         """Execute chunks starting from resume_from.
@@ -343,20 +561,23 @@ class ResilientOptimizer:
             resume_step: the step number this recovery should produce.
                 Must equal step_counter or step_counter + 1.
 
-        Assumes optimizer states, gradients, and hook-mutated buffers
-        (e.g. expert_bias, tokens_per_expert) persist in RMP across faults.
-        Committed chunks and completed hooks are not re-applied.
+        Assumes optimizer states, gradients, and the per-MoE-layer
+        ``(expert_bias, tokens_per_expert)`` buffers persist in RMP across
+        faults.  The expert-bias update is rolled back via the dedicated
+        CPU snapshot (``_eb_backup_buffer``) for the EB_UPDATE_RUNNING
+        marker; for every other in-flight marker we re-do the relevant
+        phase from scratch.  Committed chunks are not re-applied.
 
-        Post-hook is assumed idempotent (current users are
-        _model_converters.post_optimizer_hook, no-op for bf16 / safe to
-        re-run for mxfp8 weight reconversion); it is re-invoked on any
-        recovery that produces step `resume_step` to keep the path simple.
-        Pre-hook (e.g. _update_expert_bias) is non-idempotent and
-        contains an all_reduce; on a PRE_RUNNING fault we use the
-        params-step witness to distinguish "claim made, counter never
-        bumped" (skip pre-hook) from "counter bumped, fault in pre-hook"
-        (re-run), so cross-rank consistency holds — otherwise the all_reduce
-        deadlocks when ranks diverge.
+        Cross-rank consistency: the only branch that issues a collective
+        is ``_atomic_update_expert_bias`` (its all-reduce over
+        ``loss_mesh``).  We use the params-step witness on PRE_RUNNING to
+        distinguish "claim before counter bump" (skip; no collective)
+        from "counter bumped, fault in eb-update or pre-chunks window"
+        (run the full pipeline including the collective).  Ranks at
+        EB_BACKUP_RUNNING / EB_UPDATE_RUNNING / PRE_DONE / chunk markers
+        all run the eb-update path during recovery (PRE_DONE re-runs only
+        chunks; the others re-run eb-update + chunks), keeping
+        loss-mesh peers in lockstep.
         """
         stored = self._step_counter.item()
         marker_val = self._marker.item()
@@ -380,7 +601,7 @@ class ResilientOptimizer:
         )
 
         if marker_val == _MARKER_IDLE:
-            # Step fully done. The pre-claim invariant (PRE_RUNNING is set
+            # Step fully done.  The pre-claim invariant (PRE_RUNNING is set
             # before the next step's counter bump) means IDLE at this
             # counter value can only come from the trailing fill_(IDLE) of
             # the just-completed step — no witness check needed.
@@ -396,15 +617,14 @@ class ResilientOptimizer:
             #     before counter += 1 — narrow window).  params[0].step
             #     is at the prior step's value == stored.  No work to do
             #     beyond resetting the mark.
-            #   * counter bumped, fault landed in/around pre-hook.
-            #     params[0].step is at stored - 1 (chunks for the new
-            #     step haven't run yet).  Run the full pipeline.
+            #   * counter bumped, fault landed before EB_BACKUP_RUNNING
+            #     was claimed.  params[0].step is at stored - 1 (chunks
+            #     for the new step haven't run yet).  Run the full
+            #     pipeline.
             #
-            # This is the one branch that still needs the params-step
-            # witness; cross-rank consistency depends on it because
-            # _run_pre_hooks does an all_reduce (expert-bias balancing)
-            # that would deadlock if some ranks took this branch and
-            # others were at IDLE.
+            # This branch needs the params-step witness because the eb
+            # update path issues an all_reduce that would deadlock with
+            # peers at IDLE.
             params_step = int(self._all_params[0].step.item())
             if params_step == stored:
                 self._marker.fill_(_MARKER_IDLE)
@@ -414,30 +634,62 @@ class ResilientOptimizer:
                 )
                 return False
 
-            self._run_pre_hooks()
+            self._atomic_update_expert_bias()
             self._marker.fill_(_MARKER_PRE_DONE)
             self._run_chunks(resume_from=0)
             self._marker.fill_(_MARKER_POST_RUNNING)
-            self._run_post_hooks()
             self._marker.fill_(_MARKER_IDLE)
             logger.info(f"[ResilientOpt] Full step executed stored={stored}")
             return True
 
-        if marker_val == _MARKER_PRE_DONE:
-            # Pre-hook done, chunks not yet started.
+        if marker_val == _MARKER_EB_BACKUP_RUNNING:
+            # Backup was in flight (CPU snapshot may be partial); live
+            # tpe + expert_bias have not yet been mutated by the update.
+            # Re-do backup + apply, then continue with chunks.
+            self._atomic_update_expert_bias()
+            self._marker.fill_(_MARKER_PRE_DONE)
             self._run_chunks(resume_from=0)
             self._marker.fill_(_MARKER_POST_RUNNING)
-            self._run_post_hooks()
             self._marker.fill_(_MARKER_IDLE)
-            logger.info(f"[ResilientOpt] Resumed from chunk 0 after pre-hook stored={stored}")
+            logger.info(
+                f"[ResilientOpt] Recovered from EB backup; full step executed "
+                f"stored={stored}"
+            )
+            return True
+
+        if marker_val == _MARKER_EB_UPDATE_RUNNING:
+            # Update was in flight: live tpe + expert_bias may have been
+            # partially mutated; the CPU snapshot from the BACKUP phase is
+            # complete and authoritative.  Restore live state, re-apply
+            # the update (no need to re-do the backup — CPU already has
+            # the pre-update state).
+            self._restore_moe_state()
+            self._marker.fill_(_MARKER_EB_UPDATE_RUNNING)
+            self._do_expert_bias_update()
+            self._marker.fill_(_MARKER_PRE_DONE)
+            self._run_chunks(resume_from=0)
+            self._marker.fill_(_MARKER_POST_RUNNING)
+            self._marker.fill_(_MARKER_IDLE)
+            logger.info(
+                f"[ResilientOpt] Recovered from EB update; full step executed "
+                f"stored={stored}"
+            )
+            return True
+
+        if marker_val == _MARKER_PRE_DONE:
+            # Eb-update done, chunks not yet started.
+            self._run_chunks(resume_from=0)
+            self._marker.fill_(_MARKER_POST_RUNNING)
+            self._marker.fill_(_MARKER_IDLE)
+            logger.info(
+                f"[ResilientOpt] Resumed from chunk 0 after pre-phase stored={stored}"
+            )
             return True
 
         if marker_val == _MARKER_POST_RUNNING:
-            # Chunks done; post-hook may or may not have run.  Idempotent,
-            # so re-run.
-            self._run_post_hooks()
+            # Chunks done; nothing else to run (no post-hooks).
             self._marker.fill_(_MARKER_IDLE)
-            logger.info(f"[ResilientOpt] Re-ran post-hook stored={stored}")
+            logger.info(f"[ResilientOpt] Cleared POST_RUNNING stored={stored}")
             return True
 
         # marker_val >= 0: chunk in flight.
@@ -451,7 +703,6 @@ class ResilientOptimizer:
             self._restore_faulted_chunk(fault_chunk)
         self._run_chunks(resume_from=fault_chunk)
         self._marker.fill_(_MARKER_POST_RUNNING)
-        self._run_post_hooks()
         self._marker.fill_(_MARKER_IDLE)
         logger.info(f"[ResilientOpt] Recovery complete stored={stored}")
         return True

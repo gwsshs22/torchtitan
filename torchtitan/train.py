@@ -776,17 +776,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self._dump_state("entry")
-        # Reset tokens_per_expert at every step entry. In normal flow this is a
-        # no-op (it's already zeroed at the tail of _update_expert_bias). On the
-        # first step after a TRANSIENT recovery the dying process may have been
-        # killed mid-forward, leaving leftover counts in the RMP-backed buffer;
-        # zeroing here restores the invariant that tpe == 0 before forward.
-        from torchtitan.models.moe.moe import MoE
-        with torch.no_grad():
-            for mp in self.model_parts:
-                for module in mp.modules():
-                    if isinstance(module, MoE) and module.tokens_per_expert is not None:
-                        module.tokens_per_expert.zero_()
         self.optimizers.zero_grad()
         if self._cpu_snapshot_opt is not None:
             self._cpu_snapshot_opt.begin_snapshot()

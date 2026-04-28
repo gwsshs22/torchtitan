@@ -634,6 +634,8 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
             ctx.optimizers,
             ctx.rmp_manager.rmp_client,
             ctx.device,
+            model_parts=ctx.model_parts,
+            parallel_dims=ctx.parallel_dims,
         )
         if ctx.rmp_restored:
             ctx.rmp_manager.restore_param_gradients(ctx.model_parts)
