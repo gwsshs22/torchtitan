@@ -48,6 +48,7 @@ try:
         EVENT_TRAINING_STARTED,
         EVENT_STEP_DONE,
         DURATION_ITERATION,
+        kill_standby_for_oom_safeguard,
     )
     _LETO_AVAILABLE = True
 except ImportError:
@@ -264,6 +265,47 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"on rank {global_rank}"
         )
         return True
+
+    def maybe_alloc_for_oom_test(self) -> None:
+        """OOM-safeguard test hook: allocate a fresh CUDA tensor at a
+        configured step to force a cache-miss expansion that should drop
+        free GPU MiB below `oom_safeguard_threshold_mb` and trigger the
+        kill-standby callback.
+
+        The allocation is held only briefly and then freed; we don't need
+        to hold the memory after the safeguard has reclaimed standby's
+        memory and the allocator has retried."""
+        leto_cfg = self.job_config.leto
+        if leto_cfg.oom_test_alloc_step <= 0 or leto_cfg.oom_test_alloc_mb <= 0:
+            return
+        if self.step != leto_cfg.oom_test_alloc_step:
+            return
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_mb_before = int(free_b // (1024 * 1024))
+        total_mb = int(total_b // (1024 * 1024))
+        alloc_mb = int(leto_cfg.oom_test_alloc_mb)
+        n_floats = (alloc_mb * 1024 * 1024) // 4  # float32 = 4 bytes
+        logger.info(
+            f"[oom_test] rank={rank} step={self.step}: free={free_mb_before}MiB "
+            f"total={total_mb}MiB; allocating {alloc_mb}MiB (threshold="
+            f"{leto_cfg.oom_safeguard_threshold_mb}MiB)"
+        )
+        try:
+            self._oom_tensor = torch.empty(n_floats, dtype=torch.float32, device="cuda")
+        except torch.cuda.OutOfMemoryError as e:
+            free_b_after, _ = torch.cuda.mem_get_info()
+            logger.error(
+                f"[oom_test] rank={rank} OOM during test alloc despite safeguard: "
+                f"free_now={int(free_b_after // (1024 * 1024))}MiB; err={e}"
+            )
+            return
+        free_b_after, _ = torch.cuda.mem_get_info()
+        logger.info(
+            f"[oom_test] rank={rank} step={self.step}: alloc OK; "
+            f"free_after={int(free_b_after // (1024 * 1024))}MiB; freeing"
+        )
 
     def maybe_reset_after_fault(self):
         """Reset dataloader and lr scheduler if the previous step faulted and nocommit is enabled."""
@@ -664,10 +706,34 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             extra_metrics=extra_metrics,
         )
 
+    def _maybe_install_oom_safeguard(self):
+        # OOM safeguard: install only now that we've reached training. By
+        # construction this rank is active (original or post-promotion) —
+        # pre-activation standbys never get here because they're parked
+        # in run_init_sequence polling for activation. This guarantees
+        # KillStandby is only ever issued by an active rank.
+        if self.job_config.leto.oom_safeguard_threshold_mb > 0:
+            from torchtitan.components.mem import install_oom_safeguard
+            from torchtitan.components.init.progressive import get_free_mb
+
+            _oom_threshold_mb = int(self.job_config.leto.oom_safeguard_threshold_mb)
+            _oom_rank = int(os.environ.get("RANK", -1))
+
+            def _on_oom() -> bool:
+                return kill_standby_for_oom_safeguard(
+                    get_free_mb(), _oom_threshold_mb, rank=_oom_rank
+                )
+
+            install_oom_safeguard(_oom_threshold_mb, _on_oom)
+            logger.info(
+                f"OOM safeguard installed: threshold={_oom_threshold_mb}MiB "
+                f"rank={_oom_rank}"
+            )
+
     @record
     def train(self):
         job_config = self.job_config
-
+        self._maybe_install_oom_safeguard()
         if job_config.leto.enable_rmp_gpu:
             # One all_reduce instead of two: pack the metadata-vote and
             # resume_step into a single MAX-reduced tensor.
@@ -708,6 +774,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
             global_batch_size = job_config.training.local_batch_size * self._batch_degree
+
 
         logger.info(
             "Trainer is initialized with "
@@ -765,6 +832,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 _iter_start = time.monotonic()
 
+                self.maybe_alloc_for_oom_test()
                 self.maybe_reset_after_fault()
 
                 # Run validation if validator is available

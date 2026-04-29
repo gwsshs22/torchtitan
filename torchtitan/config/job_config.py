@@ -1140,6 +1140,28 @@ class Leto:
     enable_cpu_snapshot_opt: bool = False
     """Use AsyncCpuSnapshotOptimizer baseline (mutually exclusive with enable_rmp_gpu)."""
 
+    oom_safeguard_threshold_mb: int = 0
+    """If > 0, install a CUDACachingAllocator FreeMemoryCallback in the active
+    training process that synchronously kills the local standby torchrun group
+    when free GPU MiB falls below this threshold during cache-miss expansion.
+    The worker controller relaunches a fresh standby in the background. 0 disables.
+    Only takes effect on non-standby ranks and when the leto worker controller
+    client is reachable (i.e., LETO_WORKER_CONTROLLER_PORT is set)."""
+
+    oom_test_alloc_step: int = 0
+    """Test hook for the OOM safeguard. If > 0, allocate a fresh CUDA tensor
+    of size `oom_test_alloc_mb` MiB at the start of this training step on
+    every active rank. The allocation is sized to be a cache-miss expansion
+    (so the FreeMemoryCallback fires) and is freed immediately afterwards.
+    0 disables. Use together with oom_safeguard_threshold_mb to verify the
+    end-to-end kill+relaunch path."""
+
+    oom_test_alloc_mb: int = 0
+    """MiB of GPU memory to allocate at oom_test_alloc_step. Should be sized
+    so that free GPU MiB before allocation < oom_safeguard_threshold_mb (so
+    the kill callback actually fires) and so the allocation can succeed
+    after the standby is killed."""
+
 @dataclass
 class JobConfig:
     """
