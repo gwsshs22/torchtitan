@@ -407,13 +407,17 @@ def maybe_wait_for_resuming(ctx: InitContext) -> None:
             action = poll_standby_status()
         except Exception:
             logger.warning("Error while polling standby status", exc_info=True)
-            sys.exit(0)
+            # os._exit (not sys.exit) because @record on Trainer.__init__
+            # swallows SystemExit(0); we need a hard exit to prevent the
+            # process from continuing into train() with a half-initialized
+            # Trainer.
+            os._exit(0)
         if action == STANDBY_ACTION_ACTIVATE:
             logger.info("Standby activated - resuming initialization")
             return
         elif action == STANDBY_ACTION_TERMINATE:
             logger.info("Standby terminated")
-            sys.exit(0)
+            os._exit(0)
         time.sleep(poll_interval)
 
 
@@ -430,7 +434,7 @@ def _standby_wait_for_allocation_flag(
         (worker controller is promoting us — keep going so the caller
         can do the allocation itself).
 
-    On STANDBY_ACTION_TERMINATE (or a poll error), logs and ``sys.exit(0)``.
+    On STANDBY_ACTION_TERMINATE (or a poll error), logs and ``os._exit(0)``.
 
     No-op if leto isn't available or this isn't a standby.
     """
@@ -476,7 +480,10 @@ def _standby_wait_for_allocation_flag(
                 f"[RMP] standby TERMINATE while waiting for {kind} allocation "
                 f"flag after {elapsed:.2f}s"
             )
-            sys.exit(0)
+            # os._exit (not sys.exit): @record on Trainer.__init__ swallows
+            # SystemExit(0), leaving the Trainer half-initialized and
+            # crashing in train().
+            os._exit(0)
 
         time.sleep(poll_interval)
 
@@ -986,7 +993,9 @@ def _run_progressive_sequence(
                         break
                     if extra == STANDBY_ACTION_TERMINATE:
                         logger.info("[progressive] standby terminated")
-                        sys.exit(0)
+                        # os._exit (not sys.exit): @record on
+                        # Trainer.__init__ swallows SystemExit(0).
+                        os._exit(0)
             logger.info(
                 f"[progressive] task={name} delta_mb={delta_mb:.1f} → running"
             )
