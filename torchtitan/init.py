@@ -803,17 +803,7 @@ def eager_init_nccl_loss(ctx: InitContext) -> None:
     _eager_init_mesh(ctx, "loss")
 
 def warmup_stages(ctx: InitContext) -> None:
-    if ctx.job_config.leto.enable_standby:
-        if not (_LETO_AVAILABLE and leto_is_standby()):
-            return
-
-    maybe_warmup_stages(
-        ctx.model_parts,
-        ctx.job_config,
-        loss_fn=ctx.loss_fn,
-        pp_has_last_stage=getattr(ctx, "pp_has_last_stage", True),
-        parallel_dims=ctx.parallel_dims,
-    )
+    return
 
 # ---------------------------------------------------------------------------
 # Initialization sequences
