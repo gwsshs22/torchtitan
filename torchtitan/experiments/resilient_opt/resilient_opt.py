@@ -172,10 +172,19 @@ class ResilientOptimizer:
         self._num_params = 0
         self._schedule: list[list[_SliceEntry]] = []
 
-        # MoE expert-bias state — populated below if any layer has
-        # load_balance_coeff set; otherwise stays empty and the manual
-        # update path becomes a no-op.
-        self._moe_entries: list[_MoEEntry] = self._collect_moe_entries()
+        # MoE expert-bias state — only populated when the standard path
+        # would also do load balancing. The signal is whether the
+        # OptimizersContainer has any step pre-hook registered (which
+        # ``build_optimizers_with_moe_load_balancing`` does, but the
+        # plain ``build_optimizers`` doesn't). Mirroring the standard
+        # path's behavior keeps loss bit-identical between RMP-GPU and
+        # no-RMP runs for both kinds of MoE models.
+        std_has_eb_hook = bool(
+            getattr(optimizers, "_optimizer_step_pre_hooks", None)
+        )
+        self._moe_entries: list[_MoEEntry] = (
+            self._collect_moe_entries() if std_has_eb_hook else []
+        )
         self._has_moe = bool(self._moe_entries)
         self._eb_backup_buffer: torch.Tensor | None = None
         if self._has_moe:
