@@ -1074,8 +1074,14 @@ class Leto:
     If False (default), the commit body runs on a background thread
     scheduled from train_step after all microbatches have been dispatched."""
 
-    rmp_server_port: int = 52051
-    """Base port for RMP servers. Actual port = rmp_server_port + local_rank."""
+    rmp_server_port: int = 29051
+    """Base port for RMP servers. Actual port = rmp_server_port + local_rank.
+
+    Chosen below the kernel's default ephemeral range (32768-60999) so random
+    outgoing TCP connections never collide with our listeners. The worker
+    controller rotates this base by 0/100/.../900 per launch (see
+    RmpProcessGroup), staying clear of the torchrun rendezvous ports
+    (29610-29625 active, 29710-29725 standby)."""
 
     enable_standby: bool = False
     """If True, launch standby torchrun group for faster fault recovery."""
