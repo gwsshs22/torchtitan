@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from torchtitan.tools.logging import logger
+
 class CheckpointLoadAction(Enum):
     NONE = auto()
     LOCAL = auto()
@@ -46,7 +48,14 @@ class SnapshotGroup:
         self._peer_p2p_rank = None
 
         if dist.is_initialized():
+            logger.info(
+                f"[SnapshotGroup] rank={self._global_rank} entering "
+                f"dist.new_group(backend='gloo')"
+            )
             self._gloo_pg = dist.new_group(backend="gloo")
+            logger.info(
+                f"[SnapshotGroup] rank={self._global_rank} gloo PG created"
+            )
 
             # Create 2-rank P2P subgroups (one per peer pair)
             # All ranks must call new_group for every pair (it's a global collective)
@@ -54,8 +63,16 @@ class SnapshotGroup:
             all_pairs = [None] * self._global_world_size
             dist.all_gather_object(all_pairs, my_pair, group=self._gloo_pg)
             unique_pairs = sorted(set(all_pairs))
+            logger.info(
+                f"[SnapshotGroup] rank={self._global_rank} all_gather_object done; "
+                f"{len(unique_pairs)} pair PGs to create"
+            )
 
-            for pair in unique_pairs:
+            for i, pair in enumerate(unique_pairs):
+                logger.info(
+                    f"[SnapshotGroup] rank={self._global_rank} new_group "
+                    f"{i+1}/{len(unique_pairs)} pair={pair}"
+                )
                 pg = dist.new_group(
                     ranks=list(pair),
                     device_id=torch.device("cuda", torch.cuda.current_device()),
@@ -64,6 +81,9 @@ class SnapshotGroup:
                     self._p2p_pg = pg
 
             self._peer_p2p_rank = 1 - dist.get_rank(self._p2p_pg)
+            logger.info(
+                f"[SnapshotGroup] rank={self._global_rank} all pair PGs ready"
+            )
 
     @property
     def global_rank(self) -> int:
