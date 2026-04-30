@@ -48,14 +48,7 @@ class SnapshotGroup:
         self._peer_p2p_rank = None
 
         if dist.is_initialized():
-            logger.info(
-                f"[SnapshotGroup] rank={self._global_rank} entering "
-                f"dist.new_group(backend='gloo')"
-            )
             self._gloo_pg = dist.new_group(backend="gloo")
-            logger.info(
-                f"[SnapshotGroup] rank={self._global_rank} gloo PG created"
-            )
 
             # Create 2-rank P2P subgroups (one per peer pair)
             # All ranks must call new_group for every pair (it's a global collective)
@@ -69,10 +62,6 @@ class SnapshotGroup:
             )
 
             for i, pair in enumerate(unique_pairs):
-                logger.info(
-                    f"[SnapshotGroup] rank={self._global_rank} new_group "
-                    f"{i+1}/{len(unique_pairs)} pair={pair}"
-                )
                 pg = dist.new_group(
                     ranks=list(pair),
                     device_id=torch.device("cuda", torch.cuda.current_device()),

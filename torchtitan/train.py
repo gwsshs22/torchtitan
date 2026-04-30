@@ -156,6 +156,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if hasattr(self, "checkpointer") and self.checkpointer is not None:
             self.checkpointer.states["train_state"] = self
 
+        self._oom_safeguard_installed = False
+
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
@@ -748,6 +750,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
     def _maybe_install_oom_safeguard(self):
+        if self._oom_safeguard_installed:
+            return
+        self._oom_safeguard_installed = True
         # OOM safeguard: install only now that we've reached training. By
         # construction this rank is active (original or post-promotion) —
         # pre-activation standbys never get here because they're parked
@@ -775,7 +780,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        self._maybe_install_oom_safeguard()
         if job_config.leto.enable_rmp_gpu:
             # One all_reduce instead of two: pack the metadata-vote and
             # resume_step into a single MAX-reduced tensor.
@@ -940,6 +944,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         int(os.environ["LOCAL_RANK"]),
                     )
                     progressive_signal_started = True
+                self._maybe_install_oom_safeguard()
 
 
         # Wait for any pending checkpoint tracking to complete

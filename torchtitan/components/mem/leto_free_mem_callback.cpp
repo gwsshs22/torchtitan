@@ -131,9 +131,6 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     }
     int free_mb_cuda = static_cast<int>(free_b / (1024ULL * 1024ULL));
     int total_mb_cuda = static_cast<int>(total_b / (1024ULL * 1024ULL));
-    // std::fprintf(stderr,
-    //              "[leto] free=%d MiB / total=%d MiB (cuda)\n",
-    //              free_mb_cuda, total_mb_cuda);
 
     int threshold;
     {
@@ -145,6 +142,9 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     }
     g_num_kill_standby_called.fetch_add(1, std::memory_order_relaxed);
 
+    std::fprintf(stderr,
+             "[leto] Kill standby. free=%d MiB / total=%d MiB (cuda), threshold=%d\n",
+             free_mb_cuda, total_mb_cuda, threshold);
     // Below threshold — invoke the registered Python kill callback under
     // the GIL. Synchronous: when the call returns, the standby's
     // worker-controller-side kill has been awaited; the kernel may still
