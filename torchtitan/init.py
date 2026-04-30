@@ -124,7 +124,6 @@ class InitContext:
     step: int = 0
     ntokens_seen: int = 0
     _prev_step_faulted: bool = False
-    _include_rng_in_state_dict: bool = True
     _restored_step: int = 0
 
     # resilient optimizer
@@ -151,19 +150,14 @@ class InitContext:
 
     # Stateful protocol — allows checkpoint loading to restore step/ntokens/RNG
     def state_dict(self) -> dict[str, Any]:
-        state = {
+        return {
             "step": self.step,
             "ntokens_seen": self.ntokens_seen,
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
         }
-        if self._include_rng_in_state_dict:
-            state["cuda_rng_state"] = torch.cuda.get_rng_state(self.device)
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
-                state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
-        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.step = state_dict["step"]
@@ -176,10 +170,6 @@ class InitContext:
             np.random.set_state(state_dict["numpy_rng_state"])
         if "python_rng_state" in state_dict:
             random.setstate(state_dict["python_rng_state"])
-        if "dtensor_rng_state" in state_dict:
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
-                rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +599,6 @@ def init_trainer_states(ctx: InitContext) -> None:
     ctx.ntokens_seen = 0
     ctx._prev_step_faulted = False
 
-    ctx._include_rng_in_state_dict = True
-
 
 def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
     job_config = ctx.job_config
@@ -636,7 +624,7 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
         job_config.leto.enable_rmp_gpu and job_config.leto.enable_cpu_snapshot_opt
     ), "enable_rmp_gpu and enable_cpu_snapshot_opt are mutually exclusive"
 
-    if job_config.leto.enable_rmp_gpu:
+    if job_config.leto.enable_rmp_gpu and not job_config.leto.disable_resilient_opt:
         ctx._resilient_opt = ResilientOptimizer(
             ctx.optimizers,
             ctx.rmp_manager.rmp_client,

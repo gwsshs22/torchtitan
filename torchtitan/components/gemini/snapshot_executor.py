@@ -364,12 +364,6 @@ class SnapshotExecutor:
         self._p2p_copy_event_recorded = [False, False]
         self._reset_for_new_step()
 
-        if self.tp_process_group is not None:
-            dist.barrier(group=self.tp_process_group)
-        if self.pp_process_group is not None:
-            dist.barrier(group=self.pp_process_group)
-        dist.barrier(group=self._fsdp_pg)
-
         self.snapshot_container.invalidate(self._curr_version)
         cpu_metadata_state_dict = self.local_curr.snapshot_cpu_metadata_state()
         self._snapshot_future = self._snapshot_thread_pool.submit(
@@ -455,9 +449,6 @@ class SnapshotExecutor:
             curr_stream.wait_stream(self._p2p_stream)
             curr_stream.wait_event(self._local_copy_event)
 
-            if self.tp_process_group is not None:
-                dist.barrier(group=self.tp_process_group)
-            dist.barrier(group=self._fsdp_pg)
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
             # Mark snapshot step as complete
             self._is_snapshot_step = False

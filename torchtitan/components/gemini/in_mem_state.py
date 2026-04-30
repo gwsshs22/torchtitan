@@ -125,7 +125,6 @@ class InMemState:
 
         pool_view = torch.empty(0, dtype=torch.uint8)
         pool_view.set_(source=pool_storage, storage_offset=0, size=(total_bytes,))
-        pool_view[::4096].sum()  # Touch pages via read (no write to avoid data corruption).
         t2 = time.perf_counter()
 
         pin_memory(pool_storage.data_ptr(), pool_storage.nbytes())

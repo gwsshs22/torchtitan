@@ -109,13 +109,20 @@ def install_hooks(optimizer) -> HookTracker:
 
 
 def populate_grads(params, seed):
-    """Fill gradients with deterministic random values."""
+    """Fill gradients with deterministic random values, in place.
+
+    Allocates the grad buffer once on first call (when ``p.grad is None``)
+    and reuses it on every subsequent call.  ResilientOptimizer's fast
+    path captures backup CUDA graphs that bake in grad data pointers; FSDP
+    keeps those addresses stable across iters, and tests must mirror that
+    by populating in place rather than reassigning ``p.grad``.
+    """
     gen = torch.Generator(device=params[0].device)
     gen.manual_seed(seed)
     for p in params:
-        p.grad = torch.randn(
-            p.shape, dtype=p.dtype, device=p.device, generator=gen
-        )
+        if p.grad is None:
+            p.grad = torch.empty_like(p)
+        torch.randn(*p.shape, out=p.grad, generator=gen)
 
 
 def snapshot(params, optimizer):

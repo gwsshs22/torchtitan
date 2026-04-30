@@ -156,6 +156,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if hasattr(self, "checkpointer") and self.checkpointer is not None:
             self.checkpointer.states["train_state"] = self
 
+        self._oom_safeguard_installed = False
+
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
@@ -386,6 +388,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
 
+        self._resilient_opt.zero_moe_tokens_per_expert()
         self.lr_schedulers.step()
         self.step = resume_step
 
@@ -748,6 +751,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
     def _maybe_install_oom_safeguard(self):
+        if self._oom_safeguard_installed:
+            return
+        self._oom_safeguard_installed = True
         # OOM safeguard: install only now that we've reached training. By
         # construction this rank is active (original or post-promotion) —
         # pre-activation standbys never get here because they're parked
@@ -775,8 +781,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        self._maybe_install_oom_safeguard()
-        if job_config.leto.enable_rmp_gpu:
+        if job_config.leto.enable_rmp_gpu and not job_config.leto.disable_resilient_opt:
             # One all_reduce instead of two: pack the metadata-vote and
             # resume_step into a single MAX-reduced tensor.
             #   buf[0] = 1 if this rank lacks metadata else 0. After MAX,
@@ -940,6 +945,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         int(os.environ["LOCAL_RANK"]),
                     )
                     progressive_signal_started = True
+                self._maybe_install_oom_safeguard()
 
 
         # Wait for any pending checkpoint tracking to complete
@@ -956,23 +962,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.step < self.job_config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        state = {
+        # The DTensor RNG tracker is a thin wrapper over
+        # torch.cuda.default_generators, so cuda_rng_state alone covers it
+        # — no separate dtensor_rng_state.
+        return {
             "step": self.step,
             "ntokens_seen": self.ntokens_seen,
-            # RNG states for reproducibility
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
         }
-        # CUDA and DTensor rng state are omitted when the RmpManager async
-        # commit path captures them on the main thread and injects them into
-        # the metadata dict directly (see RmpManager.schedule_commit).
-        if self._include_rng_in_state_dict:
-            state["cuda_rng_state"] = torch.cuda.get_rng_state(self.device)
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
-                state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
-        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
@@ -986,11 +986,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             np.random.set_state(state_dict["numpy_rng_state"])
         if "python_rng_state" in state_dict:
             random.setstate(state_dict["python_rng_state"])
-        # Restore DTensor RNG tracker state if available
-        if "dtensor_rng_state" in state_dict:
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
-                rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
     def close(self) -> None:
         if hasattr(self, "_data_iterator") and self._data_iterator is not None:
