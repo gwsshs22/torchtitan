@@ -1,4 +1,3 @@
-from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import chain
 import pickle
 import time
@@ -8,7 +7,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.state_dict import _get_fqns
-from torch.distributed.tensor import _random as dtensor_random
 
 from torchtitan.components.checkpoint import (
     ModelWrapper,
@@ -116,9 +114,6 @@ class MetadataCircularBuffer:
             f"No slot in metadata circular buffer holds step={step}"
         )
 
-def _ms(t_start, t_end):
-    return (t_end - t_start) * 1000
-
 def get_fqns(model, name):
     fqns = _get_fqns(model, name)
     return next(iter(fqns))
@@ -151,14 +146,6 @@ class RmpManager:
         self._grad_allocator: RmpGradientAllocator | None = None
         self._allocated: bool = True  # set by maybe_init
 
-        # CPU-only barrier group for metadata commit synchronization
-        self._gloo_group = dist.new_group(backend="gloo")
-        self._gloo_warmup = dist.barrier(group=self._gloo_group, async_op=True)
-
-        self.rmp_commit_sync = leto_config.rmp_commit_sync
-        self._commit_future: Future | None = None
-        self._commit_executor: ThreadPoolExecutor | None = None
-
         if not self.enabled:
             return
 
@@ -171,14 +158,6 @@ class RmpManager:
             LR_SCHEDULER: lr_schedulers
         })
         self.lr_schedulers = lr_schedulers
-
-        if not self.skip_commit and not self.rmp_commit_sync:
-            self._commit_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="rmp-commit",
-            )
-            # Warm up: spawn the worker thread eagerly so step 0 doesn't pay
-            # thread-creation cost on the critical path.
-            self._commit_executor.submit(lambda: None).result()
 
     def maybe_init(self, buffer_device):
         if not self.enabled:
@@ -266,129 +245,26 @@ class RmpManager:
 
         return not allocated
 
-    def schedule_commit(self, step: int):
-        """Kick off the async metadata commit on the background worker.
-
-        Must be called from the main thread *after* every microbatch's
-        forward/backward has been dispatched for this step. Captures the
-        CUDA + DTensor rng state inline (cheap, main thread has the CUDA
-        context already) and hands everything else to the worker.
-        """
-        if not self.enabled or self.skip_commit or self.rmp_commit_sync:
+    def maybe_commit(self, step: int):
+        if not self.enabled or self.skip_commit:
             return
-        assert self._commit_future is None, (
-            "schedule_commit called twice without an intervening maybe_commit"
-        )
-
-        cuda_idx = self.device.index if hasattr(self.device, "index") else 0
-        cuda_gen = torch.cuda.default_generators[cuda_idx]
-        # CPU ByteTensor under gen->mutex_; the Philox offset reflects every
-        # host-side rng dispatch for this step.
-        cuda_rng = cuda_gen.get_state()
-
-        tracker = dtensor_random._rng_tracker
-        dtensor_rng = None
-        if tracker is not None and hasattr(tracker, "_get_device_state"):
-            # Same underlying generator, but we capture via the tracker so the
-            # tensor shape matches what Trainer.load_state_dict expects
-            # (it calls tracker._set_device_state(state.to(device))).
-            dtensor_rng = tracker._get_device_state().cpu()
-
-        self._commit_future = self._commit_executor.submit(
-            self._bg_commit, step, cuda_rng, dtensor_rng,
-        )
-
-    def _bg_commit(self, step: int, cuda_rng, dtensor_rng):
-        """Runs on the background worker thread. Pure CPU — no CUDA calls."""
-        t0 = time.perf_counter()
-
-        # Trainer._include_rng_in_state_dict is False in async mode, so this
-        # call does not read cuda_rng_state / dtensor_rng_state and therefore
-        # makes no CUDA API calls.
-        train_state = stateful_to_state_dict(self.states)
-        # Inject rng bytes back under the keys Trainer.load_state_dict expects.
-        train_state["cuda_rng_state"] = cuda_rng
-        if dtensor_rng is not None:
-            train_state["dtensor_rng_state"] = dtensor_rng
-        # OPTIM is not required: load_cpu_metadata never applies it (see
-        # comment in load_cpu_metadata). The non-tensor optim state is
-        # reconstructed by the next lr_scheduler.step() call.
-        metadata = {"TRAIN": train_state}
-
-        t_snapshot = time.perf_counter()
-        num_bytes = self._meta_buffer.commit(step, metadata)
-        t_commit = time.perf_counter()
-
-        if self._gloo_warmup is not None:
-            self._gloo_warmup.wait()
-            self._gloo_warmup = None
-        dist.barrier(group=self._gloo_group)
-        t_barrier = time.perf_counter()
-
-        logger.info(
-            f"Metadata commit (async): step={step}, {num_bytes} bytes, "
-            f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
-            f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
-            f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
-            f"total={_ms(t0, t_barrier):.2f} ms"
-        )
-
-    def _sync_commit(self, step: int):
-        """Inline commit on the main thread. Used when rmp_commit_sync=True
-        and for the init-time bootstrap commit in maybe_init."""
-        # torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         # OPTIM is not required: load_cpu_metadata never applies it (see
         # comment in load_cpu_metadata). The non-tensor optim state is
         # reconstructed by the next lr_scheduler.step() call.
         metadata = {"TRAIN": stateful_to_state_dict(self.states)}
-
-        # t_snapshot = time.perf_counter()
-
         num_bytes = self._meta_buffer.commit(step, metadata)
 
-        # Diagnostic: log per-step _sync_commit wall time when running the
+        # Diagnostic: log per-step commit wall time when running the
         # "only_resilient_commit" config of awsdev/performance/run_perf.sh
-        # (= disable_resilient_opt=True). Logged from every rank (per-rank
-        # log files are already separate; we want the full distribution).
+        # (= disable_resilient_opt=True).
         if self.disable_resilient_opt:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             logger.info(
                 f"_sync_commit step={step} bytes={num_bytes} "
                 f"elapsed_ms={elapsed_ms:.2f}"
             )
-
-        # t_commit = time.perf_counter()
-
-        # Ensure all ranks have committed metadata before any rank proceeds
-        # if self._gloo_warmup is not None:
-        #     self._gloo_warmup.wait()
-        #     self._gloo_warmup = None
-        # dist.barrier(group=self._gloo_group)
-
-        # t_barrier = time.perf_counter()
-        # logger.info(
-        #     f"Metadata commit: step={step}, {num_bytes} bytes, "
-        #     f"snapshot={_ms(t0, t_snapshot):.2f} ms, "
-        #     f"shm_write={_ms(t_snapshot, t_commit):.2f} ms, "
-        #     f"barrier={_ms(t_commit, t_barrier):.2f} ms, "
-        #     f"total={_ms(t0, t_barrier):.2f} ms"
-        # )
-
-    def maybe_commit(self, step: int):
-        if not self.enabled or self.skip_commit:
-            return
-        self._sync_commit(step)
-
-        # if self.rmp_commit_sync:
-        #     self._sync_commit(step)
-        #     return
-        # assert self._commit_future is not None, (
-        #     "schedule_commit must be called before maybe_commit in async mode"
-        # )
-        # self._commit_future.result()  # propagates worker exceptions
-        # self._commit_future = None
 
     def has_committed_metadata(self) -> bool:
         """True if any rank-local metadata slot holds a valid commit."""
@@ -448,12 +324,6 @@ class RmpManager:
 
     def cleanup(self):
         """Clean up resources (e.g., close RMP client connection)."""
-        if self._commit_future is not None:
-            self._commit_future.result()
-            self._commit_future = None
-        if self._commit_executor is not None:
-            self._commit_executor.shutdown(wait=True)
-            self._commit_executor = None
         if self.enabled and self.rmp_client is not None:
             self.rmp_client.close()
             self.rmp_client = None

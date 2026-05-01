@@ -962,23 +962,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.step < self.job_config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        state = {
+        # The DTensor RNG tracker is a thin wrapper over
+        # torch.cuda.default_generators, so cuda_rng_state alone covers it
+        # — no separate dtensor_rng_state.
+        return {
             "step": self.step,
             "ntokens_seen": self.ntokens_seen,
-            # RNG states for reproducibility
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.device),
         }
-        # CUDA and DTensor rng state are omitted when the RmpManager async
-        # commit path captures them on the main thread and injects them into
-        # the metadata dict directly (see RmpManager.schedule_commit).
-        if self._include_rng_in_state_dict:
-            state["cuda_rng_state"] = torch.cuda.get_rng_state(self.device)
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_get_device_state"):
-                state["dtensor_rng_state"] = rng_tracker._get_device_state().cpu()
-        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
@@ -992,11 +986,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             np.random.set_state(state_dict["numpy_rng_state"])
         if "python_rng_state" in state_dict:
             random.setstate(state_dict["python_rng_state"])
-        # Restore DTensor RNG tracker state if available
-        if "dtensor_rng_state" in state_dict:
-            rng_tracker = dtensor_random._rng_tracker
-            if rng_tracker is not None and hasattr(rng_tracker, "_set_device_state"):
-                rng_tracker._set_device_state(state_dict["dtensor_rng_state"].to(self.device))
 
     def close(self) -> None:
         if hasattr(self, "_data_iterator") and self._data_iterator is not None:
