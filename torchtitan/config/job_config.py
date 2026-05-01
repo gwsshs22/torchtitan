@@ -1149,11 +1149,13 @@ class Leto:
     disable_resilient_opt: bool = False
     """If True with enable_rmp_gpu=True, allocate the RMP-GPU shared tensor pool
     (so model/optim params are RMP-backed) but do NOT wrap the optimizer with
-    ResilientOptimizer and do NOT commit per-step CPU metadata. The training
-    step path falls through to ``self.optimizers.step()`` and recovery happens
-    only via ``checkpointer.load`` at the start of train(). Used to isolate
-    the cost of having the GPU mirror coresident from the cost of the
-    ResilientOptimizer's per-step bookkeeping."""
+    ResilientOptimizer. The training step path falls through to
+    ``self.optimizers.step()`` and recovery happens only via
+    ``checkpointer.load`` at the start of train(). Independent of
+    ``enable_skip_commit``: the per-step ``rmp_manager.maybe_commit`` still
+    runs unless ``enable_skip_commit`` is also set. Combine with
+    ``enable_skip_commit`` to isolate the GPU mirror cost alone, or leave
+    ``enable_skip_commit`` off to isolate the CPU-metadata-commit cost."""
 
     oom_safeguard_threshold_mb: int = 0
     """If > 0, install a CUDACachingAllocator FreeMemoryCallback in the active

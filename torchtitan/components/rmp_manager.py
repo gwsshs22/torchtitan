@@ -355,6 +355,17 @@ class RmpManager:
 
         num_bytes = self._meta_buffer.commit(step, metadata)
 
+        # Diagnostic: log per-step _sync_commit wall time when running the
+        # "only_resilient_commit" config of awsdev/performance/run_perf.sh
+        # (= disable_resilient_opt=True). Logged from every rank (per-rank
+        # log files are already separate; we want the full distribution).
+        if self.disable_resilient_opt:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(
+                f"_sync_commit step={step} bytes={num_bytes} "
+                f"elapsed_ms={elapsed_ms:.2f}"
+            )
+
         # t_commit = time.perf_counter()
 
         # Ensure all ranks have committed metadata before any rank proceeds
@@ -373,7 +384,7 @@ class RmpManager:
         # )
 
     def maybe_commit(self, step: int):
-        if not self.enabled or self.skip_commit or self.disable_resilient_opt:
+        if not self.enabled or self.skip_commit:
             return
         self._sync_commit(step)
 
