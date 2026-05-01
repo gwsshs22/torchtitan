@@ -306,16 +306,14 @@ class RmpManager:
         # call does not read cuda_rng_state / dtensor_rng_state and therefore
         # makes no CUDA API calls.
         train_state = stateful_to_state_dict(self.states)
-        optim_metadata = {
-            name: v
-            for name, v in self.optimizers.state_dict().items()
-            if not isinstance(v, torch.Tensor)
-        }
         # Inject rng bytes back under the keys Trainer.load_state_dict expects.
         train_state["cuda_rng_state"] = cuda_rng
         if dtensor_rng is not None:
             train_state["dtensor_rng_state"] = dtensor_rng
-        metadata = {"TRAIN": train_state, "OPTIM": optim_metadata}
+        # OPTIM is not required: load_cpu_metadata never applies it (see
+        # comment in load_cpu_metadata). The non-tensor optim state is
+        # reconstructed by the next lr_scheduler.step() call.
+        metadata = {"TRAIN": train_state}
 
         t_snapshot = time.perf_counter()
         num_bytes = self._meta_buffer.commit(step, metadata)
@@ -341,15 +339,10 @@ class RmpManager:
         # torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        optim_metadata = {}
-        metadata = {
-            "TRAIN": stateful_to_state_dict(self.states),
-            "OPTIM": optim_metadata,
-        }
-
-        for name, v in self.optimizers.state_dict().items():
-            if not isinstance(v, torch.Tensor):
-                optim_metadata[name] = v
+        # OPTIM is not required: load_cpu_metadata never applies it (see
+        # comment in load_cpu_metadata). The non-tensor optim state is
+        # reconstructed by the next lr_scheduler.step() call.
+        metadata = {"TRAIN": stateful_to_state_dict(self.states)}
 
         # t_snapshot = time.perf_counter()
 
