@@ -388,6 +388,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
 
+        self._resilient_opt.zero_moe_tokens_per_expert()
         self.lr_schedulers.step()
         self.step = resume_step
 

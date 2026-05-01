@@ -491,6 +491,20 @@ class ResilientOptimizer:
         """Return the current step counter value."""
         return self._step_counter.item()
 
+    @torch.no_grad()
+    def zero_moe_tokens_per_expert(self) -> None:
+        """Zero the per-MoE-layer ``tokens_per_expert`` buffer on this rank.
+
+        Intended to be called from the recovery driver in train.py *after*
+        ``maybe_recover`` has finished — by that point every recovery branch
+        that legitimately reads tpe (EB_BACKUP_RUNNING / EB_UPDATE_RUNNING /
+        PRE_DONE / chunk markers) has already consumed it, and zeroing here
+        only clobbers values the standby would otherwise carry into its
+        first post-promotion forward pass.
+        """
+        for entry in self._moe_entries:
+            entry.tokens_per_expert.zero_()
+
     def resync_after_external_load(self):
         """Re-sync RMP-backed scalars to the just-loaded optimizer state.
 
