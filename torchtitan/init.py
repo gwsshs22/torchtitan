@@ -636,7 +636,7 @@ def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
         job_config.leto.enable_rmp_gpu and job_config.leto.enable_cpu_snapshot_opt
     ), "enable_rmp_gpu and enable_cpu_snapshot_opt are mutually exclusive"
 
-    if job_config.leto.enable_rmp_gpu:
+    if job_config.leto.enable_rmp_gpu and not job_config.leto.disable_resilient_opt:
         ctx._resilient_opt = ResilientOptimizer(
             ctx.optimizers,
             ctx.rmp_manager.rmp_client,

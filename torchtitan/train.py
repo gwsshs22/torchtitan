@@ -781,7 +781,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        if job_config.leto.enable_rmp_gpu:
+        if job_config.leto.enable_rmp_gpu and not job_config.leto.disable_resilient_opt:
             # One all_reduce instead of two: pack the metadata-vote and
             # resume_step into a single MAX-reduced tensor.
             #   buf[0] = 1 if this rank lacks metadata else 0. After MAX,

@@ -134,6 +134,7 @@ class RmpManager:
         dataloader,
         device):
         self.enabled = leto_config.enable_rmp_gpu
+        self.disable_resilient_opt = leto_config.disable_resilient_opt
         self.device = device
 
         if self.enabled or leto_config.enable_rmp_cpu:
@@ -372,7 +373,7 @@ class RmpManager:
         # )
 
     def maybe_commit(self, step: int):
-        if not self.enabled or self.skip_commit:
+        if not self.enabled or self.skip_commit or self.disable_resilient_opt:
             return
         self._sync_commit(step)
 
