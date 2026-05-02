@@ -226,6 +226,10 @@ class ResilientOptimizer:
             )]
         )
         self._step_counter = step_cnt_tensors["resilient/step_counter"]
+        # 0-dim view used by _foreach_copy_ in _step_chunk to broadcast the
+        # counter into per-param state["step"] tensors (shapes must match
+        # pairwise). Avoids the per-chunk `_step_counter.item()` host sync.
+        self._step_counter_0d = self._step_counter.view([])
         # Initialized from optim.state["step"] on the first bind() after a
         # fresh allocation; deferred because the source tensor lives in
         # optimizer state, which we don't traverse in __init__.
@@ -924,10 +928,20 @@ class ResilientOptimizer:
     @torch.no_grad()
     def _step_chunk(self, chunk: list[_SliceEntry]):
         """Run fused AdamW on one chunk's slices."""
-        step_val = self._step_counter.item()
-        for sl in chunk:
-            if sl.is_first_slice:
-                sl.step.fill_(step_val)
+        # Mirror step_counter into each first-slice's per-param state["step"]
+        # via a single foreach copy on the GPU. Replaces the prior
+        # `step_val = self._step_counter.item(); sl.step.fill_(step_val)`,
+        # which forced a CPU↔GPU sync once per chunk. Bit-identical to the
+        # old path: both end up with state["step"] holding the int step
+        # counter value (cast to float32 by the dtype-mismatched copy when
+        # fused-style state tensors are used).
+        first_slice_steps = [sl.step for sl in chunk if sl.is_first_slice]
+        if first_slice_steps:
+            torch._foreach_copy_(
+                first_slice_steps,
+                [self._step_counter_0d] * len(first_slice_steps),
+                non_blocking=True,
+            )
 
         by_group: dict[int, list[_SliceEntry]] = defaultdict(list)
         for sl in chunk:
