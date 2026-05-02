@@ -170,7 +170,6 @@ def test_resilient_optimizer(params, optimizer, device):
         torch.device(device),
         init_chunk_size_mb=1,
         max_chunk_size_mb=256,
-        use_cuda_graph=False,
     )
     resilient.bind()
     resilient.step()
@@ -219,7 +218,6 @@ def test_multi_step(params, optimizer, device, num_steps=5):
     rmp = MockRmpClient()
     resilient = ResilientOptimizer(
         OptimizerList(optimizer), rmp, torch.device(device),
-        use_cuda_graph=False,
     )
     resilient.bind()
     for step_i in range(num_steps):
@@ -309,7 +307,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
     for p, g in zip(params, saved_grads):
         p.grad = g.clone()
     rmp = MockRmpClient()
-    r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev, use_cuda_graph=False)
+    r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
     r.bind()
     counter = _CountingMarker(r._marker)
     r._marker = counter
@@ -363,7 +361,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
                 p.grad = g.clone()
 
             rmp = MockRmpClient()
-            r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev, use_cuda_graph=False)
+            r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
             r.bind()
             real_marker = r._marker
             r._marker = _FaultingMarker(real_marker, fault_at)
@@ -447,7 +445,7 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
             # -- 5. Recovery: new optimizer with SAME rmp --
             # Optimizer states + grads persist in RMP. No checkpoint restore.
             # maybe_recover() resumes from the interrupted chunk.
-            r2 = ResilientOptimizer(OptimizerList(optimizer), rmp, dev, use_cuda_graph=False)
+            r2 = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
             r2.bind()
 
             recovered = r2.maybe_recover(resume_step=resume_step)

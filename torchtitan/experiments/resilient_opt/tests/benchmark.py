@@ -35,24 +35,7 @@ from torchtitan.experiments.resilient_opt.tests.common import (
 
 
 def benchmark(params, optimizer, device, warmup=3, repeats=10):
-    """Measure overhead of all resilient optimizer variants.
-
-    Two grad-population strategies are needed because they exercise
-    different perf paths:
-
-      * ``populate_grads`` (default for variants that don't preserve grad
-        memory across steps): allocates a fresh tensor each call.  This
-        is what the in-process tests have always done, and it's safe for
-        the eager paths.
-
-      * ``refill_grads`` (used for the cuda-graph variant only):
-        preserves the grad tensor across steps and only refills its
-        contents.  Production with ``RmpGradientAllocator`` keeps grad
-        memory pointer-stable across steps — which is what makes a
-        captured graph remain valid — and ``populate_grads``'s alloc-
-        per-step would invalidate the captured pointers.  Refill-only
-        gives a fair measurement of the captured-graph path.
-    """
+    """Measure overhead of all resilient optimizer variants."""
 
     def measure_gpu_time(setup_fn, step_fn, warmup_count, repeat_count):
         """Measure GPU time of step_fn using CUDA events.
@@ -75,11 +58,6 @@ def benchmark(params, optimizer, device, warmup=3, repeats=10):
         total = sum(s.elapsed_time(e) for s, e in zip(starts, ends))
         return total / repeat_count
 
-    def refill_grads(params, gens):
-        """Refill existing grad tensors in place (preserves data pointers)."""
-        for p, gen in zip(params, gens):
-            get_local(p.grad).normal_(generator=gen)
-
     # -- Baseline --------------------------------------------------------------
     def vanilla_setup():
         populate_grads(params, seed=999)
@@ -88,32 +66,21 @@ def benchmark(params, optimizer, device, warmup=3, repeats=10):
 
     pre_p, pre_o = snapshot(params, optimizer)
 
-    def bench(label, mem_label, make_resilient, rmp_client=None,
-              preserve_grad_ptr=False):
+    def bench(label, mem_label, make_resilient, rmp_client=None):
         restore(params, optimizer, pre_p, pre_o)
         populate_grads(params, seed=999)
         r = make_resilient()
         if hasattr(r, "bind"):
             r.bind()
 
-        if preserve_grad_ptr:
-            # Grad memory now exists from the populate_grads above; switch
-            # to refill mode so step() always sees the same data pointers.
-            gens = [
-                torch.Generator(device=p.device).manual_seed(999 + i)
-                for i, p in enumerate(params)
-            ]
-            def setup():
-                refill_grads(params, gens)
-        else:
-            def setup():
-                restore(params, optimizer, pre_p, pre_o)
-                populate_grads(params, seed=999)
+        def setup():
+            restore(params, optimizer, pre_p, pre_o)
+            populate_grads(params, seed=999)
 
         avg_ms = measure_gpu_time(setup, r.step, warmup, repeats)
         overhead = (avg_ms - vanilla_ms) / vanilla_ms * 100
         print(
-            f"  {label:<28s}  {mem_label:>12s}  "
+            f"  {label:<20s}  {mem_label:>12s}  "
             f"{avg_ms:10.2f}  {overhead:>+9.1f}%"
         )
         if rmp_client is not None:
@@ -152,10 +119,6 @@ def benchmark(params, optimizer, device, warmup=3, repeats=10):
     )
 
     # -- Exponential bootstrap -------------------------------------------------
-    # Each (init, max) is benchmarked twice: once eager (use_cuda_graph=False,
-    # the historical baseline) and once with the captured-step graph
-    # (use_cuda_graph=True, preserving grad pointer across steps so the
-    # captured graph remains valid).
     for init_mb, max_mb in [(1, 256), (1, 512), (2, 256), (2, 512), (4, 256), (4, 512)]:
         cpu_mb = init_mb * 9
         rmp = MockRmpClient()
@@ -165,21 +128,8 @@ def benchmark(params, optimizer, device, warmup=3, repeats=10):
             lambda i=init_mb, m=max_mb, r=rmp: ResilientOptimizer(
                 opt_list, r, dev,
                 init_chunk_size_mb=i, max_chunk_size_mb=m,
-                use_cuda_graph=False,
             ),
             rmp_client=rmp,
-        )
-        rmp_g = MockRmpClient()
-        bench(
-            f"exp-{init_mb}/{max_mb} +cuda_graph",
-            f"0 (CPU {cpu_mb})",
-            lambda i=init_mb, m=max_mb, r=rmp_g: ResilientOptimizer(
-                opt_list, r, dev,
-                init_chunk_size_mb=i, max_chunk_size_mb=m,
-                use_cuda_graph=True,
-            ),
-            rmp_client=rmp_g,
-            preserve_grad_ptr=True,
         )
 
     # -- Chunked ---------------------------------------------------------------
