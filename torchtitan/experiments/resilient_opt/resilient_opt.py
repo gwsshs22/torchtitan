@@ -152,6 +152,7 @@ class ResilientOptimizer:
         max_chunk_size_mb: int = 256,
         model_parts: list | None = None,
         parallel_dims: Any | None = None,
+        use_cuda_graph: bool = True,
     ):
         self._optimizers = optimizers
         self._device = device
@@ -171,6 +172,24 @@ class ResilientOptimizer:
         self._all_params: list[_ParamInfo] = []
         self._num_params = 0
         self._schedule: list[list[_SliceEntry]] = []
+
+        # CUDA graph state.  When enabled, the very first step() captures the
+        # full step body into a graph; subsequent step()s replay it, avoiding
+        # the per-chunk Python loop and per-chunk host sync that drove the
+        # original CPU overhead.  Captured on demand because tensor pointers
+        # (params, optim state, RS-output grad buffers) only become stable
+        # after bind() and the first backward.  Disabled when fault injection
+        # is active (the marker.fill_ monkey-patch can't be captured) or when
+        # MoE eb-update is present (its in-line all_reduce isn't worth the
+        # nccl-in-graph complexity for the typical workload).
+        self._use_cuda_graph = use_cuda_graph
+        self._step_graph: torch.cuda.CUDAGraph | None = None
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._fault_injection_enabled = False
+        # GPU scalar tensors per param_group, used as fused_adamw's lr arg
+        # so lr-scheduler updates flow into the captured kernel without
+        # rebaking the float into the C++ call. Built/refreshed in bind().
+        self._lr_tensors: dict[int, torch.Tensor] = {}
 
         # MoE expert-bias state — only populated when the standard path
         # would also do load balancing. The signal is whether the
@@ -226,6 +245,9 @@ class ResilientOptimizer:
             )]
         )
         self._step_counter = step_cnt_tensors["resilient/step_counter"]
+        # 0-dim view used by _foreach_copy_ to broadcast the counter into the
+        # 0-dim per-param state["step"] tensors (shapes must match pairwise).
+        self._step_counter_0d = self._step_counter.view([])
         # Initialized from optim.state["step"] on the first bind() after a
         # fresh allocation; deferred because the source tensor lives in
         # optimizer state, which we don't traverse in __init__.
@@ -475,12 +497,21 @@ class ResilientOptimizer:
             torch.cuda.current_stream().synchronize()
             self._step_counter_needs_init = False
 
+        # Refresh per-group GPU lr tensors. Group identities (id(group)) may
+        # have changed since the last bind (load_state_dict installs new
+        # param_group dicts), so we rebuild the dict against the current
+        # groups; a previously-captured graph references the *old* lr
+        # tensor objects and is therefore invalidated.
+        self._refresh_lr_tensors()
+        self._invalidate_graph()
+
         logger.info(
             f"[ResilientOpt] bound {self._num_params} params, "
             f"{len(self._schedule)} chunks, "
             f"init_chunk: {self._init_chunk_size_mb} MB, "
             f"max_chunk: {self._max_chunk_size_mb} MB, "
-            f"CPU buffer: {self._cpu_buffer_bytes / (1024**2):.1f} MB"
+            f"CPU buffer: {self._cpu_buffer_bytes / (1024**2):.1f} MB, "
+            f"cuda_graph: {self._use_cuda_graph}"
         )
 
     # ------------------------------------------------------------------
@@ -519,6 +550,11 @@ class ResilientOptimizer:
         self._step_counter.fill_(int(self._all_params[0].step.item()))
         self._marker.fill_(_MARKER_IDLE)
         torch.cuda.current_stream().synchronize()
+        # The captured graph baked in pointers to the pre-load tensors;
+        # after gemini overwrites params/state in place these *may* still be
+        # the same memory, but the safe move is to recapture on the next
+        # step rather than rely on that.
+        self._invalidate_graph()
 
     def step(self):
         """Fault-tolerant optimizer step with 3-step doubling.
@@ -540,6 +576,37 @@ class ResilientOptimizer:
         can be rolled back to the CPU snapshot.  Post-hooks are
         intentionally skipped (the only registered one is the model
         converter post-hook, which is a no-op for bf16).
+
+        Fast path: when ``use_cuda_graph`` is on (the default) and the
+        eager body is graph-capturable, the very first step() captures
+        the body into a CUDA graph; subsequent calls launch a single
+        replay.  That eliminates the per-chunk Python loop and the
+        per-chunk ``_step_counter.item()`` host sync that were the
+        dominant CPU overhead in the eager path.
+        """
+        # lr scheduler ticks each step; mirror the current Python lr into
+        # the GPU scalar tensor that fused_adamw_ reads from.  Done from
+        # *outside* the captured body so each replay sees the up-to-date
+        # value (the captured kernel only records the read address, not
+        # the value).  The eager fallback path also needs this — _step_chunk
+        # always reads from the GPU lr tensor regardless of whether the
+        # body is being captured, replayed, or run eagerly.
+        self._sync_lr_tensors_to_gpu()
+        if self._can_use_graph():
+            if self._step_graph is None:
+                self._capture_step_graph()
+            else:
+                self._step_graph.replay()
+            return
+        self._eager_step_body()
+
+    def _eager_step_body(self):
+        """Eager step body — also the body that gets captured into the graph.
+
+        Stays in this method so capture sees exactly the same op sequence
+        (and the same Python-level views, which is what fixes the data
+        pointers recorded into the captured kernels) that the eager fall-
+        back path executes.
         """
         self._marker.fill_(_MARKER_PRE_RUNNING)
         self._step_counter += 1
@@ -548,6 +615,96 @@ class ResilientOptimizer:
         self._run_chunks(resume_from=0)
         self._marker.fill_(_MARKER_POST_RUNNING)
         self._marker.fill_(_MARKER_IDLE)
+
+    def _can_use_graph(self) -> bool:
+        """Predicate: is graph mode safe right now?
+
+        Disabled when:
+          * use_cuda_graph=False at construction time
+          * fault injection is enabled — the marker.fill_ monkey-patch
+            doesn't apply to captured kernels, so graph mode would silently
+            skip the simulated faults
+          * MoE eb-update is present — its loss-mesh all_reduce is a
+            stream-captured nccl collective, which is supported but adds
+            enough complexity (process-group capture mode, etc.) that we
+            fall back to eager for the typical workload that has it
+        """
+        return (
+            self._use_cuda_graph
+            and not self._fault_injection_enabled
+            and not self._has_moe
+        )
+
+    def _invalidate_graph(self) -> None:
+        """Drop any captured graph so the next step() recaptures.
+
+        Called from bind() / resync_after_external_load(), since both
+        operations may relocate the tensors whose pointers the captured
+        graph baked in.
+        """
+        self._step_graph = None
+        self._capture_stream = None
+
+    def _refresh_lr_tensors(self) -> None:
+        """(Re)build the per-group lr tensor dict against current groups.
+
+        Called from bind().  Identity-keyed by ``id(group)`` because that
+        is what ``_step_chunk`` uses to look the tensor up; load_state_dict
+        installs fresh group dicts so the prior id mapping is stale.
+        Existing tensors are *not* reused across binds — that would extend
+        the lifetime of the captured graph's references in ways that are
+        easy to get subtly wrong.
+        """
+        new_tensors: dict[int, torch.Tensor] = {}
+        for optimizer in self._optimizers:
+            for group in optimizer.param_groups:
+                gid = id(group)
+                if gid in new_tensors:
+                    continue
+                new_tensors[gid] = torch.tensor(
+                    float(group["lr"]),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+        self._lr_tensors = new_tensors
+
+    def _sync_lr_tensors_to_gpu(self) -> None:
+        """Copy current group['lr'] (Python float) into the GPU lr scalars.
+
+        Runs once per step on the calling stream (i.e. before graph
+        replay), so the captured fused_adamw_ sees the up-to-date lr.
+        Tiny (one fill_ per group, typically 1) — not worth tracking
+        last-value to elide.
+        """
+        for optimizer in self._optimizers:
+            for group in optimizer.param_groups:
+                t = self._lr_tensors.get(id(group))
+                if t is not None:
+                    t.fill_(float(group["lr"]))
+
+    def _capture_step_graph(self) -> None:
+        """Run the step body once on a side stream while capturing.
+
+        No separate warmup pass: the kernels we use (fill_, copy_,
+        add_, _foreach_copy_, _fused_adamw_) don't need cuBLAS / cuDNN
+        handle priming, and warming up would require snapshotting +
+        restoring optimizer state to keep the first-call semantics
+        right.  Capture itself executes the body once on the side
+        stream, advancing optim state by exactly one step, which is
+        what the caller expects on the very first ``step()`` call.
+        """
+        capture_stream = torch.cuda.Stream(device=self._device)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=capture_stream):
+            self._eager_step_body()
+
+        torch.cuda.current_stream().wait_stream(capture_stream)
+
+        self._step_graph = g
+        self._capture_stream = capture_stream
+        logger.info("[ResilientOpt] Captured step CUDA graph")
 
     def _run_chunks(self, resume_from: int):
         """Execute chunks starting from resume_from.
@@ -738,6 +895,12 @@ class ResilientOptimizer:
         near-zero overhead (one random.random() call).
 
         Seeds RNG from time so each process launch gets a different sequence.
+
+        Disables CUDA graph mode for the rest of this object's lifetime —
+        the patched Python method only runs during eager execution; once a
+        kernel is recorded into a graph, replaying it bypasses the patch
+        and silently skips every simulated fault.  Any already-captured
+        graph is dropped so the next step() falls back to eager.
         """
         import time
         rng = random.Random(time.time_ns())
@@ -754,6 +917,8 @@ class ResilientOptimizer:
             return original_fill(value)
 
         self._marker.fill_ = _faulting_fill
+        self._fault_injection_enabled = True
+        self._invalidate_graph()
 
     # ------------------------------------------------------------------
     # Internal: schedule, cursor, harvest
@@ -924,16 +1089,27 @@ class ResilientOptimizer:
     @torch.no_grad()
     def _step_chunk(self, chunk: list[_SliceEntry]):
         """Run fused AdamW on one chunk's slices."""
-        step_val = self._step_counter.item()
-        for sl in chunk:
-            if sl.is_first_slice:
-                sl.step.fill_(step_val)
+        # Mirror step_counter into each first-slice's per-param state["step"]
+        # via a single foreach copy on the GPU.  This replaces the prior
+        # `step_val = self._step_counter.item(); sl.step.fill_(step_val)`,
+        # which forced a host sync once per chunk and is not capturable
+        # into a CUDA graph.  Bit-identical to the old path: both end up
+        # with state["step"] holding the integer step_counter value (cast
+        # to float32 by the dtype-mismatched copy when fused-style state
+        # tensors are used).
+        first_slice_steps = [sl.step for sl in chunk if sl.is_first_slice]
+        if first_slice_steps:
+            torch._foreach_copy_(
+                first_slice_steps,
+                [self._step_counter_0d] * len(first_slice_steps),
+                non_blocking=True,
+            )
 
         by_group: dict[int, list[_SliceEntry]] = defaultdict(list)
         for sl in chunk:
             by_group[id(sl.group)].append(sl)
 
-        for group_slices in by_group.values():                
+        for group_slices in by_group.values():
             group = group_slices[0].group
             params = []
             grads = []
@@ -956,7 +1132,7 @@ class ResilientOptimizer:
                 params, grads, exp_avgs, exp_avg_sqs,
                 [], steps,
                 amsgrad=False,
-                lr=group["lr"],
+                lr=self._lr_tensors[id(group)],
                 beta1=group["betas"][0],
                 beta2=group["betas"][1],
                 weight_decay=group["weight_decay"],
