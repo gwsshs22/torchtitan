@@ -79,6 +79,31 @@ def _get_local(tensor):
     return tensor
 
 
+def _make_group_step_lambda(
+    group, params, exp_avgs, exp_avg_sqs, steps, grad_specs,
+    beta1, beta2, weight_decay, eps,
+):
+    """Factory that closes over the args (avoids the loop-var late-binding trap)."""
+    def lam():
+        grads = []
+        for sl, start, end in grad_specs:
+            flat = _get_local(sl.param_ref.grad).view(-1)
+            sl.flat_grad = flat
+            grads.append(flat[start:end])
+        torch._fused_adamw_(
+            params, grads, exp_avgs, exp_avg_sqs,
+            [], steps,
+            amsgrad=False,
+            lr=group["lr"],
+            beta1=beta1, beta2=beta2,
+            weight_decay=weight_decay, eps=eps,
+            maximize=False,
+            grad_scale=None,
+            found_inf=None,
+        )
+    return lam
+
+
 @dataclass
 class _ParamInfo:
     """Per-parameter info with pre-computed flat views (no alloc in hot path)."""
@@ -137,6 +162,18 @@ class _SliceEntry:
     flat_grad: torch.Tensor = None  # set at step time (grad may change)
 
 
+@dataclass
+class _ChunkCache:
+    """Per-chunk fast-path state, lazily populated on the first normal step()."""
+
+    backup_graph: "torch.cuda.CUDAGraph | None" = None
+    # Side stream the backup graph was captured on. Retained so the graph's
+    # recorded stream associations stay alive for the lifetime of the cache.
+    backup_capture_stream: "torch.cuda.Stream | None" = None
+    # Nullary callables that issue the kernels for this chunk's _step_chunk.
+    step_lambdas: "list | None" = None
+
+
 class ResilientOptimizer:
     """Zero-GPU-overhead resilient optimizer.
 
@@ -171,6 +208,29 @@ class ResilientOptimizer:
         self._all_params: list[_ParamInfo] = []
         self._num_params = 0
         self._schedule: list[list[_SliceEntry]] = []
+
+        # Per-chunk fast-path cache (one entry per chunk, lazily filled on the
+        # first normal step()).  Each entry holds:
+        #   * backup_graph: CUDA graph capturing _backup_chunk_scatter for
+        #     this chunk (fixed src/dst pointers across iters).
+        #   * backup_capture_stream: side stream the graph was captured on
+        #     (kept alive so the graph's recorded ops stay valid).
+        #   * step_lambdas: list of nullary callables that re-issue the
+        #     _step_chunk kernels.  Lambdas re-read group["lr"] each call
+        #     (lr_scheduler ticks per step) and re-resolve param.grad each
+        #     call (FSDP may reallocate grads on zero_grad(set_to_none=True)).
+        # Invalidated on bind() / resync_after_external_load() / after
+        # maybe_recover() because tensor pointers may have shifted.
+        # Disabled entirely during maybe_recover via _recovery_in_progress.
+        # Assumption: param / param.grad / optim-state buffer addresses are
+        # stable across iterations once bind() has run. FSDP's FlatParameter
+        # reuses the grad shard across iters; param storage doesn't move
+        # outside of explicit reshard/load events (which invalidate via
+        # bind / resync_after_external_load / maybe_recover).  Synthetic
+        # tests that reassign tensors on every step must populate in
+        # place to honor this assumption.
+        self._chunk_caches: list[_ChunkCache] = []
+        self._recovery_in_progress = False
 
         # MoE expert-bias state — only populated when the standard path
         # would also do load balancing. The signal is whether the
@@ -479,6 +539,12 @@ class ResilientOptimizer:
             torch.cuda.current_stream().synchronize()
             self._step_counter_needs_init = False
 
+        # Caches reference _SliceEntry / param-state tensor pointers and
+        # captured CUDA graphs that bake in those addresses. bind() rebuilds
+        # the schedule and re-views state tensors, so any prior cache is
+        # stale.
+        self._invalidate_chunk_caches()
+
         logger.info(
             f"[ResilientOpt] bound {self._num_params} params, "
             f"{len(self._schedule)} chunks, "
@@ -523,6 +589,10 @@ class ResilientOptimizer:
         self._step_counter.fill_(int(self._all_params[0].step.item()))
         self._marker.fill_(_MARKER_IDLE)
         torch.cuda.current_stream().synchronize()
+        # Captured graphs reference the pre-load tensor addresses; while the
+        # data may live in the same allocator slot, gemini.load() rewrites
+        # bytes via foreach copies that aren't replay-safe. Force re-capture.
+        self._invalidate_chunk_caches()
 
     def step(self):
         """Fault-tolerant optimizer step with 3-step doubling.
@@ -561,14 +631,27 @@ class ResilientOptimizer:
 
         Caller is responsible for the post-chunks marker transition
         (POST_RUNNING) and the eventual IDLE.
+
+        Fast path: when not in recovery, _backup_chunk_scatter is replayed
+        from a per-chunk CUDA graph (captured on first call) and _step_chunk
+        invokes per-chunk cached lambdas (built on first call). Both are
+        skipped during recovery — see _recovery_in_progress — and any prior
+        cache is invalidated on bind / resync_after_external_load /
+        maybe_recover so stale tensor pointers can never be replayed.
+
+        Last-chunk harvest is skipped: its freed grad memory has no
+        consumer in this step and no carry across iterations.
         """
         freed_grad_segments: list[torch.Tensor] = []
+        last_idx = len(self._schedule) - 1
+        use_fast_path = not self._recovery_in_progress
 
         for chunk_idx, chunk in enumerate(self._schedule):
             if chunk_idx < resume_from:
                 # Committed chunk: harvest freed grad memory for scratch space.
                 self._resolve_grads(chunk)
-                self._harvest_grads(chunk, freed_grad_segments)
+                if chunk_idx < last_idx:
+                    self._harvest_grads(chunk, freed_grad_segments)
                 continue
 
             backup_dest = (
@@ -576,10 +659,30 @@ class ResilientOptimizer:
             )
 
             self._marker.fill_(chunk_idx * 2)
-            self._backup_chunk_scatter(chunk, backup_dest)
+            if use_fast_path:
+                cache = self._get_chunk_cache(chunk_idx)
+                if cache.backup_graph is None:
+                    cache.backup_graph, cache.backup_capture_stream = (
+                        self._capture_backup_graph(chunk, backup_dest)
+                    )
+                else:
+                    cache.backup_graph.replay()
+            else:
+                self._backup_chunk_scatter(chunk, backup_dest)
+
             self._marker.fill_(chunk_idx * 2 + 1)
-            self._step_chunk(chunk)
-            self._harvest_grads(chunk, freed_grad_segments)
+            if use_fast_path:
+                cache = self._get_chunk_cache(chunk_idx)
+                if cache.step_lambdas is None:
+                    cache.step_lambdas = self._build_and_run_step_lambdas(chunk)
+                else:
+                    for lam in cache.step_lambdas:
+                        lam()
+            else:
+                self._step_chunk(chunk)
+
+            if chunk_idx < last_idx:
+                self._harvest_grads(chunk, freed_grad_segments)
 
     def maybe_recover(self, resume_step: int) -> bool:
         """Detect mid-step fault and resume from the interrupted phase.
@@ -605,7 +708,20 @@ class ResilientOptimizer:
         all run the eb-update path during recovery (PRE_DONE re-runs only
         chunks; the others re-run eb-update + chunks), keeping
         loss-mesh peers in lockstep.
+
+        Recovery runs on the eager backup/step path (never the fast-path
+        graphs/lambdas): tensor pointers may have shifted across the fault
+        boundary, so any captured graph or grad reference is stale. The
+        cache is invalidated on exit so the next normal step rebuilds it.
         """
+        self._recovery_in_progress = True
+        try:
+            return self._maybe_recover_impl(resume_step)
+        finally:
+            self._recovery_in_progress = False
+            self._invalidate_chunk_caches()
+
+    def _maybe_recover_impl(self, resume_step: int) -> bool:
         stored = self._step_counter.item()
         marker_val = self._marker.item()
 
@@ -979,3 +1095,96 @@ class ResilientOptimizer:
                 grad_scale=None,
                 found_inf=None,
             )
+
+    # ------------------------------------------------------------------
+    # Per-chunk fast-path cache (CUDA-graphed backup + lambda-cached step)
+    # ------------------------------------------------------------------
+
+    def _invalidate_chunk_caches(self) -> None:
+        """Drop all per-chunk caches.  Next normal step rebuilds them."""
+        self._chunk_caches = []
+
+    def _get_chunk_cache(self, chunk_idx: int) -> _ChunkCache:
+        """Lazily allocate the per-chunk cache slot."""
+        while len(self._chunk_caches) <= chunk_idx:
+            self._chunk_caches.append(_ChunkCache())
+        return self._chunk_caches[chunk_idx]
+
+    def _capture_backup_graph(
+        self, chunk: list[_SliceEntry], segments: list[torch.Tensor],
+    ) -> "tuple[torch.cuda.CUDAGraph, torch.cuda.Stream]":
+        """Capture _backup_chunk_scatter into a CUDA graph and run it once.
+
+        The body issues async copies between fixed src views (param /
+        exp_avg / exp_avg_sq slices, all stable from bind()) and fixed dst
+        segments (cpu_buffer for chunk 0; freed_grad_segments for later
+        chunks — view objects differ across iters but data pointers are
+        stable as long as the grad shard isn't reallocated).
+
+        CUDA stream capture only RECORDS kernels; it doesn't execute them.
+        We replay() once on the default stream so the first iter's backup
+        actually happens (otherwise cpu_buffer / freed grad memory stays
+        un-initialized and a fault on this iter would restore garbage).
+        """
+        capture_stream = torch.cuda.Stream(device=self._device)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=capture_stream):
+            self._backup_chunk_scatter(chunk, segments)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        g.replay()
+        return g, capture_stream
+
+    def _build_and_run_step_lambdas(
+        self, chunk: list[_SliceEntry],
+    ) -> list:
+        """Build lambdas that re-issue _step_chunk's kernels, and run them once.
+
+        Why lambdas not a CUDA graph: lr changes every iter (lr_scheduler
+        ticks), and the previously-attempted lr-as-tensor capture broke
+        bit-identity with the standard AdamW path. Lambdas keep lr on the
+        Python-float fused_adamw_ overload while still skipping the per-iter
+        list-rebuild and per-group dict iteration.
+
+        Captured in closure (stable across iters):
+          - params / exp_avgs / exp_avg_sqs / steps slice views
+          - group dict (so group["lr"] picks up scheduler updates per call)
+          - betas / weight_decay / eps (fixed per group)
+        Re-resolved each call:
+          - grads — param.grad may be reallocated by zero_grad(set_to_none=True)
+            + backward; we also write back sl.flat_grad so a downstream
+            _harvest_grads sees the right view.
+        """
+        lambdas: list = []
+
+        # Step counter mirroring (per-chunk, GPU-only foreach copy).
+        first_slice_steps = [sl.step for sl in chunk if sl.is_first_slice]
+        if first_slice_steps:
+            step_counter_0d = self._step_counter_0d
+            sources = [step_counter_0d] * len(first_slice_steps)
+            lambdas.append(lambda: torch._foreach_copy_(
+                first_slice_steps, sources, non_blocking=True,
+            ))
+
+        by_group: dict[int, list[_SliceEntry]] = defaultdict(list)
+        for sl in chunk:
+            by_group[id(sl.group)].append(sl)
+
+        for group_slices in by_group.values():
+            group = group_slices[0].group
+            params = [sl.flat_param[sl.start : sl.end] for sl in group_slices]
+            exp_avgs = [sl.flat_exp_avg[sl.start : sl.end] for sl in group_slices]
+            exp_avg_sqs = [sl.flat_exp_avg_sq[sl.start : sl.end] for sl in group_slices]
+            steps = [sl.step for sl in group_slices]
+            grad_specs = [(sl, sl.start, sl.end) for sl in group_slices]
+            beta1, beta2 = group["betas"]
+            weight_decay = group["weight_decay"]
+            eps = group["eps"]
+            lambdas.append(_make_group_step_lambda(
+                group, params, exp_avgs, exp_avg_sqs, steps, grad_specs,
+                beta1, beta2, weight_decay, eps,
+            ))
+
+        for lam in lambdas:
+            lam()
+        return lambdas

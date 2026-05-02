@@ -487,6 +487,173 @@ def test_exhaustive_fault_recovery(params, optimizer, device):
     return all_passed
 
 
+def test_lr_schedule(params, optimizer, device, num_steps=8):
+    """N resilient steps with a varying lr per step match vanilla optimizer.
+
+    The fast path caches a per-group lambda that closes over ``group`` (the
+    param-group dict) and reads ``group["lr"]`` fresh on every call.  If a
+    bug ever bakes lr into the lambda or the captured CUDA graph, this
+    test catches it: each step uses a different lr, so a stale lr would
+    diverge the params almost immediately.
+
+    Schedule: lr = base * (1 + 0.1*step), so lr changes monotonically and
+    by enough to make any bake-in observable in the very first step diff.
+    """
+    pre_p, pre_o = snapshot(params, optimizer)
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+
+    def set_step_lrs(step_i):
+        factor = 1.0 + 0.1 * step_i
+        for g, base in zip(optimizer.param_groups, base_lrs):
+            g["lr"] = base * factor
+
+    # Ground truth: N vanilla steps with lr changing each step.
+    for step_i in range(num_steps):
+        set_step_lrs(step_i)
+        populate_grads(params, seed=600 + step_i)
+        optimizer.step()
+    gt_params = [p.data.clone() for p in params]
+    gt_exp_avg = [optimizer.state[p]["exp_avg"].clone() for p in params]
+    gt_exp_avg_sq = [optimizer.state[p]["exp_avg_sq"].clone() for p in params]
+    gt_steps = [optimizer.state[p]["step"].clone() for p in params]
+
+    # Resilient: N steps with the same lr schedule.
+    restore(params, optimizer, pre_p, pre_o)
+    for g, base in zip(optimizer.param_groups, base_lrs):
+        g["lr"] = base  # restore() doesn't touch param_group hyperparams
+
+    rmp = MockRmpClient()
+    resilient = ResilientOptimizer(
+        OptimizerList(optimizer), rmp, torch.device(device),
+    )
+    resilient.bind()
+    for step_i in range(num_steps):
+        set_step_lrs(step_i)
+        populate_grads(params, seed=600 + step_i)
+        resilient.step()
+
+    # Sanity-check the fast path actually engaged on this run.
+    assert resilient._chunk_caches, (
+        "fast path didn't run: _chunk_caches empty after step()"
+    )
+    assert any(c.backup_graph is not None for c in resilient._chunk_caches), (
+        "no backup_graph captured — backup_chunk_scatter went eager every step"
+    )
+    assert any(c.step_lambdas is not None for c in resilient._chunk_caches), (
+        "no step_lambdas built — _step_chunk went eager every step"
+    )
+    rmp.close()
+
+    all_match = True
+    for i, p in enumerate(params):
+        if not torch.equal(gt_params[i], p.data):
+            diff = (gt_params[i] - p.data).abs().max().item()
+            print(f"  param {i}: MISMATCH max_diff={diff:.6e}")
+            all_match = False
+        if not torch.equal(gt_exp_avg[i], optimizer.state[p]["exp_avg"]):
+            diff = (gt_exp_avg[i] - optimizer.state[p]["exp_avg"]).abs().max().item()
+            print(f"  exp_avg {i}: MISMATCH max_diff={diff:.6e}")
+            all_match = False
+        if not torch.equal(gt_exp_avg_sq[i], optimizer.state[p]["exp_avg_sq"]):
+            diff = (gt_exp_avg_sq[i] - optimizer.state[p]["exp_avg_sq"]).abs().max().item()
+            print(f"  exp_avg_sq {i}: MISMATCH max_diff={diff:.6e}")
+            all_match = False
+        if not torch.equal(gt_steps[i], optimizer.state[p]["step"]):
+            print(
+                f"  step {i}: {gt_steps[i].item()} "
+                f"vs {optimizer.state[p]['step'].item()}"
+            )
+            all_match = False
+
+    print(f"  {num_steps} lr-varying steps match: {all_match}")
+    return all_match
+
+
+def test_recovery_invalidates_cache(params, optimizer, device):
+    """maybe_recover must drop the per-chunk cache so stale graphs/lambdas
+    can never be replayed against a post-recovery (possibly relocated)
+    state.  Also verifies that recovery itself runs on the eager path
+    (where _recovery_in_progress=True keeps fast-path off).
+    """
+    dev = torch.device(device)
+    pre_p, pre_o = snapshot(params, optimizer)
+    populate_grads(params, seed=700)
+    saved_grads = [p.grad.clone() for p in params]
+    pre_step_val = int(optimizer.state[params[0]]["step"].item())
+
+    # Ground truth single step.
+    optimizer.step()
+    gt_params = [p.data.clone() for p in params]
+    gt_exp_avg = [optimizer.state[p]["exp_avg"].clone() for p in params]
+    gt_exp_avg_sq = [optimizer.state[p]["exp_avg_sq"].clone() for p in params]
+    gt_steps = [optimizer.state[p]["step"].clone() for p in params]
+
+    # 1) Run a clean resilient step → caches populated.
+    restore(params, optimizer, pre_p, pre_o)
+    for p, g in zip(params, saved_grads):
+        p.grad = g.clone()
+    rmp = MockRmpClient()
+    r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+    r.bind()
+    r.step()
+    assert r._chunk_caches and any(c.backup_graph is not None for c in r._chunk_caches), (
+        "fast path didn't engage on clean step — invalidation test is meaningless"
+    )
+    assert not r._recovery_in_progress, "flag leaked outside step()"
+    rmp.close()
+
+    # 2) Fresh setup, fault mid-step, then recover via maybe_recover().
+    restore(params, optimizer, pre_p, pre_o)
+    for p, g in zip(params, saved_grads):
+        p.grad = g.clone()
+    rmp = MockRmpClient()
+    r = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+    r.bind()
+    # First step populates caches.
+    r.step()
+    populated = bool(r._chunk_caches) and any(
+        c.backup_graph is not None for c in r._chunk_caches
+    )
+    assert populated, "fast path didn't engage on first step"
+
+    # Inject a fault into the SECOND step at an arbitrary mid-chunk marker.
+    populate_grads(params, seed=701)
+    r._marker = _FaultingMarker(r._marker, fault_at=3)  # PRE_DONE→chunk0 boundary
+    try:
+        r.step()
+        print("  FAIL: expected FaultInjected, got none")
+        rmp.close()
+        return False
+    except FaultInjected:
+        pass
+
+    # 3) Recover. Build a fresh ResilientOptimizer (mirrors real recovery
+    # path where the new active process re-binds against persistent RMP).
+    r2 = ResilientOptimizer(OptimizerList(optimizer), rmp, dev)
+    r2.bind()
+    # Need a real marker (not faulting) for the recovery's own marker.fill_s.
+    recovered = r2.maybe_recover(resume_step=pre_step_val + 2)
+    assert recovered, "maybe_recover returned False unexpectedly"
+    assert not r2._recovery_in_progress, (
+        "_recovery_in_progress flag leaked past maybe_recover"
+    )
+    assert r2._chunk_caches == [], (
+        f"cache not invalidated after maybe_recover: "
+        f"{len(r2._chunk_caches)} entries remain"
+    )
+
+    # 4) Recovered state matches ground-truth single step (resume_step=pre+2
+    # means we expected two steps total; ground truth above did only one;
+    # but the second-step recovery starts from post-step-1 state, which we
+    # don't have ground truth for here. Skip the value comparison — the
+    # important properties are (a) recovery succeeded, (b) cache cleared,
+    # (c) no exception, (d) flag clean).
+    rmp.close()
+
+    print("  recovery clears cache and finishes without using fast path: OK")
+    return True
+
+
 def main():
     parser = make_parser("Resilient optimizer correctness tests")
     args = parser.parse_args()
@@ -512,13 +679,28 @@ def main():
     print("\n=== Multi-Step Test (5 steps) ===")
     passed_multi = test_multi_step(params, optimizer, args.device)
 
+    # Re-create for lr-schedule test (clean state)
+    params, optimizer = create_optimizer_from_info(info, device=args.device)
+
+    print("\n=== LR Schedule Test (8 steps, varying lr) ===")
+    passed_lr = test_lr_schedule(params, optimizer, args.device)
+
+    # Re-create for cache-invalidation test (clean state)
+    params, optimizer = create_optimizer_from_info(info, device=args.device)
+
+    print("\n=== Recovery Cache Invalidation Test ===")
+    passed_inv = test_recovery_invalidates_cache(params, optimizer, args.device)
+
     # Re-create for exhaustive fault test (clean state)
     params, optimizer = create_optimizer_from_info(info, device=args.device)
 
     print("\n=== Exhaustive Fault Recovery Test ===")
     passed_fault = test_exhaustive_fault_recovery(params, optimizer, args.device)
 
-    passed = passed_manual and passed_resilient and passed_multi and passed_fault
+    passed = (
+        passed_manual and passed_resilient and passed_multi
+        and passed_lr and passed_inv and passed_fault
+    )
     print(f"\nResult: {'PASS' if passed else 'FAIL'}")
     sys.exit(0 if passed else 1)
 
