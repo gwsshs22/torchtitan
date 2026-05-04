@@ -521,7 +521,7 @@ def maybe_record_stage_inputs(
         logger.info("Stage input/output recording enabled for first iteration")
         return recorder
 
-    # Save and cleanup after first iteration
+    # Save and cleanup after first iteration.
     if step == 2 and recorder is not None:
         rank = dist.get_rank() if dist.is_initialized() else 0
         save_folder = os.path.join(
@@ -569,16 +569,30 @@ def maybe_warmup_stages(
     )
     record_path = os.path.join(record_folder, f"rank_{rank}.json")
 
-    warmup_stages(
-        model_parts,
-        record_path,
-        warmup_backward=True,
-        loss_fn=loss_fn,
-        pp_has_last_stage=pp_has_last_stage,
-        local_batch_size=job_config.training.local_batch_size,
-        seq_len=job_config.training.seq_len,
-        parallel_dims=parallel_dims,
-    )
+    mode = getattr(job_config.leto, "stage_warmup_mode", "fake")
+    if mode == "real":
+        warmup_stages_real(
+            model_parts,
+            record_path,
+            loss_fn=loss_fn,
+            pp_has_last_stage=pp_has_last_stage,
+            local_batch_size=job_config.training.local_batch_size,
+            seq_len=job_config.training.seq_len,
+            parallel_dims=parallel_dims,
+        )
+    else:
+        warmup_stages(
+            model_parts,
+            record_path,
+            warmup_backward=True,
+            loss_fn=loss_fn,
+            pp_has_last_stage=pp_has_last_stage,
+            local_batch_size=job_config.training.local_batch_size,
+            seq_len=job_config.training.seq_len,
+            parallel_dims=parallel_dims,
+        )
+
+    _reload_compiled_fx_graphs_after_warmup()
 
 
 _subclass_unwrap_debug_installed = False
@@ -658,6 +672,39 @@ def _install_subclass_unwrap_debug() -> None:
     import torch._functorch._aot_autograd.runtime_wrappers as _rw_mod
     _rw_mod.runtime_unwrap_tensor_subclasses = wrapped
 
+    # Symmetric fix for backward: when warmup-time AOT trace saw an
+    # AsyncCollectiveTensor input (because we forced ACT under fake mode
+    # in `_patch_for_fake_warmup`), AOT records the corresponding
+    # backward tangent slot as expecting ACT. At real training the
+    # tangent arrives as a plain Tensor (no live functional collective
+    # is producing the gradient), so `process_runtime_tangent`'s
+    # `maybe_coerce` finds no `__coerce_same_metadata_as_tangent__` on
+    # plain Tensor and raises. Pre-wrap such plain Tensors in ACT so
+    # the maybe_coerce path lands on ACT's coerce method, which calls
+    # `trigger_wait()` and returns a plain Tensor — matching what the
+    # graph expects after unflatten.
+    from torch._functorch._aot_autograd.schemas import (
+        SubclassCreationMeta as _SCM,
+    )
+
+    _orig_prt = _rw_mod.AOTDispatchAutograd.process_runtime_tangent
+
+    def _prt_simple(x, meta):
+        if (
+            isinstance(meta, _SCM)
+            and meta.original_subclass_type is AsyncCollectiveTensor
+            and isinstance(x, torch.Tensor)
+            and not isinstance(x, AsyncCollectiveTensor)
+        ):
+            wrapped_x = AsyncCollectiveTensor(x)
+            wrapped_x.completed = True
+            x = wrapped_x
+        return _orig_prt(x, meta)
+
+    _rw_mod.AOTDispatchAutograd.process_runtime_tangent = staticmethod(
+        _prt_simple
+    )
+
 import contextlib
 
 
@@ -674,9 +721,11 @@ def _find_ep_hooks(model_parts, method_name):
     is ``ExpertParallel.<method_name>``.
 
     Returns a list of tuples ``(hook_dict, key, orig_hook, ep_instance,
-    device_mesh)``. ``hook_dict`` is the live ``OrderedDict`` from the
+    device_mesh, fqn)``. ``hook_dict`` is the live ``OrderedDict`` from the
     submodule (``_forward_pre_hooks`` or ``_forward_hooks``), so the caller
-    can replace entries in place and restore them later.
+    can replace entries in place and restore them later. ``fqn`` is the
+    submodule's fully-qualified name within its model_part — stable across
+    record-time and warmup-time, so caller can key recorded EP state on it.
     """
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -684,32 +733,34 @@ def _find_ep_hooks(model_parts, method_name):
     hook_dict_names = ("_forward_pre_hooks", "_forward_hooks")
 
     results = []
-    for submod in _iter_all_submodules(model_parts):
-        for hook_dict_name in hook_dict_names:
-            hook_dict = getattr(submod, hook_dict_name, None)
-            if not hook_dict:
-                continue
-            for key, hook in list(hook_dict.items()):
-                closure = getattr(hook, "__closure__", None)
-                if not closure:
+    for mp_idx, mp in enumerate(model_parts):
+        for fqn, submod in mp.named_modules():
+            for hook_dict_name in hook_dict_names:
+                hook_dict = getattr(submod, hook_dict_name, None)
+                if not hook_dict:
                     continue
-                ep_inst = None
-                dm = None
-                for cell in closure:
-                    try:
-                        val = cell.cell_contents
-                    except ValueError:
+                for key, hook in list(hook_dict.items()):
+                    closure = getattr(hook, "__closure__", None)
+                    if not closure:
                         continue
-                    # Bound method of ExpertParallel.<method_name>?
-                    fn = getattr(val, "__func__", None)
-                    if fn is not None and getattr(
-                        fn, "__qualname__", ""
-                    ) == target_qualname:
-                        ep_inst = val.__self__
-                    elif isinstance(val, DeviceMesh):
-                        dm = val
-                if ep_inst is not None and dm is not None:
-                    results.append((hook_dict, key, hook, ep_inst, dm))
+                    ep_inst = None
+                    dm = None
+                    for cell in closure:
+                        try:
+                            val = cell.cell_contents
+                        except ValueError:
+                            continue
+                        # Bound method of ExpertParallel.<method_name>?
+                        fn = getattr(val, "__func__", None)
+                        if fn is not None and getattr(
+                            fn, "__qualname__", ""
+                        ) == target_qualname:
+                            ep_inst = val.__self__
+                        elif isinstance(val, DeviceMesh):
+                            dm = val
+                    if ep_inst is not None and dm is not None:
+                        full_fqn = f"mp{mp_idx}.{fqn}" if fqn else f"mp{mp_idx}"
+                        results.append((hook_dict, key, hook, ep_inst, dm, full_fqn))
     return results
 
 
@@ -731,8 +782,11 @@ def _patch_for_fake_warmup(model_parts):
       is launched below the ``__torch_dispatch__`` layer and reads
       ``data_ptr()`` on FakeTensors → illegal memory access.
 
-    MoE patches assume *perfectly balanced* token routing; shapes produced
-    match real-run shapes under that assumption.
+    MoE patches assume *perfectly balanced* token routing; the resulting
+    shapes match what the real run sees on average and stays bit-identical
+    for non-MoE workloads and gpt-oss. The remaining MoE-specific drift
+    is addressed by `stage_warmup_mode = "real"` which traces the actual
+    forward instead.
     """
     from torchtitan.distributed import expert_parallel as ep_mod
     from torchtitan.models.moe import utils as moe_utils
@@ -745,6 +799,7 @@ def _patch_for_fake_warmup(model_parts):
     from torch._dynamo.guards import GuardBuilder, CheckFunctionManager
     import torch._C._dynamo.guards as _c_guards_mod
     from torch._subclasses.fake_tensor import FakeTensor
+    import torch.distributed._functional_collectives as _fc_mod
 
     orig_token_dispatch = ep_mod.ExpertParallel._token_dispatch
     orig_token_combine = ep_mod.ExpertParallel._token_combine
@@ -761,6 +816,26 @@ def _patch_for_fake_warmup(model_parts):
     orig_empty_strided_cuda = _c_guards_mod._empty_strided_cuda
     orig_reinterpret_tensor = _c_guards_mod._reinterpret_tensor
     orig_fake_new = FakeTensor.__new__
+    orig_maybe_wrap_tensor = _fc_mod._maybe_wrap_tensor
+
+    # Disable on-disk inductor / AOT-autograd / autotune cache writes during
+    # warmup. fake-mode-compiled artifacts can land in the shared cache under
+    # keys that real-mode compiles later look up, causing real training to
+    # reuse fake-mode artifacts and drift bit-for-bit. Reads stay enabled so
+    # warmup still benefits from any real-mode entries already populated by
+    # earlier phases (warmup_run / init / normal in run_e2e.sh).
+    from torch._inductor.codecache import FxGraphCache as _FxGraphCache
+    from torch._functorch._aot_autograd.autograd_cache import (
+        AOTAutogradCache as _AOTAutogradCache,
+    )
+    from torch._inductor.runtime.autotune_cache import (
+        AutotuneCacheBundler as _AutotuneCacheBundler,
+    )
+    orig_fx_save = _FxGraphCache._save_graph
+    orig_fx_write_local = _FxGraphCache._write_to_local_cache
+    orig_aot_save = _AOTAutogradCache.save
+    orig_aot_write_local = _AOTAutogradCache._write_to_local_cache
+    orig_autotune_put = _AutotuneCacheBundler.put
 
     def fake_permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
         align = moe_utils.TOKEN_GROUP_ALIGN_SIZE_M
@@ -798,7 +873,7 @@ def _patch_for_fake_warmup(model_parts):
         )
         self.input_shape = input_shape
         self.permuted_indices = permuted_indices
-        # Assume balanced a2a: equal-sized splits across EP ranks.
+
         per_rank = routed_input.shape[0] // max(ep_degree, 1)
         self.input_splits = [per_rank] * ep_degree
         self.output_splits = [per_rank] * ep_degree
@@ -895,18 +970,17 @@ def _patch_for_fake_warmup(model_parts):
         return torch.as_strided(tensor, size, stride, offset)
 
     def fake_autotuner_run(self, *args, stream, **kwargs):
-        # Inductor Triton kernel launcher. Assumes the disk cache is already
-        # populated from a prior real run, so len(self.launchers) == 1 and we
-        # skip precompile/autotune. Skipping the actual launcher(*args) call
-        # means no GPU kernel fires with (garbage) FakeTensor-backed pointers.
-        # Warmup output tensors stay uninitialized, which is fine because
-        # we throw them away.
+        # Inductor Triton kernel launcher. We let precompile() build all
+        # candidates (it doesn't launch kernels, only compiles), but skip
+        # both autotune (which would benchmark with FakeTensor pointers and
+        # fault) and the actual launcher call. We DO NOT truncate
+        # self.launchers, so the first real-mode call will trigger the
+        # standard autotune path and pick the genuine winner — same kernel
+        # a no-warmup baseline would pick. Truncating here would lock us
+        # into the first candidate (an arbitrary choice) and produce a
+        # different bf16 reduction order than the baseline.
         if len(self.launchers) == 0:
             self.precompile()
-        if len(self.launchers) > 1:
-            # Pick the first candidate without benchmarking (autotune_to_one_
-            # config would launch kernels to measure latency).
-            self.launchers = self.launchers[:1]
         return None
 
     ep_mod.ExpertParallel._token_dispatch = fake_token_dispatch
@@ -946,9 +1020,9 @@ def _patch_for_fake_warmup(model_parts):
             return fake_token_combine(ep_inst, mod, output, device_mesh)
         return _hook
 
-    for hook_dict, key, _orig, ep_inst, dm in dispatch_hook_records:
+    for hook_dict, key, _orig, ep_inst, dm, fqn in dispatch_hook_records:
         hook_dict[key] = _make_fake_pre_hook(ep_inst, dm)
-    for hook_dict, key, _orig, ep_inst, dm in combine_hook_records:
+    for hook_dict, key, _orig, ep_inst, dm, fqn in combine_hook_records:
         hook_dict[key] = _make_fake_post_hook(ep_inst, dm)
 
     logger.info(
@@ -956,9 +1030,84 @@ def _patch_for_fake_warmup(model_parts):
         f"and {len(combine_hook_records)} _token_combine hooks"
     )
 
+    # Patch _maybe_wrap_tensor so eager-mode collective wrappers (called
+    # from within model.forward but outside any active Dynamo/AOT proxy
+    # capture) wrap their result in AsyncCollectiveTensor instead of
+    # eagerly emitting wait_tensor.
+    #
+    # Why: real training, when Dynamo enters compile region with an ACT
+    # input, AOT unflattens ACT and emits a wait_tensor op as the first
+    # node of the graph. Under our outer FakeTensorMode, _are_we_tracing
+    # returns True (FakeTensorMode is active) so _maybe_wrap_tensor
+    # short-circuits to wait_tensor(self), producing a plain tensor and
+    # the next compile region's primals are plain — no wait_tensor op
+    # in the graph. AOT's min-cut partitioner sees a different graph
+    # topology (one fewer non-fusible boundary), makes different
+    # save-vs-recompute decisions, and Inductor produces a different
+    # set of fused kernels. By forcing ACT under fake mode (when no
+    # proxy mode is active = outside compile region), we make the
+    # warmup-time AOT trace observe the same input subclass structure
+    # as real training.
+    from torch.fx.experimental.proxy_tensor import get_proxy_mode as _gpm
+    def _patched_maybe_wrap_tensor(self):
+        # Mirror real-mode `_are_we_tracing` *minus* the FakeTensorMode
+        # check. Real mode never has an outer FakeTensorMode active;
+        # warmup does (it's our top-level context). The original
+        # `_are_we_tracing` returns True under our outer FakeTensorMode,
+        # which short-circuits to `wait_tensor(self)` and produces a
+        # plain tensor — but in real mode that same call site (inside
+        # AOT metadata collection or Dynamo/AOT proxy) wraps in ACT
+        # because real mode doesn't have an outer FakeTensorMode.
+        # The result is that warmup-time AOT records different subclass
+        # metadata than real-mode would, and the resulting AOT joint
+        # graph diverges (extra/missing wait_tensor nodes).
+        #
+        # Fix: only emit wait_tensor if Dynamo / proxy / PythonDispatcher
+        # is active (which mirrors what real mode triggers). Wrap in
+        # ACT otherwise — including when our outer FakeTensorMode is
+        # the only dispatch mode active.
+        if _fc_mod.is_torchdynamo_compiling():
+            return _fc_mod.wait_tensor(self)
+        if _gpm() is not None:
+            return _fc_mod.wait_tensor(self)
+        if torch._C._dispatch_tls_is_dispatch_key_included(
+            torch._C.DispatchKey.PythonDispatcher
+        ):
+            return _fc_mod.wait_tensor(self)
+        from torch.distributed._functional_collectives import AsyncCollectiveTensor
+        return AsyncCollectiveTensor(self)
+    _fc_mod._maybe_wrap_tensor = _patched_maybe_wrap_tensor
+    # Functional-collective wrappers also import the symbol by-value at
+    # module import; rebind their callers' references too.
+    for _mod_name in (
+        "torch.distributed.tensor._dispatch",
+        "torch.distributed.tensor._redistribute",
+        "torch.distributed.tensor._collective_utils",
+    ):
+        try:
+            import importlib as _il
+            _m = _il.import_module(_mod_name)
+            if hasattr(_m, "_maybe_wrap_tensor"):
+                setattr(_m, "_maybe_wrap_tensor", _patched_maybe_wrap_tensor)
+        except Exception:
+            pass
+
+    # Replace cache writes with no-ops. Reads still work since they go through
+    # different code paths (FxGraphCache.load_with_key, AOTAutogradCache.load).
+    _FxGraphCache._save_graph = staticmethod(lambda *a, **kw: None)
+    _FxGraphCache._write_to_local_cache = staticmethod(lambda *a, **kw: None)
+    _AOTAutogradCache.save = staticmethod(lambda *a, **kw: None)
+    _AOTAutogradCache._write_to_local_cache = staticmethod(lambda *a, **kw: None)
+    _AutotuneCacheBundler.put = classmethod(lambda cls, *a, **kw: None)
+
     try:
         yield
     finally:
+        _FxGraphCache._save_graph = orig_fx_save
+        _FxGraphCache._write_to_local_cache = orig_fx_write_local
+        _AOTAutogradCache.save = orig_aot_save
+        _AOTAutogradCache._write_to_local_cache = orig_aot_write_local
+        _AutotuneCacheBundler.put = orig_autotune_put
         ep_mod.ExpertParallel._token_dispatch = orig_token_dispatch
         ep_mod.ExpertParallel._token_combine = orig_token_combine
         moe_utils._permute = orig_permute
@@ -974,9 +1123,22 @@ def _patch_for_fake_warmup(model_parts):
         _c_guards_mod._empty_strided_cuda = orig_empty_strided_cuda
         _c_guards_mod._reinterpret_tensor = orig_reinterpret_tensor
         FakeTensor.__new__ = orig_fake_new
-        for hook_dict, key, orig, _ep, _dm in dispatch_hook_records:
+        _fc_mod._maybe_wrap_tensor = orig_maybe_wrap_tensor
+        for _mod_name in (
+            "torch.distributed.tensor._dispatch",
+            "torch.distributed.tensor._redistribute",
+            "torch.distributed.tensor._collective_utils",
+        ):
+            try:
+                import importlib as _il
+                _m = _il.import_module(_mod_name)
+                if hasattr(_m, "_maybe_wrap_tensor"):
+                    setattr(_m, "_maybe_wrap_tensor", orig_maybe_wrap_tensor)
+            except Exception:
+                pass
+        for hook_dict, key, orig, _ep, _dm, _fqn in dispatch_hook_records:
             hook_dict[key] = orig
-        for hook_dict, key, orig, _ep, _dm in combine_hook_records:
+        for hook_dict, key, orig, _ep, _dm, _fqn in combine_hook_records:
             hook_dict[key] = orig
 
 
@@ -1060,10 +1222,21 @@ def warmup_stages(
         "under FakeTensorMode..."
     )
 
-    # Disable Inductor's on-disk FX graph cache during warmup so we neither
-    # read poisoned artifacts from prior warmups nor write new ones.
+    # KEEP Inductor's on-disk FX graph cache ENABLED during warmup. With
+    # the `_maybe_wrap_tensor` patch in `_patch_for_fake_warmup`, the
+    # warmup-time AOT joint graph matches the real-mode joint graph
+    # node-for-node, so the cache key is stable across modes. Real
+    # training's compile then hits the warmup-populated cache and reuses
+    # the exact same Inductor-compiled artifacts (same tiling_scores,
+    # same autotune candidate list, same chosen launcher) — bit-identity.
+    # Disabling the cache here would force real training to recompile,
+    # and the recompile would observe slightly different size hints
+    # than warmup (because Inductor's first-seen concrete shape value
+    # is what it benchmarks against, and that depends on which call
+    # site triggered the compile). Keeping the cache enabled defers the
+    # benchmark to warmup time so both runs land on the same artifact.
     prev_fx_graph_cache = inductor_config.fx_graph_cache
-    inductor_config.fx_graph_cache = False
+    inductor_config.fx_graph_cache = True
 
     # Snapshot real grads before warmup. RMP restores param.grad from the
     # active's last step on standby ranks (init.py:restore_param_gradients),
@@ -1084,7 +1257,9 @@ def warmup_stages(
     # _deserialize_args (and the real parameters inside model_part) be
     # auto-lifted to FakeTensors on dispatch, so we don't have to manually
     # convert every input or parameter.
-    with FakeTensorMode(allow_non_fake_inputs=True), _patch_for_fake_warmup(model_parts):
+    with FakeTensorMode(allow_non_fake_inputs=True), _patch_for_fake_warmup(
+        model_parts
+    ):
         # Pre-compute attention_masks ONCE using the first model_part's
         # ``get_attention_masks`` with a full-batch stub, then reuse for
         # ALL virtual stages. This is critical for PP Interleaved1F1B
@@ -1438,5 +1613,401 @@ def warmup_stages(
 
     _current_parallel_dims = None
 
+    # Reset all FSDP state-context and per-state lifecycle flags so the
+    # first real-training forward re-runs `_lazy_init` and sees a fresh
+    # state machine. Without this, warmup's forward+backward leaves
+    # `iter_forward_root`, `post_backward_final_callback_queued`,
+    # `is_last_backward`, `_training_state`, and the comm-context CUDA
+    # streams in a state that subtly skips work the baseline run does
+    # (e.g. queueing the post-backward final callback or replaying the
+    # all-gather/reduce-scatter stream creation order). Tiny ordering
+    # differences in NCCL stream submission cause ~3e-6 loss drift.
+    from torch.distributed.fsdp._fully_shard._fsdp_state import (
+        FSDPState as _FSDPState, TrainingState as _TS,
+    )
+    for mp in model_parts:
+        for mod in mp.modules():
+            get_state = getattr(mod, "_get_fsdp_state", None)
+            if get_state is None:
+                continue
+            try:
+                state = get_state()
+            except Exception:
+                continue
+            if not isinstance(state, _FSDPState):
+                continue
+            state._is_root = None
+            state._training_state = _TS.IDLE
+            ctx = getattr(state, "_state_ctx", None)
+            if ctx is not None:
+                ctx.all_states = []
+                ctx.iter_forward_root = None
+                ctx.post_backward_final_callback_queued = False
+                ctx.is_last_backward = True
+                ctx.post_optim_event = None
+            comm_ctx = getattr(state, "_comm_ctx", None)
+            if comm_ctx is not None:
+                for attr in (
+                    "all_gather_copy_in_stream", "all_gather_stream",
+                    "reduce_scatter_stream", "all_reduce_stream",
+                    "all_gather_state", "reduce_scatter_state",
+                    "post_forward_order",
+                ):
+                    if hasattr(comm_ctx, attr):
+                        try:
+                            delattr(comm_ctx, attr)
+                        except Exception:
+                            pass
+            pg = getattr(state, "_fsdp_param_group", None)
+            if pg is not None:
+                pg._training_state = _TS.IDLE
+
     torch.cuda.synchronize()
     gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def _build_warmup_attention_masks(
+    model_parts: list[torch.nn.Module],
+    local_batch_size: int,
+    seq_len: int,
+    parallel_dims: Any,
+):
+    """Pre-build the per-microbatch list of `attention_masks` to feed each
+    model_part. Mirrors the logic embedded in ``warmup_stages``: builds a
+    single set of masks via the first model_part's ``get_attention_masks``,
+    then splits them per microbatch when PP is enabled so the
+    `mask_mod.__code__` Dynamo guards see the same `batch_offset_mask_mod`
+    closures real training builds in `pipelining.microbatch._split_block_mask`.
+
+    Returns the list of microbatch masks (singleton if PP not enabled or
+    attn_type != flex/varlen). For flex/varlen models the elements are
+    BlockMask or dict[str, BlockMask]; for sdpa it is ``[None]``.
+    """
+    shared_attention_masks = None
+    _all_split_masks = None
+    model_args = getattr(model_parts[0], "model_args", None)
+    attn_type = getattr(model_args, "attn_type", "sdpa")
+    if attn_type not in ("flex", "varlen"):
+        return [None]
+
+    class _StubTokenizer:
+        eos_id = 0
+
+    device = f"cuda:{torch.cuda.current_device()}"
+    stub_tokens = torch.zeros(
+        local_batch_size, seq_len, dtype=torch.long, device=device,
+    )
+    try:
+        # pyrefly: ignore [not-callable]
+        shared_attention_masks = model_parts[0].get_attention_masks(
+            input_batch=stub_tokens,
+            tokenizer=_StubTokenizer(),
+            extra_inputs={},
+        )
+        if (
+            len(model_parts) > 1
+            and parallel_dims is not None
+            and getattr(parallel_dims, "pp_enabled", False)
+            and isinstance(shared_attention_masks, BlockMask)
+        ):
+            from torch.distributed.pipelining.microbatch import _split_block_mask
+            num_chunks = max(
+                local_batch_size,
+                shared_attention_masks.kv_num_blocks.size(0),
+            )
+            if num_chunks > 1:
+                split = _split_block_mask(shared_attention_masks, num_chunks)
+                _all_split_masks = split
+                shared_attention_masks = split[0]
+        elif isinstance(shared_attention_masks, dict):
+            if (
+                len(model_parts) > 1
+                and parallel_dims is not None
+                and getattr(parallel_dims, "pp_enabled", False)
+            ):
+                from torch.distributed.pipelining.microbatch import _split_block_mask
+                key_splits: dict[str, list] = {}
+                max_chunks = 1
+                new_masks = {}
+                for k, v in shared_attention_masks.items():
+                    if isinstance(v, BlockMask):
+                        nc = max(local_batch_size, v.kv_num_blocks.size(0))
+                        if nc > 1:
+                            s = _split_block_mask(v, nc)
+                            new_masks[k] = s[0]
+                            key_splits[k] = s
+                            max_chunks = max(max_chunks, len(s))
+                        else:
+                            new_masks[k] = v
+                    else:
+                        new_masks[k] = v
+                shared_attention_masks = new_masks
+                if max_chunks > 1:
+                    _all_split_masks = []
+                    for ci in range(max_chunks):
+                        chunk_dict = {}
+                        for k, v in new_masks.items():
+                            if k in key_splits:
+                                chunk_dict[k] = key_splits[k][min(ci, len(key_splits[k]) - 1)]
+                            else:
+                                chunk_dict[k] = v
+                        _all_split_masks.append(chunk_dict)
+    except Exception as e:
+        logger.warning(
+            f"Warmup: get_attention_masks failed "
+            f"({type(e).__name__}: {e}), using per-stage recorded masks."
+        )
+
+    return (
+        _all_split_masks
+        if _all_split_masks is not None and len(_all_split_masks) > 1
+        else [shared_attention_masks]
+    )
+
+
+def warmup_stages_real(
+    model_parts: list[torch.nn.Module],
+    record_path: str,
+    *,
+    loss_fn: Optional[Callable] = None,
+    pp_has_last_stage: bool = True,
+    local_batch_size: int = 1,
+    seq_len: int = 2048,
+    parallel_dims: Any = None,
+) -> None:
+    """Real-tensor variant of :func:`warmup_stages`.
+
+    Runs an actual CUDA forward + backward through each ``model_part`` with
+    zero-init recorded inputs (no FakeTensorMode, no MoE/permute stubs). The
+    AOT autograd / Inductor compile path sees the exact same FX graph it
+    would see at real training time, so the warmup-compiled Dynamo cache is
+    bit-compatible with the no-warmup baseline. Drawback vs the fake variant:
+    one full real iteration's worth of activation memory and kernel-launch
+    time, plus actual collective traffic on the PG.
+
+    ``loss_fn`` is invoked on the last-stage output exactly as in the fake
+    path (loss_parallel + dummy zero labels). Gradients are zeroed and
+    pre-warmup grads are restored, mirroring the cleanup the fake path
+    does. FSDP unsharded-cache purge from the fake path is skipped here
+    because FSDP's all-gather under real CUDA does not leave fake state
+    behind (the cached unsharded param is a real ``nn.Parameter``).
+    """
+    global _current_parallel_dims
+    _current_parallel_dims = parallel_dims
+
+    if not os.path.exists(record_path):
+        logger.warning(
+            f"Stage input record file not found at {record_path}, skipping warmup"
+        )
+        _current_parallel_dims = None
+        return
+
+    with open(record_path, "r") as f:
+        data = json.load(f)
+    recorded_stages = data["stages"]
+
+    if len(recorded_stages) != len(model_parts):
+        logger.warning(
+            f"Mismatch between recorded stages ({len(recorded_stages)}) "
+            f"and model_parts ({len(model_parts)}). Skipping warmup."
+        )
+        _current_parallel_dims = None
+        return
+
+    logger.info(
+        f"Starting REAL stage warmup for {len(model_parts)} model_parts "
+        "(real CUDA forward+backward)..."
+    )
+
+    # Snapshot real grads so the warmup backward's grad accumulation does
+    # not pollute resilient_opt's state. Restored after warmup.
+    saved_grads: list[dict[int, torch.Tensor]] = []
+    for mp in model_parts:
+        grads_for_mp: dict[int, torch.Tensor] = {}
+        for p in mp.parameters():
+            if p.grad is not None:
+                grads_for_mp[id(p)] = p.grad
+                p.grad = None
+        saved_grads.append(grads_for_mp)
+
+    # Snapshot every buffer so any in-place mutation during the warmup
+    # forward is undone. The MoE module's
+    # ``self.tokens_per_expert.add_(num_tokens_per_expert)`` is the
+    # canonical case: ``build_optimizers_with_moe_load_balancing``'s
+    # pre-hook reads this counter at every optimizer step, so even one
+    # warmup forward shifts the load-balance bias trajectory and breaks
+    # bit-identity at step 2+ for gpt-oss / deepseek-moe. (The
+    # FakeTensorMode warmup is immune to this — in-place ops on real
+    # storage under fake mode return a fake result without writing real
+    # memory.) Cloning every buffer is overkill but cheap and
+    # future-proof against any other in-place buffer mutation.
+    saved_buffers: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+    for mp in model_parts:
+        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for _, buf in mp.named_buffers():
+            try:
+                snapshots.append((buf, buf.detach().clone()))
+            except Exception:
+                pass
+        saved_buffers.append(snapshots)
+
+    microbatch_masks = _build_warmup_attention_masks(
+        model_parts, local_batch_size, seq_len, parallel_dims,
+    )
+
+    for mb_idx, _current_microbatch_mask in enumerate(microbatch_masks):
+        if mb_idx > 0:
+            logger.info(
+                f"Real warmup: extra microbatch pass {mb_idx} "
+                f"(compiling for batch_offset={mb_idx})"
+            )
+        for stage_idx, (model_part, stage_metadata) in enumerate(
+            zip(model_parts, recorded_stages)
+        ):
+            if stage_metadata is None:
+                logger.warning(
+                    f"No recorded inputs for stage {stage_idx}, skipping"
+                )
+                continue
+
+            synthetic_args, synthetic_kwargs = _deserialize_args(stage_metadata)
+            try:
+                if (
+                    _current_microbatch_mask is not None
+                    and "attention_masks" in synthetic_kwargs
+                ):
+                    synthetic_kwargs["attention_masks"] = _current_microbatch_mask
+
+                output = model_part(*synthetic_args, **synthetic_kwargs)
+
+                loss = None
+                is_last_stage_module = (
+                    pp_has_last_stage and stage_idx == len(model_parts) - 1
+                )
+                if (
+                    is_last_stage_module
+                    and loss_fn is not None
+                    and isinstance(output, torch.Tensor)
+                ):
+                    labels = torch.zeros(
+                        output.shape[:-1],
+                        dtype=torch.long,
+                        device=output.device,
+                    )
+                    from torch.distributed.tensor import DTensor
+
+                    if isinstance(output, DTensor):
+                        from torch.distributed.tensor.parallel import loss_parallel
+                        with loss_parallel():
+                            loss = loss_fn(output, labels)
+                            if loss is not None:
+                                loss.backward()
+                    else:
+                        loss = loss_fn(output, labels)
+                        if loss is not None:
+                            loss.backward()
+                else:
+                    loss = _reduce_output_to_scalar(output)
+                    if loss is not None:
+                        loss.backward()
+
+                del synthetic_args, synthetic_kwargs, output
+            except Exception as e:
+                logger.warning(
+                    f"Real warmup failed for stage {stage_idx} "
+                    f"(mb={mb_idx}): {type(e).__name__}: {e}. "
+                    "This stage will pay full compile cost on the first "
+                    "real step."
+                )
+                raise
+
+            model_part.zero_grad(set_to_none=True)
+
+    # Restore the real grads we snapshotted before warmup.
+    for mp, grads_for_mp in zip(model_parts, saved_grads):
+        for p in mp.parameters():
+            p.grad = grads_for_mp.get(id(p))
+
+    # Restore every buffer's pre-warmup contents in-place.
+    for snapshots in saved_buffers:
+        for buf, snap in snapshots:
+            try:
+                with torch.no_grad():
+                    buf.copy_(snap)
+            except Exception as e:
+                logger.warning(
+                    f"Real warmup: failed to restore buffer "
+                    f"({type(e).__name__}: {e})"
+                )
+
+    _current_parallel_dims = None
+    torch.cuda.synchronize()
+    gc.collect()
+
+
+def _reload_compiled_fx_graphs_after_warmup() -> None:
+    """Reload the PyCodeCache module behind every live `CompiledFxGraph`.
+
+    Confirmed root cause of an otherwise-residual ~3e-6 step-1 drift
+    when warmup keeps the Dynamo cache and reuses warmup-built compiled
+    artifacts at real time: `CompiledFxGraph.current_callable` is a
+    closure (`align_inputs_from_check_idxs.<locals>.run`) that wraps a
+    `module.call` from a PyCodeCache module instance loaded at warmup
+    time. That module's globals capture the `CachingAutotuner`
+    instances created during warmup `precompile()`, which carry
+    warmup-time launcher state. When real training reuses the warmup
+    module, the warmup-time launchers feed `autotune_to_one_config`
+    with stale benchmark context and pick a different chosen kernel
+    config than a fresh-from-disk module would.
+
+    Fix (no Dynamo retrace, no real GPU kernels): mirror what
+    `cache_hit_post_compile` does at retrace time, but in-place:
+      - `prepare_for_serialization()` strips `current_callable` /
+        `recursively_apply_fns` / `compiled_fn_runner` so the graph
+        looks like a freshly-pickled one;
+      - `after_deserialization(constants)` invokes
+        `PyCodeCache.load_by_key_path(...)`. Because every Inductor-
+        generated module for an FX graph with constants is loaded with
+        `attrs is not None`, the cache always misses and triggers a
+        fresh `_reload_python_module(...)`. The new module has fresh
+        `CachingAutotuner` globals.
+
+    Result: bit-identical losses across all four MoE / non-MoE
+    workloads, no Dynamo retrace, ~45–64% step-1 wall-time saving from
+    Triton-disk-cache reuse.
+    """
+    try:
+        import gc
+        from torch._inductor.output_code import (
+            CompiledFxGraph,
+            CompiledFxGraphConstants,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Stage warmup post-warmup reload setup failed: "
+            f"{type(e).__name__}: {e}"
+        )
+        return
+
+    constants = CompiledFxGraphConstants()
+    n_reloaded = 0
+    n_failed = 0
+    for obj in gc.get_objects():
+        if not isinstance(obj, CompiledFxGraph):
+            continue
+        try:
+            obj.prepare_for_serialization()
+            obj.after_deserialization(constants)
+            n_reloaded += 1
+        except Exception as e:
+            logger.warning(
+                f"Stage warmup: CompiledFxGraph.after_deserialization "
+                f"failed: {type(e).__name__}: {e}"
+            )
+            n_failed += 1
+    logger.info(
+        f"Stage warmup: reloaded PyCodeCache module on {n_reloaded} "
+        f"CompiledFxGraphs ({n_failed} failed)"
+    )

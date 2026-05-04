@@ -1058,6 +1058,16 @@ class Leto:
     enable_stage_warmup: bool = False
     """Warmup stages with recorded inputs before training starts"""
 
+    stage_warmup_mode: str = "fake"
+    """Mode for stage warmup. "fake" (default) traces the model under
+    FakeTensorMode with monkey-patched MoE stubs to avoid real kernel
+    launches — fast but FX-graph divergence vs real-mode AOT compile
+    causes small bf16 drift on MoE-heavy workloads. "real" runs an actual
+    CUDA forward+backward with zero-init recorded inputs; the FX graph
+    matches real training exactly so the warmup-compiled cache produces
+    bit-identical losses, at the cost of one extra real iteration of
+    activation memory and compute."""
+
     stage_inputs_folder: str = "stage_inputs"
     """Folder to save/load recorded stage shape metadata (relative to dump_folder)."""
 
