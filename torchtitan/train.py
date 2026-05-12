@@ -10,7 +10,7 @@ import os
 import random
 import time
 from datetime import timedelta
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import torch
@@ -158,6 +158,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self._oom_safeguard_installed = False
 
+        # State for kernel_trap fault injection. Updated each iter regardless
+        # of whether the fault fires, so the next fault step has a recent
+        # launches-per-iter measurement to randomize against.
+        self._kernel_trap_prev_count: Optional[int] = None
+        self._kernel_trap_last_k: int = 0
+
+    @staticmethod
+    def _seeded_offset(seed: int, *parts) -> int:
+        """Stable hash-based RNG. Same inputs always yield the same int."""
+        import hashlib
+        s = f"{seed}|" + "|".join(str(p) for p in parts)
+        return int(hashlib.sha256(s.encode()).hexdigest(), 16)
+
+    def _kernel_trap_update_k(self) -> int:
+        """Update ``self._kernel_trap_last_k`` from the previous iter's
+        matching-kernel launches, and return the current matching-launch
+        count. Returns 0 if the NVBit tool isn't loaded."""
+        try:
+            from leto.fault_injection import kernel_trap
+        except Exception:
+            return 0
+        if not kernel_trap.is_available():
+            return 0
+        current = kernel_trap.get_count()
+        if self._kernel_trap_prev_count is not None:
+            self._kernel_trap_last_k = max(0, current - self._kernel_trap_prev_count)
+        self._kernel_trap_prev_count = current
+        return current
+
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
@@ -181,6 +210,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             return False
         if leto_cfg.fault_injection_step_interval <= 0:
             return False
+
+        # Track per-iter matching-kernel launch count for kernel_trap mode. We
+        # call this every step so that on a fault step we have a recent K.
+        pre_count = self._kernel_trap_update_k() if leto_cfg.fault_injection_kernel_trap else 0
 
         # self.step is 1-indexed (incremented at start of training loop)
         step = self.step
@@ -242,9 +275,54 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if target_rank in group_ranks and global_rank in group_ranks:
                     should_fault = True
                     break
+        elif rank_mode == "prob":
+            # Each rank independently decides whether to fault this step,
+            # deterministic per (seed, step, global_rank) so the schedule is
+            # reproducible across restarts. target_rank is unused in this mode;
+            # with p over `world_size` ranks, ~p*world_size ranks fault per step.
+            prob = leto_cfg.fault_injection_step_prob
+            if prob >= 1.0:
+                should_fault = True
+            elif prob > 0.0:
+                rank_seed = leto_cfg.fault_injection_step_seed
+                draw = (
+                    self._seeded_offset(rank_seed, step, global_rank, "prob")
+                    % 1_000_000
+                ) / 1_000_000.0
+                should_fault = draw < prob
+        elif rank_mode == "random":
+            # Per (seed, step) deterministic 50/50 between two fault kinds:
+            #   kind == 0 -> "single" NVBit kernel_trap on target_rank
+            #   kind == 1 -> target_rank's whole FSDP group os._exit(1)
+            #               (hard process death -> master restarts from the
+            #               last checkpoint; os._exit so NCCL peers notice in
+            #               ~8s instead of the ~180s heartbeat timeout).
+            rand_seed = leto_cfg.fault_injection_step_seed
+            kind = self._seeded_offset(rand_seed, step, "kind") % 2
+            if kind == 0:
+                should_fault = (global_rank == target_rank)
+            else:
+                mesh_tensor = self.parallel_dims.get_mesh("fsdp").mesh
+                if mesh_tensor.ndim == 1:
+                    mesh_tensor = mesh_tensor.unsqueeze(0)
+                for group_idx in range(mesh_tensor.shape[0]):
+                    group_ranks = mesh_tensor[group_idx].tolist()
+                    if target_rank in group_ranks and global_rank in group_ranks:
+                        logger.info(
+                            f"[STEP FAULT INJECTION] random->fsdp os._exit(1): "
+                            f"step={step}, rank={global_rank}, "
+                            f"target_rank={target_rank}"
+                        )
+                        os._exit(1)
 
-        # All ranks mark the fault so nocommit reset happens everywhere
-        self._prev_step_faulted = True
+        # kernel_trap lets optimizer.step() run normally (the armed launch
+        # traps inside the fused-AdamW kernel and kills the process). No
+        # dataloader/lr-scheduler reset is needed and setting the flag here
+        # would race against the async trap and produce spurious NOCOMMIT
+        # logs before the CUDA error surfaces.
+        if not leto_cfg.fault_injection_kernel_trap:
+            # All ranks mark the fault so nocommit reset happens everywhere
+            self._prev_step_faulted = True
 
         if not should_fault:
             return False
@@ -254,6 +332,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"[STEP FAULT INJECTION] step={step}, rank={global_rank}, "
             f"target_rank={target_rank}, mode={rank_mode}"
         )
+
+        if leto_cfg.fault_injection_kernel_trap:
+            from leto.fault_injection import kernel_trap
+            if not kernel_trap.is_available():
+                raise RuntimeError(
+                    "fault_injection_kernel_trap requires adam_trap.so to be loaded "
+                    "via CUDA_INJECTION64_PATH. Set fault_injection.mode='kernel_trap' "
+                    "in your job YAML so leto wires the env automatically."
+                )
+            k = max(1, self._kernel_trap_last_k)
+            seed = leto_cfg.fault_injection_step_seed
+            # Include global_rank so concurrently-faulting ranks (prob/random
+            # modes) trap at *different* launch positions within the optimizer
+            # step — a diffuse blast radius rather than every rank tearing the
+            # same chunk. Deterministic per (seed, step, rank).
+            launch_offset = self._seeded_offset(seed, step, global_rank, "launch") % k
+            # arm() is 1-indexed; pre_count is the count BEFORE this iter's
+            # optimizer step starts. The (launch_offset+1)-th matching launch
+            # in this iter will trap.
+            target_count = int(pre_count) + int(launch_offset) + 1
+            kernel_trap.arm(target_count)
+            logger.info(
+                f"[KERNEL_TRAP] armed: step={step}, rank={global_rank}, "
+                f"pre_count={pre_count}, K={k}, launch_offset={launch_offset}, "
+                f"target_count={target_count}"
+            )
+            # Do NOT return True — we want optimizer.step() to run so the
+            # adam kernel actually launches and trips the trap.
+            return False
 
         if leto_cfg.fault_injection_raise_error:
             time.sleep(3.0)
@@ -384,9 +491,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         recovered = self._resilient_opt.maybe_recover(resume_step)
         if recovered:
-            logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
+            logger.info(f"[ResilientOpt] (rank={dist.get_rank()}) Recovery completed at step {resume_step}")
         else:
-            logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
+            logger.info(f"[ResilientOpt] (rank={dist.get_rank()}) No recovery needed at step {resume_step}")
 
         self._resilient_opt.zero_moe_tokens_per_expert()
         self.lr_schedulers.step()
@@ -808,6 +915,34 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.checkpointer.load(step=job_config.checkpoint.load_step)
                 self._resilient_opt.bind()
                 self._resilient_opt.resync_after_external_load()
+        elif job_config.leto.enable_rmp_gpu and job_config.leto.disable_resilient_opt:
+            # No ResilientOptimizer replay, but rmp_manager.maybe_commit has
+            # been writing CPU-side metadata (step counter, dataloader, lr
+            # scheduler) every step. Load that metadata so the restart
+            # picks up where the last successful step left off; the
+            # RMP-GPU-backed params/optim tensors are already correct.
+            has_md = self.rmp_manager.has_committed_metadata()
+            local_step = self.rmp_manager.latest_committed_step() or 0
+            buf = torch.tensor(
+                [0 if has_md else 1, local_step],
+                dtype=torch.int64, device=self.device,
+            )
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            any_lacks = bool(buf[0].item())
+            resume_step = int(buf[1].item())
+
+            if not any_lacks:
+                self.rmp_manager.load_cpu_metadata(resume_step)
+                # The committed metadata captures lr_scheduler state from the
+                # START of step=resume_step (before optimizer.step). To match
+                # the no-fault path's state at the end of resume_step (so the
+                # next iter starts with the same lr as normal step resume_step+1
+                # would), advance the scheduler by one — same compensation
+                # _resilient_opt_recover does.
+                self.lr_schedulers.step()
+                self.step = resume_step
+            else:
+                self.checkpointer.load(step=job_config.checkpoint.load_step)
         else:
             self.checkpointer.load(step=job_config.checkpoint.load_step)
 

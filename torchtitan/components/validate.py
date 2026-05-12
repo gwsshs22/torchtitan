@@ -33,7 +33,8 @@ class BaseValidator:
         raise NotImplementedError("validate method not implemented")
 
     def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.job_config.validation.freq == 0
+        cfg = self.job_config.validation
+        return step == 1 or (step - cfg.freq_offset) % cfg.freq == 0
 
 
 class Validator(BaseValidator):

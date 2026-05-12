@@ -1000,6 +1000,14 @@ class Validation:
     freq: int = 10
     """Frequency of validation"""
 
+    freq_offset: int = 0
+    """Phase offset for the validation cadence: validate at steps where
+    ``(step - freq_offset) % freq == 0``. Step 1 is always validated.
+    Useful when training has a periodic event at ``step % freq == 0``
+    (e.g. fault injection at every freq-th step) that would otherwise
+    eat the validation. With freq=10 and freq_offset=1, validation runs
+    at steps 1, 11, 21, 31, …"""
+
     steps: int = -1
     """
     Number of steps to take in the validation set, -1 means consuming all the data in the validation dataset
@@ -1116,7 +1124,17 @@ class Leto:
     """Inject a fault every N training steps. 0 = disabled."""
 
     fault_injection_step_rank_mode: str = "single"
-    """Which ranks fault: 'single' (one rank per step), 'tp' (all ranks in TP group), 'fsdp' (all ranks in FSDP group)."""
+    """Which ranks fault: 'single' (one rank per step), 'tp' (all ranks in TP
+    group), 'fsdp' (all ranks in FSDP group), 'prob' (each rank independently
+    decides, with probability fault_injection_step_prob), 'random' (per-step
+    deterministic 50/50: 'single' kernel_trap, or target_rank's FSDP group
+    os._exit(1))."""
+
+    fault_injection_step_prob: float = 0.5
+    """For fault_injection_step_rank_mode == 'prob': per-fault-step independent
+    probability in [0, 1] that each rank faults. Deterministic per
+    (fault_injection_step_seed, step, global_rank), so the schedule is
+    reproducible across restarts. Unused for the other rank modes."""
 
     fault_injection_step_barrier: bool = False
     """If True, call dist.barrier() before raising the fault exception."""
@@ -1138,6 +1156,13 @@ class Leto:
 
     fault_injection_nocommit: bool = False
     """If True, reset dataloader and lr scheduler at the start of the next step after a faulted step."""
+
+    fault_injection_kernel_trap: bool = False
+    """If True, instead of raising/skipping when a step fault fires, arm the
+    NVBit ``adam_trap`` tool so the next fused-AdamW kernel launch traps in
+    GPU code. Requires ``adam_trap.so`` loaded via ``CUDA_INJECTION64_PATH``
+    (leto's launcher sets this automatically when
+    ``fault_injection.mode == 'kernel_trap'``)."""
 
     dump_optimizer_info: bool = False
     """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
