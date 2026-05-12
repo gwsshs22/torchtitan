@@ -1139,6 +1139,13 @@ class Leto:
     fault_injection_nocommit: bool = False
     """If True, reset dataloader and lr scheduler at the start of the next step after a faulted step."""
 
+    fault_injection_kernel_trap: bool = False
+    """If True, instead of raising/skipping when a step fault fires, arm the
+    NVBit ``adam_trap`` tool so the next fused-AdamW kernel launch traps in
+    GPU code. Requires ``adam_trap.so`` loaded via ``CUDA_INJECTION64_PATH``
+    (leto's launcher sets this automatically when
+    ``fault_injection.mode == 'kernel_trap'``)."""
+
     dump_optimizer_info: bool = False
     """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
 

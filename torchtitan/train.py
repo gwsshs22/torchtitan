@@ -10,7 +10,7 @@ import os
 import random
 import time
 from datetime import timedelta
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import torch
@@ -158,6 +158,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self._oom_safeguard_installed = False
 
+        # State for kernel_trap fault injection. Updated each iter regardless
+        # of whether the fault fires, so the next fault step has a recent
+        # launches-per-iter measurement to randomize against.
+        self._kernel_trap_prev_count: Optional[int] = None
+        self._kernel_trap_last_k: int = 0
+
+    @staticmethod
+    def _seeded_offset(seed: int, *parts) -> int:
+        """Stable hash-based RNG. Same inputs always yield the same int."""
+        import hashlib
+        s = f"{seed}|" + "|".join(str(p) for p in parts)
+        return int(hashlib.sha256(s.encode()).hexdigest(), 16)
+
+    def _kernel_trap_update_k(self) -> int:
+        """Update ``self._kernel_trap_last_k`` from the previous iter's
+        matching-kernel launches, and return the current matching-launch
+        count. Returns 0 if the NVBit tool isn't loaded."""
+        try:
+            from leto.fault_injection import kernel_trap
+        except Exception:
+            return 0
+        if not kernel_trap.is_available():
+            return 0
+        current = kernel_trap.get_count()
+        if self._kernel_trap_prev_count is not None:
+            self._kernel_trap_last_k = max(0, current - self._kernel_trap_prev_count)
+        self._kernel_trap_prev_count = current
+        return current
+
     def maybe_inject_fault(self) -> bool:
         """Inject a fault at specific training steps (worker-side, step-based).
 
@@ -181,6 +210,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             return False
         if leto_cfg.fault_injection_step_interval <= 0:
             return False
+
+        # Track per-iter matching-kernel launch count for kernel_trap mode. We
+        # call this every step so that on a fault step we have a recent K.
+        pre_count = self._kernel_trap_update_k() if leto_cfg.fault_injection_kernel_trap else 0
 
         # self.step is 1-indexed (incremented at start of training loop)
         step = self.step
@@ -254,6 +287,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"[STEP FAULT INJECTION] step={step}, rank={global_rank}, "
             f"target_rank={target_rank}, mode={rank_mode}"
         )
+
+        if leto_cfg.fault_injection_kernel_trap:
+            from leto.fault_injection import kernel_trap
+            if not kernel_trap.is_available():
+                raise RuntimeError(
+                    "fault_injection_kernel_trap requires adam_trap.so to be loaded "
+                    "via CUDA_INJECTION64_PATH. Set fault_injection.mode='kernel_trap' "
+                    "in your job YAML so leto wires the env automatically."
+                )
+            k = max(1, self._kernel_trap_last_k)
+            seed = leto_cfg.fault_injection_step_seed
+            launch_offset = self._seeded_offset(seed, step, "launch") % k
+            # arm() is 1-indexed; pre_count is the count BEFORE this iter's
+            # optimizer step starts. The (launch_offset+1)-th matching launch
+            # in this iter will trap.
+            target_count = int(pre_count) + int(launch_offset) + 1
+            kernel_trap.arm(target_count)
+            logger.info(
+                f"[KERNEL_TRAP] armed: step={step}, rank={global_rank}, "
+                f"pre_count={pre_count}, K={k}, launch_offset={launch_offset}, "
+                f"target_count={target_count}"
+            )
+            # Do NOT return True — we want optimizer.step() to run so the
+            # adam kernel actually launches and trips the trap.
+            return False
 
         if leto_cfg.fault_injection_raise_error:
             time.sleep(3.0)
