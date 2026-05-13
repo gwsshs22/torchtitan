@@ -12,6 +12,7 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.models.moe import MoEArgs
 
+from torchtitan.components.validate import build_validator
 from torchtitan.protocols.train_spec import TrainSpec
 
 from .infra.parallelize import parallelize_gptoss
@@ -130,5 +131,6 @@ def get_train_spec() -> TrainSpec:
         build_dataloader_fn=build_text_dataloader,
         build_tokenizer_fn=build_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
+        build_validator_fn=build_validator,
         state_dict_adapter=GptOssStateDictAdapter,
     )
