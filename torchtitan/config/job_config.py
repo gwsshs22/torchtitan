@@ -1000,6 +1000,14 @@ class Validation:
     freq: int = 10
     """Frequency of validation"""
 
+    freq_offset: int = 0
+    """Phase offset for the validation cadence: validate at steps where
+    ``(step - freq_offset) % freq == 0``. Step 1 is always validated.
+    Useful when training has a periodic event at ``step % freq == 0``
+    (e.g. fault injection at every freq-th step) that would otherwise
+    eat the validation. With freq=10 and freq_offset=1, validation runs
+    at steps 1, 11, 21, 31, …"""
+
     steps: int = -1
     """
     Number of steps to take in the validation set, -1 means consuming all the data in the validation dataset
@@ -1148,12 +1156,6 @@ class Leto:
 
     dump_optimizer_info: bool = False
     """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
-
-    debug_state_signature: bool = False
-    """If True, log a compact signature (param/exp_avg/exp_avg_sq L1 sums,
-    step counters, first/last param scalar) at the start of every train_step
-    on rank 0. Used to pinpoint where resilient_opt recovery diverges from a
-    fault-free baseline."""
 
     resilient_opt_fault_injection: bool = False
     """Enable fault injection in resilient optimizer marker."""

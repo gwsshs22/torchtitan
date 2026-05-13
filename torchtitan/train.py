@@ -456,63 +456,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.lr_schedulers.step()
         self.step = resume_step
 
-    @torch.no_grad()
-    def _debug_state_signature(self, tag: str) -> None:
-        """Print a compact signature of params + AdamW state + step counters.
-
-        Operates on the local shard of each DTensor so we avoid cross-mesh
-        all-reduces. Used to compare states across runs (normal vs
-        fault_with_resilient_opt) and pinpoint where recovery diverges.
-        """
-        if not getattr(self.job_config.leto, "debug_state_signature", False):
-            return
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank != 0:
-            return
-
-        def _local(t):
-            return t.to_local() if hasattr(t, "to_local") else t
-
-        def _sumabs(tensors) -> float:
-            tot = 0.0
-            for t in tensors:
-                if t is None:
-                    continue
-                lt = _local(t.detach())
-                if lt.numel() == 0:
-                    continue
-                tot += float(lt.float().abs().sum().item())
-            return tot
-
-        params = [p for m in self.model_parts for p in m.parameters()]
-        if not params:
-            return
-        p0_local = _local(params[0].detach())
-        plast_local = _local(params[-1].detach())
-        p_sumabs = _sumabs(params)
-
-        opt = self.optimizers.optimizers[0]
-        opt_states = list(opt.state.values()) if opt.state else []
-        ea_sum = _sumabs(s.get("exp_avg") for s in opt_states)
-        es_sum = _sumabs(s.get("exp_avg_sq") for s in opt_states)
-        step_t = next((s["step"] for s in opt_states if "step" in s), None)
-        if step_t is None:
-            adam_step = -1
-        else:
-            adam_step = int(_local(step_t).flatten()[0].item())
-        try:
-            sched_le = int(self.lr_schedulers.schedulers[0].last_epoch)
-        except Exception:
-            sched_le = -1
-        logger.info(
-            f"[DBG_SIG] tag={tag} self.step={self.step} adam_step={adam_step} "
-            f"sched_last_epoch={sched_le} "
-            f"p_sumabs={p_sumabs!r} "
-            f"ea_sumabs={ea_sum!r} es_sumabs={es_sum!r} "
-            f"p0[0]={float(p0_local.float().flatten()[0].item())!r} "
-            f"plast[-1]={float(plast_local.float().flatten()[-1].item())!r}"
-        )
-
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
             return
@@ -778,7 +721,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
-        self._debug_state_signature("step_entry")
         self.optimizers.zero_grad()
         if self._cpu_snapshot_opt is not None:
             self._cpu_snapshot_opt.begin_snapshot()

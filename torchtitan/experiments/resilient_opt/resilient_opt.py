@@ -36,7 +36,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from torch.cuda._pin_memory_utils import pin_memory
 from torch.distributed._tensor import DTensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
@@ -624,47 +623,6 @@ class ResilientOptimizer:
         self._marker.fill_(_MARKER_POST_RUNNING)
         self._marker.fill_(_MARKER_IDLE)
 
-    @torch.no_grad()
-    def _dump_chunk_sig(self, chunk_idx: int, tag: str) -> None:
-        """Per-chunk pre/post signature, rank-0 only, gated by env var.
-
-        Set ``RESILIENT_OPT_DEBUG_SIG=1`` to enable. Sums abs values of
-        the chunk's param/exp_avg/exp_avg_sq/grad slices and prints them
-        with full float64 precision so we can compare across a normal
-        run (all fast-path) and a recovery run (slow-path replay for
-        chunks >= fault_chunk).
-        """
-        import os
-        if os.environ.get("RESILIENT_OPT_DEBUG_SIG", "0") not in ("1", "true", "True"):
-            return
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-        chunk = self._schedule[chunk_idx]
-        p_sum = 0.0
-        ea_sum = 0.0
-        es_sum = 0.0
-        g_sum = 0.0
-        n_grad_nan = 0
-        for sl in chunk:
-            p_sum += float(sl.flat_param[sl.start : sl.end].float().abs().sum().item())
-            ea_sum += float(sl.flat_exp_avg[sl.start : sl.end].float().abs().sum().item())
-            es_sum += float(sl.flat_exp_avg_sq[sl.start : sl.end].float().abs().sum().item())
-            grad_t = sl.param_ref.grad
-            if grad_t is None:
-                g_sum = float('nan')
-                n_grad_nan += 1
-            else:
-                gl = grad_t._local_tensor if isinstance(grad_t, DTensor) else grad_t
-                gflat = gl.view(-1)[sl.start : sl.end]
-                g_sum += float(gflat.float().abs().sum().item())
-        sc = int(self._step_counter.item())
-        lrv = chunk[0].group["lr"] if chunk else float('nan')
-        logger.info(
-            f"[CHUNK_SIG] chunk={chunk_idx} tag={tag} "
-            f"step_counter={sc} lr={lrv!r} fast={not self._recovery_in_progress} "
-            f"p={p_sum!r} ea={ea_sum!r} es={es_sum!r} g={g_sum!r} g_none={n_grad_nan}"
-        )
-
     def _run_chunks(self, resume_from: int):
         """Execute chunks starting from resume_from.
 
@@ -700,7 +658,6 @@ class ResilientOptimizer:
                 [self._cpu_buffer] if chunk_idx == 0 else freed_grad_segments
             )
 
-            self._dump_chunk_sig(chunk_idx, "pre")
             self._marker.fill_(chunk_idx * 2)
             if use_fast_path:
                 cache = self._get_chunk_cache(chunk_idx)
@@ -723,7 +680,6 @@ class ResilientOptimizer:
                         lam()
             else:
                 self._step_chunk(chunk)
-            self._dump_chunk_sig(chunk_idx, "post")
 
             if chunk_idx < last_idx:
                 self._harvest_grads(chunk, freed_grad_segments)
