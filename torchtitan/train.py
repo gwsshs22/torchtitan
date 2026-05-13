@@ -276,8 +276,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     should_fault = True
                     break
 
-        # All ranks mark the fault so nocommit reset happens everywhere
-        self._prev_step_faulted = True
+        # kernel_trap lets optimizer.step() run normally (the armed launch
+        # traps inside the fused-AdamW kernel and kills the process). No
+        # dataloader/lr-scheduler reset is needed and setting the flag here
+        # would race against the async trap and produce spurious NOCOMMIT
+        # logs before the CUDA error surfaces.
+        if not leto_cfg.fault_injection_kernel_trap:
+            # All ranks mark the fault so nocommit reset happens everywhere
+            self._prev_step_faulted = True
 
         if not should_fault:
             return False
@@ -449,6 +455,63 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self._resilient_opt.zero_moe_tokens_per_expert()
         self.lr_schedulers.step()
         self.step = resume_step
+
+    @torch.no_grad()
+    def _debug_state_signature(self, tag: str) -> None:
+        """Print a compact signature of params + AdamW state + step counters.
+
+        Operates on the local shard of each DTensor so we avoid cross-mesh
+        all-reduces. Used to compare states across runs (normal vs
+        fault_with_resilient_opt) and pinpoint where recovery diverges.
+        """
+        if not getattr(self.job_config.leto, "debug_state_signature", False):
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            return
+
+        def _local(t):
+            return t.to_local() if hasattr(t, "to_local") else t
+
+        def _sumabs(tensors) -> float:
+            tot = 0.0
+            for t in tensors:
+                if t is None:
+                    continue
+                lt = _local(t.detach())
+                if lt.numel() == 0:
+                    continue
+                tot += float(lt.float().abs().sum().item())
+            return tot
+
+        params = [p for m in self.model_parts for p in m.parameters()]
+        if not params:
+            return
+        p0_local = _local(params[0].detach())
+        plast_local = _local(params[-1].detach())
+        p_sumabs = _sumabs(params)
+
+        opt = self.optimizers.optimizers[0]
+        opt_states = list(opt.state.values()) if opt.state else []
+        ea_sum = _sumabs(s.get("exp_avg") for s in opt_states)
+        es_sum = _sumabs(s.get("exp_avg_sq") for s in opt_states)
+        step_t = next((s["step"] for s in opt_states if "step" in s), None)
+        if step_t is None:
+            adam_step = -1
+        else:
+            adam_step = int(_local(step_t).flatten()[0].item())
+        try:
+            sched_le = int(self.lr_schedulers.schedulers[0].last_epoch)
+        except Exception:
+            sched_le = -1
+        logger.info(
+            f"[DBG_SIG] tag={tag} self.step={self.step} adam_step={adam_step} "
+            f"sched_last_epoch={sched_le} "
+            f"p_sumabs={p_sumabs:.10e} "
+            f"ea_sumabs={ea_sum:.10e} es_sumabs={es_sum:.10e} "
+            f"p0[0]={float(p0_local.float().flatten()[0].item()):.10e} "
+            f"plast[-1]={float(plast_local.float().flatten()[-1].item()):.10e}"
+        )
 
     def maybe_check_step_consistency(self, data_iterator):
         if not self.job_config.leto.fault_injection_step_enabled:
@@ -715,6 +778,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        self._debug_state_signature("step_entry")
         self.optimizers.zero_grad()
         if self._cpu_snapshot_opt is not None:
             self._cpu_snapshot_opt.begin_snapshot()
@@ -866,6 +930,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.checkpointer.load(step=job_config.checkpoint.load_step)
                 self._resilient_opt.bind()
                 self._resilient_opt.resync_after_external_load()
+        elif job_config.leto.enable_rmp_gpu and job_config.leto.disable_resilient_opt:
+            # No ResilientOptimizer replay, but rmp_manager.maybe_commit has
+            # been writing CPU-side metadata (step counter, dataloader, lr
+            # scheduler) every step. Load that metadata so the restart
+            # picks up where the last successful step left off; the
+            # RMP-GPU-backed params/optim tensors are already correct.
+            has_md = self.rmp_manager.has_committed_metadata()
+            local_step = self.rmp_manager.latest_committed_step() or 0
+            buf = torch.tensor(
+                [0 if has_md else 1, local_step],
+                dtype=torch.int64, device=self.device,
+            )
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            any_lacks = bool(buf[0].item())
+            resume_step = int(buf[1].item())
+
+            if not any_lacks:
+                self.rmp_manager.load_cpu_metadata(resume_step)
+            else:
+                self.checkpointer.load(step=job_config.checkpoint.load_step)
         else:
             self.checkpointer.load(step=job_config.checkpoint.load_step)
 

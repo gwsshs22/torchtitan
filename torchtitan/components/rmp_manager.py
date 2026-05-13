@@ -1,6 +1,7 @@
 from itertools import chain
 import pickle
 import time
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -271,6 +272,13 @@ class RmpManager:
         if not self.enabled:
             return False
         return self._meta_buffer.load_latest() is not None
+
+    def latest_committed_step(self) -> Optional[int]:
+        """Step of the most recent valid metadata commit, or None."""
+        if not self.enabled:
+            return None
+        result = self._meta_buffer.load_latest()
+        return result[0] if result is not None else None
 
     def load_cpu_metadata(self, resume_step):
         if self.skip_commit:

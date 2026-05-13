@@ -1149,6 +1149,12 @@ class Leto:
     dump_optimizer_info: bool = False
     """If True, dump optimizer setup (shapes, dtypes, hyperparams) to optimizer_info.json on step 1."""
 
+    debug_state_signature: bool = False
+    """If True, log a compact signature (param/exp_avg/exp_avg_sq L1 sums,
+    step counters, first/last param scalar) at the start of every train_step
+    on rank 0. Used to pinpoint where resilient_opt recovery diverges from a
+    fault-free baseline."""
+
     resilient_opt_fault_injection: bool = False
     """Enable fault injection in resilient optimizer marker."""
 
