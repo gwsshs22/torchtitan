@@ -79,6 +79,16 @@ class LRSchedulersContainer(Stateful):
         # approach is safe. We call ``copy()`` here to ensure extra safety.
         for scheduler in self.schedulers:
             scheduler.load_state_dict(copy.deepcopy(state_dict))
+            # PyTorch's LRScheduler.load_state_dict restores last_epoch and
+            # _last_lr on the scheduler itself but does NOT push the restored
+            # lr back into optimizer.param_groups[*]["lr"]. After a fresh
+            # optimizer is rebuilt (e.g. on a transient restart), its param
+            # groups still hold the initial lr (= lr at last_epoch=0), so the
+            # next optimizer.step() — and any code reading group["lr"] before
+            # the next scheduler.step() — would use the wrong value. Sync
+            # them here so the restored epoch is fully effective immediately.
+            for pg, lr in zip(scheduler.optimizer.param_groups, scheduler._last_lr):
+                pg["lr"] = lr
 
 
 def build_lr_schedulers(

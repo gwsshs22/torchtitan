@@ -507,10 +507,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"[DBG_SIG] tag={tag} self.step={self.step} adam_step={adam_step} "
             f"sched_last_epoch={sched_le} "
-            f"p_sumabs={p_sumabs:.10e} "
-            f"ea_sumabs={ea_sum:.10e} es_sumabs={es_sum:.10e} "
-            f"p0[0]={float(p0_local.float().flatten()[0].item()):.10e} "
-            f"plast[-1]={float(plast_local.float().flatten()[-1].item()):.10e}"
+            f"p_sumabs={p_sumabs!r} "
+            f"ea_sumabs={ea_sum!r} es_sumabs={es_sum!r} "
+            f"p0[0]={float(p0_local.float().flatten()[0].item())!r} "
+            f"plast[-1]={float(plast_local.float().flatten()[-1].item())!r}"
         )
 
     def maybe_check_step_consistency(self, data_iterator):
@@ -948,6 +948,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             if not any_lacks:
                 self.rmp_manager.load_cpu_metadata(resume_step)
+                # The committed metadata captures lr_scheduler state from the
+                # START of step=resume_step (before optimizer.step). To match
+                # the no-fault path's state at the end of resume_step (so the
+                # next iter starts with the same lr as normal step resume_step+1
+                # would), advance the scheduler by one — same compensation
+                # _resilient_opt_recover does.
+                self.lr_schedulers.step()
+                self.step = resume_step
             else:
                 self.checkpointer.load(step=job_config.checkpoint.load_step)
         else:
