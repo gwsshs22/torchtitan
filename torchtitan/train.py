@@ -448,9 +448,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         recovered = self._resilient_opt.maybe_recover(resume_step)
         if recovered:
-            logger.info(f"[ResilientOpt] Recovery completed at step {resume_step}")
+            logger.info(f"[ResilientOpt] (rank={dist.get_rank()}) Recovery completed at step {resume_step}")
         else:
-            logger.info(f"[ResilientOpt] No recovery needed at step {resume_step}")
+            logger.info(f"[ResilientOpt] (rank={dist.get_rank()}) No recovery needed at step {resume_step}")
 
         self._resilient_opt.zero_moe_tokens_per_expert()
         self.lr_schedulers.step()
