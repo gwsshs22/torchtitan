@@ -1124,7 +1124,17 @@ class Leto:
     """Inject a fault every N training steps. 0 = disabled."""
 
     fault_injection_step_rank_mode: str = "single"
-    """Which ranks fault: 'single' (one rank per step), 'tp' (all ranks in TP group), 'fsdp' (all ranks in FSDP group)."""
+    """Which ranks fault: 'single' (one rank per step), 'tp' (all ranks in TP
+    group), 'fsdp' (all ranks in FSDP group), 'prob' (each rank independently
+    decides, with probability fault_injection_step_prob), 'random' (per-step
+    deterministic 50/50: 'single' kernel_trap, or target_rank's FSDP group
+    os._exit(1))."""
+
+    fault_injection_step_prob: float = 0.5
+    """For fault_injection_step_rank_mode == 'prob': per-fault-step independent
+    probability in [0, 1] that each rank faults. Deterministic per
+    (fault_injection_step_seed, step, global_rank), so the schedule is
+    reproducible across restarts. Unused for the other rank modes."""
 
     fault_injection_step_barrier: bool = False
     """If True, call dist.barrier() before raising the fault exception."""

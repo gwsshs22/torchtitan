@@ -275,6 +275,45 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if target_rank in group_ranks and global_rank in group_ranks:
                     should_fault = True
                     break
+        elif rank_mode == "prob":
+            # Each rank independently decides whether to fault this step,
+            # deterministic per (seed, step, global_rank) so the schedule is
+            # reproducible across restarts. target_rank is unused in this mode;
+            # with p over `world_size` ranks, ~p*world_size ranks fault per step.
+            prob = leto_cfg.fault_injection_step_prob
+            if prob >= 1.0:
+                should_fault = True
+            elif prob > 0.0:
+                rank_seed = leto_cfg.fault_injection_step_seed
+                draw = (
+                    self._seeded_offset(rank_seed, step, global_rank, "prob")
+                    % 1_000_000
+                ) / 1_000_000.0
+                should_fault = draw < prob
+        elif rank_mode == "random":
+            # Per (seed, step) deterministic 50/50 between two fault kinds:
+            #   kind == 0 -> "single" NVBit kernel_trap on target_rank
+            #   kind == 1 -> target_rank's whole FSDP group os._exit(1)
+            #               (hard process death -> master restarts from the
+            #               last checkpoint; os._exit so NCCL peers notice in
+            #               ~8s instead of the ~180s heartbeat timeout).
+            rand_seed = leto_cfg.fault_injection_step_seed
+            kind = self._seeded_offset(rand_seed, step, "kind") % 2
+            if kind == 0:
+                should_fault = (global_rank == target_rank)
+            else:
+                mesh_tensor = self.parallel_dims.get_mesh("fsdp").mesh
+                if mesh_tensor.ndim == 1:
+                    mesh_tensor = mesh_tensor.unsqueeze(0)
+                for group_idx in range(mesh_tensor.shape[0]):
+                    group_ranks = mesh_tensor[group_idx].tolist()
+                    if target_rank in group_ranks and global_rank in group_ranks:
+                        logger.info(
+                            f"[STEP FAULT INJECTION] random->fsdp os._exit(1): "
+                            f"step={step}, rank={global_rank}, "
+                            f"target_rank={target_rank}"
+                        )
+                        os._exit(1)
 
         # kernel_trap lets optimizer.step() run normally (the armed launch
         # traps inside the fused-AdamW kernel and kills the process). No
@@ -304,7 +343,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
             k = max(1, self._kernel_trap_last_k)
             seed = leto_cfg.fault_injection_step_seed
-            launch_offset = self._seeded_offset(seed, step, "launch") % k
+            # Include global_rank so concurrently-faulting ranks (prob/random
+            # modes) trap at *different* launch positions within the optimizer
+            # step — a diffuse blast radius rather than every rank tearing the
+            # same chunk. Deterministic per (seed, step, rank).
+            launch_offset = self._seeded_offset(seed, step, global_rank, "launch") % k
             # arm() is 1-indexed; pre_count is the count BEFORE this iter's
             # optimizer step starts. The (launch_offset+1)-th matching launch
             # in this iter will trap.
