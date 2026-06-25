@@ -32,6 +32,7 @@ Usage:
 
 import random
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,7 @@ import torch
 from torch.cuda._pin_memory_utils import pin_memory
 from torch.distributed._tensor import DTensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Replicate
 
 from leto.rmp.client import RmpClient, TensorSpec
@@ -82,16 +84,25 @@ def _get_local(tensor):
 def _make_group_step_lambda(
     group, params, exp_avgs, exp_avg_sqs, steps, grad_specs,
     beta1, beta2, weight_decay, eps,
+    scaled_views, clip_coef_0d,
 ):
-    """Factory that closes over the args (avoids the loop-var late-binding trap)."""
+    """Factory that closes over the args (avoids the loop-var late-binding trap).
+
+    ``scaled_views[i]`` is a fixed-address scratch tensor for grad_specs[i];
+    each call writes ``grad * clip_coef_0d`` into it (the live gradient is
+    never modified) and the fused step consumes the scaled views. This is
+    bit-identical to the stock ``_foreach_mul_(grad, clip_coef) -> fused``
+    path (same multiply, same fp32 coef, same out dtype) while keeping the
+    RMP gradient pristine so a mid-step fault is replayable. ``clip_coef_0d``
+    is a stable-address RMP scalar whose contents change per step.
+    """
     def lam():
-        grads = []
-        for sl, start, end in grad_specs:
+        for (sl, start, end), buf in zip(grad_specs, scaled_views):
             flat = _get_local(sl.param_ref.grad).view(-1)
-            sl.flat_grad = flat
-            grads.append(flat[start:end])
+            sl.flat_grad = flat  # keep original for downstream _harvest_grads
+            torch.mul(flat[start:end], clip_coef_0d, out=buf)
         torch._fused_adamw_(
-            params, grads, exp_avgs, exp_avg_sqs,
+            params, scaled_views, exp_avgs, exp_avg_sqs,
             [], steps,
             amsgrad=False,
             lr=group["lr"],
@@ -294,6 +305,102 @@ class ResilientOptimizer:
         # fresh allocation; deferred because the source tensor lives in
         # optimizer state, which we don't traverse in __init__.
         self._step_counter_needs_init = step_cnt_allocated
+
+        # -- Gradient-clip coefficient (RMP-backed GPU scalar) ----------------
+        # Holds clamp(max_norm / (total_norm + 1e-6), max=1.0) for the current
+        # step. dist_utils.clip_grad_norm_(..., compute_only=True) computes it
+        # WITHOUT scaling grads in place; we apply it per chunk inside the
+        # fault-recoverable step (grad * coef -> scratch -> fused AdamW), so a
+        # fault mid-step is replayable and grads in RMP are never mutated.
+        #
+        # Why RMP-backed: the value must survive a transient restart so the
+        # recovery replay uses the same coefficient as the no-fault step
+        # (set_clip_coef writes it before step()'s PRE_RUNNING/counter bump,
+        # mirroring the single-scalar step-counter atomicity discipline).
+        # Why a fixed-address 0-dim view (_clip_coef_0d): so the per-chunk
+        # `torch.mul(grad, coef, out=scratch)` reads a stable device address
+        # whose CONTENTS are updated in place each step — the same
+        # CUDA-graph-safe pattern as _step_counter_0d (no value baked at
+        # capture; no realloc). The step path is eager today, but this keeps
+        # it correct if it is ever graph-captured.
+        clip_coef_tensors, clip_coef_allocated = rmp_client.get_or_allocate_tensors(
+            [TensorSpec(
+                name="resilient/clip_coef", shape=(1,),
+                dtype=torch.float32, device=device_idx,
+            )]
+        )
+        self._clip_coef = clip_coef_tensors["resilient/clip_coef"]
+        self._clip_coef_0d = self._clip_coef.view([])
+        if clip_coef_allocated:
+            # Default 1.0 == "no clipping" (and a true no-op multiply), so a
+            # caller that never calls set_clip_coef() — e.g. the unit tests —
+            # stays bit-identical to plain optimizer.step().
+            self._clip_coef.fill_(1.0)
+            torch.cuda.current_stream().synchronize()
+
+        # -- Pre-reduction local norm contributions (RMP-backed GPU) ----------
+        # Per-rank `_NormPartial` local scalar(s) from `get_total_norm`, taken
+        # BEFORE the reduction collective (full_tensor / EP / PP all-reduce).
+        # Persisted *before* the reduction so collective completion witnesses
+        # universal persistence: any rank that advances past the reduction
+        # ⟹ every rank entered the reduction ⟹ every rank executed
+        # persist_clip_locals just prior ⟹ every rank's RMP holds the fresh
+        # locals for the resume step. Recovery re-runs the SAME reducer over
+        # those locals — no peer reads, no grad reads (immune to advanced-rank
+        # mutated grads). See ``persist_clip_locals`` /
+        # ``recompute_clip_coef_from_locals`` for the two phases.
+        #
+        # Two slots: EP layout uses [0]=ep_local, [1]=non_ep_local; non-EP
+        # layout uses [0]=total_local. Slot 1 is unused (kept 0.0) in non-EP
+        # runs and never feeds the reducer (ep_enabled is static per run).
+        clip_locals_tensors, clip_locals_allocated = (
+            rmp_client.get_or_allocate_tensors(
+                [TensorSpec(
+                    name="resilient/clip_local_norms", shape=(2,),
+                    dtype=torch.float32, device=device_idx,
+                )]
+            )
+        )
+        self._clip_local_norms = clip_locals_tensors["resilient/clip_local_norms"]
+        if clip_locals_allocated:
+            self._clip_local_norms.fill_(0.0)
+            torch.cuda.current_stream().synchronize()
+
+        # CPU mirror of `_clip_local_norms` — survives a FATAL fault where the
+        # RMP GPU server is torn down (transient recovery still reads the GPU
+        # tensor; this CPU copy is the durable fallback). Mirrored after every
+        # `persist_clip_locals` via a non_blocking GPU→CPU memcpy. The CPU
+        # storage MUST be pinned for `non_blocking=True` to actually be an
+        # async DMA — without pinning CUDA falls back to a synchronous copy,
+        # which would defeat the purpose of avoiding a host-device sync.
+        # The copy + the subsequent reducer collective are enqueued on the
+        # current CUDA stream in order, so the collective-completion witness
+        # ("any rank that advances ⟹ every rank persisted") still holds for
+        # the CPU mirror too.
+        clip_locals_bytes = (
+            self._clip_local_norms.numel() * self._clip_local_norms.element_size()
+        )
+        clip_locals_cpu_storage, _ = rmp_client.get_or_allocate_cpu_memory(
+            "resilient/clip_local_norms_cpu", clip_locals_bytes,
+        )
+        pin_memory(clip_locals_cpu_storage.data_ptr(), clip_locals_cpu_storage.nbytes())
+        _clip_locals_cpu_u8 = torch.empty(0, dtype=torch.uint8).set_(
+            source=clip_locals_cpu_storage, storage_offset=0,
+            size=(clip_locals_bytes,),
+        )
+        # Re-view the pinned uint8 buffer as the same shape/dtype as the GPU
+        # tensor so `_clip_local_norms_cpu.copy_(_clip_local_norms, ...)` is a
+        # straight elementwise async DMA.
+        self._clip_local_norms_cpu = _clip_locals_cpu_u8.view(
+            self._clip_local_norms.dtype
+        )
+
+        # Persistent GPU scratch holding scaled grads for one chunk at a time
+        # (grads themselves are never modified). Lazily sized to the largest
+        # chunk's total grad bytes on the first step (grads exist by then);
+        # reset on bind() because the schedule may change. Reused across
+        # chunks: single-stream ordering serializes mul -> fused per chunk.
+        self._grad_scratch: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # MoE expert-bias load balancing (manual, atomic, fault-tolerant)
@@ -545,6 +652,12 @@ class ResilientOptimizer:
         # stale.
         self._invalidate_chunk_caches()
 
+        # Schedule (and thus per-chunk grad byte sizes) may have changed; force
+        # a one-time re-alloc of the grad-scale scratch on the next step. Safe:
+        # the step path is eager and chunk caches were just invalidated, so no
+        # captured graph or cached lambda references the old scratch address.
+        self._grad_scratch = None
+
         logger.info(
             f"[ResilientOpt] bound {self._num_params} params, "
             f"{len(self._schedule)} chunks, "
@@ -560,6 +673,173 @@ class ResilientOptimizer:
     def get_step(self) -> int:
         """Return the current step counter value."""
         return self._step_counter.item()
+
+    @torch.no_grad()
+    def set_clip_coef(self, clip_coef_clamped: torch.Tensor) -> None:
+        """Stage this step's gradient-clip coefficient for the chunked step.
+
+        Call this from the training loop right before ``step()``, passing the
+        ``clip_coef_clamped`` returned by
+        ``dist_utils.clip_grad_norm_(..., compute_only=True)`` (i.e. the
+        coefficient computed but NOT applied in place).
+
+        The value is copied **in place** into the fixed-address RMP scalar
+        ``self._clip_coef`` (no realloc): it then (a) survives a transient
+        restart so the recovery replay scales grads by the exact same factor
+        as the no-fault step, and (b) is read via the stable-address
+        ``_clip_coef_0d`` inside the per-chunk multiply — CUDA-graph-safe by
+        construction (contents change per step, address does not), the same
+        discipline as ``_step_counter_0d``.
+
+        Written before ``step()``'s PRE_RUNNING marker / counter bump, so any
+        fault during the chunked step finds the correct coefficient already
+        persisted (mirrors the single-scalar step-counter atomicity
+        assumption the rest of this class relies on).
+        """
+        self._clip_coef.copy_(
+            clip_coef_clamped.detach().reshape(1).to(self._clip_coef.dtype),
+            non_blocking=True,
+        )
+
+    @torch.no_grad()
+    def persist_clip_locals(self, locals_list: list[torch.Tensor]) -> None:
+        """Persist the pre-reduction local norm contribution(s) into RMP.
+
+        Call this from the training loop with ``ClipLocals.locals`` from
+        ``dist_utils.clip_compute_locals(...)``, **before** invoking
+        ``dist_utils.clip_reduce_from_locals(...)`` (which runs the reduction
+        collective). The pre-collective ordering is what makes the
+        collective-completion witness sound: any rank that advances past the
+        reducer (counter bumps) ⟹ every rank entered the reducer ⟹ every
+        rank executed this persist just prior. So at recovery every rank's
+        RMP holds the fresh local for the resume step, and the recovery
+        recompute is grad-free and peer-free.
+
+        Layout (must match ``ep_enabled`` for the run):
+            EP:     locals_list = [ep_local, non_ep_local]
+            Dense:  locals_list = [total_local]
+
+        Each entry is the raw ``get_total_norm`` result — a 0-dim
+        ``_NormPartial`` DTensor in the typical case, or a non-DTensor 0-dim
+        tensor when this rank has no grads in that group (PP+EP corner case).
+        ``.to_local()`` extracts the rank-local scalar from a DTensor.
+        """
+        for i, local in enumerate(locals_list):
+            scalar = local.to_local() if isinstance(local, DTensor) else local
+            self._clip_local_norms[i].copy_(
+                scalar.detach().reshape(()).to(self._clip_local_norms.dtype),
+                non_blocking=True,
+            )
+        # Mirror the GPU tensor into pinned RMP-CPU memory so the persisted
+        # local survives a FATAL fault (RMP GPU server killed). Async DMA on
+        # the current CUDA stream — pinned target makes `non_blocking=True`
+        # an actual fire-and-forget transfer, not a hidden host sync. Stream
+        # ordering ensures the subsequent reducer collective only starts
+        # after this memcpy completes.
+        self._clip_local_norms_cpu.copy_(
+            self._clip_local_norms, non_blocking=True
+        )
+
+    @torch.no_grad()
+    def recompute_clip_coef_from_locals(
+        self,
+        parameters: Iterable[torch.Tensor],
+        max_norm: float,
+        norm_type: float = 2.0,
+        pp_mesh: DeviceMesh | None = None,
+        *,
+        ep_enabled: bool,
+    ) -> None:
+        """Recovery only: reconstruct ``_NormPartial`` DTensor(s) from the
+        locals persisted in RMP, run the SAME reducer used at normal time
+        (``dist_utils.clip_reduce_from_locals``), and write the resulting
+        clip_coef into ``self._clip_coef`` for the chunked replay.
+
+        **All-ranks lockstep collective.** Must be called from a code path
+        that every rank enters unconditionally (the top of
+        ``Trainer._resilient_opt_recover`` before ``maybe_recover``'s
+        per-rank branches). The reducer issues the same multi-collective
+        sequence as the normal path (per-mesh ``full_tensor()``, optional PP
+        all-reduce); bit-identity rests on deterministic collective replay
+        over identical persisted local inputs.
+
+        Why no peer / grad reads: ``_NormPartial`` is reconstructed from a
+        ``zeros_like(p)`` *template* — values are irrelevant, only the
+        param's DTensor spec (mesh + placements) is consulted, and that spec
+        is reconstructed identically on every (re)start. The persisted
+        scalar carries this rank's own pre-reduction norm contribution,
+        captured before the original collective when grads were valid.
+        """
+        # Lazy import to avoid a top-level cycle with torchtitan.distributed.utils
+        from torchtitan.distributed import utils as dist_utils
+
+        parameters = list(parameters)
+
+        if ep_enabled:
+            ep_only = [
+                p for p in parameters
+                if isinstance(p, DTensor) and "ep" in p.device_mesh.mesh_dim_names
+            ]
+            non_ep_only = [
+                p for p in parameters
+                if isinstance(p, DTensor) and "ep" not in p.device_mesh.mesh_dim_names
+            ]
+            ep_recon = self._reconstruct_local_norm_dtensor(
+                ep_only, self._clip_local_norms[0], norm_type
+            )
+            non_ep_recon = self._reconstruct_local_norm_dtensor(
+                non_ep_only, self._clip_local_norms[1], norm_type
+            )
+            total_norm, clip_coef = dist_utils.clip_reduce_from_locals(
+                [ep_recon, non_ep_recon], max_norm, norm_type, pp_mesh,
+                ep_enabled=True,
+            )
+        else:
+            recon = self._reconstruct_local_norm_dtensor(
+                parameters, self._clip_local_norms[0], norm_type
+            )
+            total_norm, clip_coef = dist_utils.clip_reduce_from_locals(
+                [recon], max_norm, norm_type, pp_mesh, ep_enabled=False,
+            )
+
+        self._clip_coef.copy_(
+            clip_coef.detach().reshape(1).to(self._clip_coef.dtype),
+            non_blocking=True,
+        )
+        logger.info(
+            f"[ResilientOpt] Recovery: clip_coef recomputed from persisted locals "
+            f"(coef={clip_coef.item():.6e}, total_norm={total_norm.item():.6e})"
+        )
+
+    @torch.no_grad()
+    def _reconstruct_local_norm_dtensor(
+        self,
+        group_params: list[torch.Tensor],
+        persisted_scalar: torch.Tensor,
+        norm_type: float,
+    ) -> torch.Tensor:
+        """Wrap ``persisted_scalar`` as the ``_NormPartial`` DTensor that
+        ``get_total_norm(group_grads)`` would have produced at normal time.
+
+        Derives the mesh + placements from a ``zeros_like`` template — the
+        values don't matter, only the DTensor spec, and that spec is
+        deterministic across (re)starts. Returns a non-DTensor scalar if
+        the group is empty on this rank (stock path also returns
+        ``tensor(0.)`` there, and the reducer handles either case).
+        """
+        if not group_params:
+            return persisted_scalar.detach().reshape(()).to(torch.float32)
+        zeros = [torch.zeros_like(p) for p in group_params]
+        template = torch.nn.utils.get_total_norm(zeros, norm_type, False, None)
+        del zeros  # template is a 0-dim norm; the zero shards can go.
+        if isinstance(template, DTensor):
+            local_shape = template.to_local().shape
+            local_dtype = template.to_local().dtype
+            local_scalar = persisted_scalar.detach().reshape(local_shape).to(local_dtype)
+            return DTensor.from_local(
+                local_scalar, template.device_mesh, template.placements
+            )
+        return persisted_scalar.detach().reshape(()).to(template.dtype)
 
     @torch.no_grad()
     def zero_moe_tokens_per_expert(self) -> None:
@@ -1042,6 +1322,46 @@ class ResilientOptimizer:
                         seg_offset = 0
 
     @torch.no_grad()
+    def _ensure_grad_scratch(self) -> None:
+        """Lazily allocate the persistent scaled-grad scratch buffer once.
+
+        Sized to the largest single chunk's total grad bytes (chunks run one
+        at a time and reuse the buffer, so one chunk's worth suffices). Grads
+        exist by first-step time, so element sizes are known here. Allocated
+        eagerly (never inside a CUDA-graph capture region — the step path is
+        not captured), never reallocated until bind() resets it.
+        """
+        if self._grad_scratch is not None:
+            return
+        max_bytes = 0
+        for chunk in self._schedule:
+            b = 0
+            for sl in chunk:
+                g = _get_local(sl.param_ref.grad)
+                b += (sl.end - sl.start) * g.element_size()
+            max_bytes = max(max_bytes, b)
+        self._grad_scratch = torch.empty(
+            max(max_bytes, 1), dtype=torch.uint8, device=self._device
+        )
+
+    def _scaled_grad_view(
+        self, grad_slice: torch.Tensor, off: int
+    ) -> "tuple[torch.Tensor, int]":
+        """Write ``grad_slice * clip_coef`` into scratch at ``off``; return
+        (scaled_view, next_off).
+
+        Bit-identical to the stock path's
+        ``torch._foreach_mul_(grad, clip_coef_clamped)`` followed by fused
+        AdamW: same elementwise multiply, same fp32 coefficient tensor, same
+        out dtype — only the destination differs (scratch, not the live grad),
+        so the RMP-persisted gradient is never mutated and a mid-step fault is
+        replayable.
+        """
+        nbytes = grad_slice.numel() * grad_slice.element_size()
+        buf = self._grad_scratch[off : off + nbytes].view(grad_slice.dtype)
+        torch.mul(grad_slice, self._clip_coef_0d, out=buf)
+        return buf, off + nbytes
+
     def _step_chunk(self, chunk: list[_SliceEntry]):
         """Run fused AdamW on one chunk's slices."""
         # Mirror step_counter into each first-slice's per-param state["step"]
@@ -1059,11 +1379,13 @@ class ResilientOptimizer:
                 non_blocking=True,
             )
 
+        self._ensure_grad_scratch()
         by_group: dict[int, list[_SliceEntry]] = defaultdict(list)
         for sl in chunk:
             by_group[id(sl.group)].append(sl)
 
-        for group_slices in by_group.values():                
+        scratch_off = 0  # reused across this chunk's groups (disjoint regions)
+        for group_slices in by_group.values():
             group = group_slices[0].group
             params = []
             grads = []
@@ -1074,10 +1396,16 @@ class ResilientOptimizer:
             for sl in group_slices:
                 # Resolve grad flat view (grad tensor may change between steps)
                 grad_local = _get_local(sl.param_ref.grad)
-                sl.flat_grad = grad_local.view(-1)
+                sl.flat_grad = grad_local.view(-1)  # keep original for harvest
+
+                # Defer gradient clipping into the recoverable region: scale
+                # grad*coef into scratch (grad itself is never mutated).
+                scaled, scratch_off = self._scaled_grad_view(
+                    sl.flat_grad[sl.start : sl.end], scratch_off
+                )
 
                 params.append(sl.flat_param[sl.start : sl.end])
-                grads.append(sl.flat_grad[sl.start : sl.end])
+                grads.append(scaled)
                 exp_avgs.append(sl.flat_exp_avg[sl.start : sl.end])
                 exp_avg_sqs.append(sl.flat_exp_avg_sq[sl.start : sl.end])
                 steps.append(sl.step)
@@ -1153,8 +1481,11 @@ class ResilientOptimizer:
         Re-resolved each call:
           - grads — param.grad may be reallocated by zero_grad(set_to_none=True)
             + backward; we also write back sl.flat_grad so a downstream
-            _harvest_grads sees the right view.
+            _harvest_grads sees the right view. The grad is then scaled by
+            the clip coefficient into the per-slice scratch view (fixed
+            address, captured in the closure) — never in place.
         """
+        self._ensure_grad_scratch()
         lambdas: list = []
 
         # Step counter mirroring (per-chunk, GPU-only foreach copy).
@@ -1170,6 +1501,7 @@ class ResilientOptimizer:
         for sl in chunk:
             by_group[id(sl.group)].append(sl)
 
+        scratch_off = 0  # disjoint scratch regions across this chunk's groups
         for group_slices in by_group.values():
             group = group_slices[0].group
             params = [sl.flat_param[sl.start : sl.end] for sl in group_slices]
@@ -1177,12 +1509,26 @@ class ResilientOptimizer:
             exp_avg_sqs = [sl.flat_exp_avg_sq[sl.start : sl.end] for sl in group_slices]
             steps = [sl.step for sl in group_slices]
             grad_specs = [(sl, sl.start, sl.end) for sl in group_slices]
+            # Pre-carve a fixed-address scratch view per slice (sizes are
+            # constant across iters). The lambda re-resolves the (possibly
+            # moved) grad each call but always writes the scaled result into
+            # these stable buffers — efficient and CUDA-graph-safe.
+            scaled_views = []
+            for sl in group_slices:
+                g = _get_local(sl.param_ref.grad)
+                nbytes = (sl.end - sl.start) * g.element_size()
+                scaled_views.append(
+                    self._grad_scratch[scratch_off : scratch_off + nbytes]
+                    .view(g.dtype)
+                )
+                scratch_off += nbytes
             beta1, beta2 = group["betas"]
             weight_decay = group["weight_decay"]
             eps = group["eps"]
             lambdas.append(_make_group_step_lambda(
                 group, params, exp_avgs, exp_avg_sqs, steps, grad_specs,
                 beta1, beta2, weight_decay, eps,
+                scaled_views, self._clip_coef_0d,
             ))
 
         for lam in lambdas:

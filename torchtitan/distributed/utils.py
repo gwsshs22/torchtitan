@@ -10,7 +10,7 @@ import os
 from abc import abstractmethod
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -388,6 +388,192 @@ def set_pg_timeouts(
         torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
 
 
+class ClipLocals(NamedTuple):
+    """Pre-reduction local norm contributions for ``clip_grad_norm_``.
+
+    ``locals`` holds the values to persist into RMP *before* the reduction
+    collective(s); ``ep_params`` / ``non_ep_params`` are the EP split (None
+    when ``ep_enabled`` was False) and are used only by the in-place stock
+    scaling — the resilient path ignores them.
+
+    EP layout: ``locals = [ep_local, non_ep_local]``
+    Dense layout: ``locals = [total_local]``
+
+    Each entry is the raw ``torch.nn.utils.get_total_norm(...)`` result
+    (a 0-dim ``_NormPartial`` DTensor, or a non-DTensor 0-dim tensor when
+    a rank has no grads in that group — e.g. PP+EP corner case).
+    """
+
+    locals: list[torch.Tensor]
+    ep_params: list[torch.Tensor] | None
+    non_ep_params: list[torch.Tensor] | None
+
+
+def _apply_pp_norm_reduce(
+    total_norm: torch.Tensor,
+    norm_type: float,
+    pp_mesh: DeviceMesh | None,
+) -> torch.Tensor:
+    """Optional PP all-reduce step shared by all reducers below."""
+    if pp_mesh is None:
+        return total_norm
+    if math.isinf(norm_type):
+        dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+    else:
+        total_norm **= norm_type  # pyrefly: ignore[unsupported-operation]
+        dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
+        total_norm **= 1.0 / norm_type  # pyrefly: ignore[unsupported-operation]
+    return total_norm
+
+
+def _reduce_clip_from_locals_dense(
+    total_local: torch.Tensor,
+    max_norm: float,
+    norm_type: float,
+    pp_mesh: DeviceMesh | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a single pre-reduction local to ``(total_norm, clip_coef)``.
+
+    Mirrors the original non-EP tail of ``clip_grad_norm_``: ``full_tensor``
+    (collectives over the param mesh, if a DTensor), optional PP all-reduce,
+    same 1e-6 eps + clamp as ``torch.nn.utils.clip_grads_with_norm_``.
+    Used by stock, resilient-normal, and resilient-recovery — bit-identical
+    by construction (deterministic collective replay over identical inputs).
+    """
+    total_norm = total_local
+    if isinstance(total_norm, DTensor):
+        # Reach here if any non-PP parallelism is used. If only PP, total_norm
+        # is already a local tensor and we skip straight to the PP all-reduce.
+        total_norm = total_norm.full_tensor()
+    total_norm = _apply_pp_norm_reduce(total_norm, norm_type, pp_mesh)
+    clip_coef_clamped = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    return total_norm, clip_coef_clamped
+
+
+def _reduce_clip_from_locals_ep(
+    ep_local: torch.Tensor,
+    non_ep_local: torch.Tensor,
+    max_norm: float,
+    norm_type: float,
+    pp_mesh: DeviceMesh | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce ep + non-ep pre-reduction locals to ``(total_norm, clip_coef)``.
+
+    Same operation sequence as the original ``_clip_grad_norm_with_ep`` tail:
+    per-group ``full_tensor`` (collectives over the ep / non-ep param meshes),
+    p-norm combine, optional PP all-reduce, clamp.
+    """
+    ep_norm = ep_local.full_tensor() if isinstance(ep_local, DTensor) else ep_local
+    non_ep_norm = (
+        non_ep_local.full_tensor()
+        if isinstance(non_ep_local, DTensor)
+        else non_ep_local
+    )
+    if math.isinf(norm_type):
+        total_norm = torch.maximum(ep_norm, non_ep_norm)
+    else:
+        total_norm = (
+            ep_norm**norm_type  # pyrefly: ignore[unsupported-operation]
+            + non_ep_norm**norm_type
+        )
+        total_norm **= 1.0 / norm_type  # pyrefly: ignore[unsupported-operation]
+    total_norm = _apply_pp_norm_reduce(total_norm, norm_type, pp_mesh)
+    clip_coef_clamped = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    return total_norm, clip_coef_clamped
+
+
+@torch.no_grad()
+def clip_compute_locals(
+    parameters: torch.Tensor | Iterable[torch.Tensor],
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    *,
+    ep_enabled: bool,
+) -> ClipLocals:
+    """Compute the pre-reduction ``_NormPartial`` locals for the resilient
+    clip path — the per-rank scalars that must be persisted to RMP *before*
+    the reduction collective runs.
+
+    No collectives are issued. The caller persists ``ClipLocals.locals``
+    into RMP, then calls :func:`clip_reduce_from_locals` (which runs the
+    actual collectives + clamp).
+
+    Why split: the collective is the synchronization point. If any rank
+    advances past it (counter bumps), then every rank entered the collective
+    — which means every rank executed *this* function and its persist
+    immediately after. So persistence is witnessed by collective completion:
+    every rank's RMP holds the fresh ``locals`` for the resume step, and
+    recovery can re-run the same reducer over them with no peer reads and
+    no grads consulted (immune to advanced-rank mutated grads).
+    """
+    if ep_enabled:
+        ep_params: list[torch.Tensor] = []
+        non_ep_params: list[torch.Tensor] = []
+        ep_grads: list[torch.Tensor] = []
+        non_ep_grads: list[torch.Tensor] = []
+        for p in parameters:
+            if p.grad is None:
+                continue
+            assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
+            # pyrefly: ignore[not-iterable]
+            if "ep" in p.device_mesh.mesh_dim_names:
+                ep_params.append(p)
+                ep_grads.append(p.grad)
+            else:
+                non_ep_params.append(p)
+                non_ep_grads.append(p.grad)
+        ep_local = torch.nn.utils.get_total_norm(
+            ep_grads, norm_type, error_if_nonfinite, foreach
+        )
+        non_ep_local = torch.nn.utils.get_total_norm(
+            non_ep_grads, norm_type, error_if_nonfinite, foreach
+        )
+        return ClipLocals(
+            locals=[ep_local, non_ep_local],
+            ep_params=ep_params,
+            non_ep_params=non_ep_params,
+        )
+
+    if isinstance(parameters, torch.Tensor):
+        parameters_list: list[torch.Tensor] = [parameters]
+    else:
+        parameters_list = list(parameters)
+    grads = [p.grad for p in parameters_list if p.grad is not None]
+    total_local = torch.nn.utils.get_total_norm(
+        grads, norm_type, error_if_nonfinite, foreach
+    )
+    return ClipLocals(locals=[total_local], ep_params=None, non_ep_params=None)
+
+
+@torch.no_grad()
+def clip_reduce_from_locals(
+    locals_list: list[torch.Tensor],
+    max_norm: float,
+    norm_type: float = 2.0,
+    pp_mesh: DeviceMesh | None = None,
+    *,
+    ep_enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce per-rank locals (live or recovery-reconstructed) to
+    ``(total_norm, clip_coef_clamped)``.
+
+    The single reducer shared by the stock clip path, the resilient normal
+    path, and the resilient recovery path. Bit-identity rests on
+    deterministic collective replay over identical inputs (mesh, group, op,
+    and persisted locals are all the same at normal and recovery time).
+    """
+    if ep_enabled:
+        assert len(locals_list) == 2
+        return _reduce_clip_from_locals_ep(
+            locals_list[0], locals_list[1], max_norm, norm_type, pp_mesh
+        )
+    assert len(locals_list) == 1
+    return _reduce_clip_from_locals_dense(
+        locals_list[0], max_norm, norm_type, pp_mesh
+    )
+
+
 @torch.no_grad()
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -397,7 +583,8 @@ def clip_grad_norm_(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
     ep_enabled: bool = False,
-) -> torch.Tensor:
+    compute_only: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Clip the gradient norm of an iterable of parameters.
 
@@ -421,9 +608,18 @@ def clip_grad_norm_(
         pp_mesh: Pipeline Parallel device mesh. If not None, will reduce gradient norm across PP stages.
         ep_dense_params_mesh_ndim: Mesh ndim of the dense params when EP is used. If EP is not used,
             set it to ``None``.
+        compute_only: if True, compute the total norm and the (clamped) clip
+            coefficient but do **not** scale the gradients in place. Returns
+            ``(total_norm, clip_coef_clamped)`` instead of ``total_norm``.
+            Used by ResilientOptimizer so the clip scaling can be folded into
+            its fault-recoverable chunked step (gradients are never mutated
+            outside the replayable region). Default ``False`` keeps the
+            original in-place behavior and single-tensor return.
 
     Returns:
         Total norm of the parameter gradients (viewed as a single vector).
+        If ``compute_only`` is True, returns
+        ``(total_norm, clip_coef_clamped)`` and leaves gradients untouched.
 
     """
     if ep_enabled:
@@ -434,6 +630,7 @@ def clip_grad_norm_(
             error_if_nonfinite,
             foreach,
             pp_mesh,
+            compute_only,
         )
 
     if isinstance(parameters, torch.Tensor):
@@ -441,29 +638,23 @@ def clip_grad_norm_(
     else:
         # prevent generators from being exhausted
         parameters = list(parameters)
-    grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
+
+    # Split into compute-locals (no collective) -> reduce-from-locals
+    # (collective + clamp). Same two-phase contract the resilient path
+    # uses; keeps stock and resilient bit-identical by routing through
+    # the same reducer over the same locals.
+    clip_locals = clip_compute_locals(
+        parameters, norm_type, error_if_nonfinite, foreach, ep_enabled=False
+    )
+    total_norm, clip_coef_clamped = clip_reduce_from_locals(
+        clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=False
     )
 
-    # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
-    # We can simply reduce the DTensor to get the total norm in this tensor's process group
-    # and then convert it to a local tensor.
-    # NOTE: It has two purposes:
-    #       1. to make sure the total norm is computed correctly when PP is used (see below)
-    #       2. to return a reduced total_norm tensor whose .item() would return the correct value
-    if isinstance(total_norm, DTensor):
-        # Will reach here if any non-PP parallelism is used.
-        # If only using PP, total_norm will be a local tensor.
-        total_norm = total_norm.full_tensor()
-
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            total_norm **= norm_type  # pyrefly: ignore[unsupported-operation]
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type  # pyrefly: ignore[unsupported-operation]
+    if compute_only:
+        # Do NOT scale grads here — the resilient chunked step does
+        # `grad * clip_coef -> scratch -> fused AdamW` inside its
+        # fault-recoverable replay region.
+        return total_norm, clip_coef_clamped
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
@@ -477,55 +668,24 @@ def _clip_grad_norm_with_ep(
     error_if_nonfinite: bool,
     foreach: bool | None,
     pp_mesh: DeviceMesh | None,
-) -> torch.Tensor:
-    ep_params = []
-    non_ep_params = []
-    ep_grads = []
-    non_ep_grads = []
-
-    for p in parameters:
-        if p.grad is None:
-            continue
-        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
-        # pyrefly: ignore[not-iterable]
-        if "ep" in p.device_mesh.mesh_dim_names:
-            ep_params.append(p)
-            ep_grads.append(p.grad)
-        else:
-            non_ep_params.append(p)
-            non_ep_grads.append(p.grad)
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        ep_grads, norm_type, error_if_nonfinite, foreach
+    compute_only: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # Split into compute-locals (no collective) -> reduce-from-locals
+    # (collective + combine + clamp). The compute-locals helper also
+    # returns the ep / non_ep param split used by the in-place scaling
+    # below — so we do the split exactly once.
+    clip_locals = clip_compute_locals(
+        parameters, norm_type, error_if_nonfinite, foreach, ep_enabled=True
     )
-    # ep_grads may be an empty list, in which case get_total_norm returns tensor(0.), a non-DTensor
-    # This can occur in PP + EP setups where certain PP ranks only own non-EP layers, for instance.
-    if isinstance(ep_grads_total_norm, DTensor):
-        ep_grads_total_norm = ep_grads_total_norm.full_tensor()
+    total_norm, clip_coef_clamped = clip_reduce_from_locals(
+        clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=True
+    )
 
-    # pyrefly: ignore [missing-attribute]
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
-    ).full_tensor()
+    if compute_only:
+        # Resilient path: defer scaling into ResilientOptimizer's chunk step.
+        return total_norm, clip_coef_clamped
 
-    if math.isinf(norm_type):
-        total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
-    else:
-        total_norm = (
-            # pyrefly: ignore[unsupported-operation]
-            ep_grads_total_norm**norm_type
-            + non_ep_grads_total_norm**norm_type
-        )
-        total_norm **= 1.0 / norm_type  # pyrefly: ignore[unsupported-operation]
-
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            total_norm **= norm_type  # pyrefly: ignore[unsupported-operation]
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type  # pyrefly: ignore[unsupported-operation]
-
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
+    torch.nn.utils.clip_grads_with_norm_(clip_locals.ep_params, max_norm, total_norm, foreach)
+    torch.nn.utils.clip_grads_with_norm_(clip_locals.non_ep_params, max_norm, total_norm, foreach)
 
     return total_norm

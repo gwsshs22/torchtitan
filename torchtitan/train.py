@@ -489,6 +489,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(f"[ResilientOpt] resume_step={resume_step} (global max)")
 
+        # Recompute clip_coef from the per-rank pre-reduction locals persisted
+        # in RMP — runs the SAME reducer the normal path uses (and the SAME
+        # multi-collective sequence: per-mesh full_tensor + optional PP/EP
+        # all-reduce + clamp). All-ranks lockstep; placed before
+        # ``maybe_recover`` so the chunked replay scales by the correct
+        # coefficient. Grad-free + peer-free: the local came from this rank's
+        # valid grads at compute time and was persisted before the original
+        # collective, so collective completion ⟹ every rank's RMP holds its
+        # fresh local for the resume step.
+        self._resilient_opt.recompute_clip_coef_from_locals(
+            [p for m in self.model_parts for p in m.parameters()],
+            self.job_config.training.max_norm,
+            norm_type=2.0,
+            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+            ep_enabled=self.parallel_dims.ep_enabled,
+        )
+
         recovered = self._resilient_opt.maybe_recover(resume_step)
         if recovered:
             logger.info(f"[ResilientOpt] (rank={dist.get_rank()}) Recovery completed at step {resume_step}")
@@ -791,13 +808,46 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
+        if self._resilient_opt is not None:
+            # Defer the in-place grad scaling AND persist the pre-reduction
+            # local norm so a mid-step fault is fully recoverable:
+            #   1. compute_locals  — per-rank `_NormPartial` (no collective)
+            #   2. persist_clip_locals — write locals to RMP **before** the
+            #      reducer so collective completion witnesses universal
+            #      persistence (any rank that advances ⟹ every rank
+            #      persisted; recovery re-runs the same reducer over the
+            #      persisted locals, no peer reads, no grad reads).
+            #   3. reduce_from_locals — full_tensor/EP/PP all-reduce + clamp
+            #      (the collective(s)); shared with the stock and recovery
+            #      paths → bit-identical by construction.
+            #   4. set_clip_coef — stage coef for the chunked replay.
+            # grad_norm is still the pre-clip total norm, so the logged value
+            # is unchanged.
+            params_for_clip = [p for m in self.model_parts for p in m.parameters()]
+            pp_mesh = parallel_dims.get_optional_mesh("pp")
+            clip_locals = dist_utils.clip_compute_locals(
+                params_for_clip,
+                norm_type=2.0,
+                foreach=True,
+                ep_enabled=parallel_dims.ep_enabled,
+            )
+            self._resilient_opt.persist_clip_locals(clip_locals.locals)
+            grad_norm, clip_coef = dist_utils.clip_reduce_from_locals(
+                clip_locals.locals,
+                self.job_config.training.max_norm,
+                norm_type=2.0,
+                pp_mesh=pp_mesh,
+                ep_enabled=parallel_dims.ep_enabled,
+            )
+            self._resilient_opt.set_clip_coef(clip_coef)
+        else:
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.job_config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
         self.checkpointer.maybe_wait_for_staging()
 
         fault_triggered = self.maybe_inject_fault()

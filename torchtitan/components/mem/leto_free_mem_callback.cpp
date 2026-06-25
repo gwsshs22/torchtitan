@@ -90,20 +90,30 @@ static bool get_free_mb_nvml(int* free_mb_out, int* total_mb_out) {
   if (g_nvml_init_status != NVML_SUCCESS) return false;
   nvmlDevice_t handle;
   if (!resolve_nvml_handle(&handle)) return false;
+  // Use nvmlDeviceGetMemoryInfo_v2 when available (NVML API >= 12, i.e.
+  // CUDA 11.6+). v2 splits used / free / reserved into three buckets;
+  // computing total - used gives free + reserved, which catches a
+  // teardown that releases memory into `reserved` rather than `free`.
+  // Fall back to the v1 API on older NVML (e.g. mew1's system-package
+  // /usr/include/nvml.h ships NVML_API_VERSION 11, where only
+  // nvmlMemory_t / nvmlDeviceGetMemoryInfo exist). In v1 the relation is
+  // total = used + free, so total - used == free; the teardown-shift
+  // case isn't observable, but the OOM-threshold trigger is correct.
+#if defined(NVML_API_VERSION) && NVML_API_VERSION >= 12
   nvmlMemory_v2_t mem;
   mem.version = nvmlMemory_v2;
   nvmlReturn_t nerr = nvmlDeviceGetMemoryInfo_v2(handle, &mem);
+  const char* nvml_api_name = "nvmlDeviceGetMemoryInfo_v2";
+#else
+  nvmlMemory_t mem;
+  nvmlReturn_t nerr = nvmlDeviceGetMemoryInfo(handle, &mem);
+  const char* nvml_api_name = "nvmlDeviceGetMemoryInfo";
+#endif
   if (nerr != NVML_SUCCESS) {
-    std::fprintf(stderr,
-                 "[leto] nvmlDeviceGetMemoryInfo_v2 failed: %s\n",
-                 nvmlErrorString(nerr));
+    std::fprintf(stderr, "[leto] %s failed: %s\n",
+                 nvml_api_name, nvmlErrorString(nerr));
     return false;
   }
-  // Compute "free" as total - used rather than reading mem.free
-  // directly: in nvmlMemory_v2 the relation is total = reserved + used
-  // + free, and we want the polling loop to recognize a kill that only
-  // shrinks `used` (which is what teardown of another context does)
-  // even if `reserved` shifts. total - used = free + reserved.
   unsigned long long free_b = (mem.total > mem.used)
       ? (mem.total - mem.used)
       : 0ULL;

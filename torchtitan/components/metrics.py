@@ -595,7 +595,7 @@ class MetricsProcessor:
         color = self.color
         logger.info(
             f"{color.yellow}validate step: {step:2}  "
-            f"{color.green}loss: {loss:7.4f}  "
+            f"{color.green}loss: {loss:7.10f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}{color.reset}"

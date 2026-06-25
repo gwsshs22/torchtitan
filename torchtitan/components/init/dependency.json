@@ -17,7 +17,7 @@
     { "name": "activate_cuda_device",                  "depends_on": [] },
     { "name": "set_determinism",                       "depends_on": ["activate_cuda_device"] },
     { "name": "compute_init_device",                   "depends_on": ["set_device_attr"] },
-    { "name": "apply_parallelisms_and_init_weights",   "depends_on": ["apply_model_converters", "build_loss_fn_and_grad_accum", "compute_init_device", "activate_cuda_device", "set_determinism", "init_ft_manager"] },
+    { "name": "apply_parallelisms_and_init_weights",   "depends_on": ["apply_model_converters", "build_loss_fn_and_grad_accum", "compute_init_device", "activate_cuda_device", "set_determinism", "init_ft_manager", "build_metrics_processor"] },
     { "name": "log_device_memory_stats",               "depends_on": ["build_metrics_processor", "apply_parallelisms_and_init_weights"] },
     { "name": "build_optimizers",                      "depends_on": ["apply_parallelisms_and_init_weights"] },
     { "name": "init_rmp_and_resilient_opt",            "depends_on": ["activate_cuda_device", "build_optimizers", "build_tokenizer_and_dataloader", "compute_init_device"] },
