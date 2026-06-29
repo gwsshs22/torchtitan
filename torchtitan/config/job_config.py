@@ -1045,7 +1045,22 @@ class Leto:
 
     profile_init: bool = False
     """If True, profile each init task's wall time and GPU memory usage (via pynvml).
-    Writes a JSON file to dump_folder/init_profile_rank{rank}.json."""
+    Writes a JSON file to dump_folder/init_profile_rank{rank}.json.
+
+    When set, the active group skips the training loop entirely (see
+    torchtitan.train.main): a profile run only needs to capture init cost, and
+    the training loop's activation/optimizer allocations would OOM on top of the
+    standby group's still-resident init memory. With enable_standby the active
+    group additionally waits for the standby to finish writing its profile
+    before exiting (see profile_init_wait_timeout_s)."""
+
+    profile_init_wait_timeout_s: float = 1800.0
+    """On a profile_init + enable_standby run, how long (seconds) the active
+    group waits, after finishing init, for the standby group to finish writing
+    its init profile (init_profile/<mode>/{rank_*.json,solution.json}) before
+    exiting. The wait prevents the active's exit from triggering a shutdown that
+    SIGKILLs the standby mid-profile. On timeout the active logs an error and
+    exits anyway."""
 
     eager_init_list: list[str] = field(default_factory=list)
     """

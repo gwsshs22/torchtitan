@@ -1098,3 +1098,68 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
 
     maybe_wait_for_resuming(ctx)
     return ctx
+
+
+def wait_for_standby_init_profile(
+    job_config: JobConfig, timeout_s: float | None = None
+) -> bool:
+    """Block until the standby group has finished writing its init profile.
+
+    Counterpart to the profiling block in ``run_init_sequence``. On a
+    ``leto.profile_init`` + ``leto.enable_standby`` run the standby group
+    profiles the init sequence and writes
+    ``init_profile/<mode>/{rank_*.json,solution.json}`` (consumed later by a
+    ``leto.progressive_init`` run). The *active* group must not run training on
+    such a run — its activation/optimizer allocations would OOM on top of the
+    standby's still-resident init memory — but it also must not exit the moment
+    init finishes: that trips the master's shutdown, which SIGKILLs the standby
+    (``worker_controller._kill_standby``) before it can finish profiling. So the
+    active group calls this to stay alive until the profile is on disk, then
+    shuts down cleanly. Both groups' init complete independently here: every
+    cross-group RMP allocation flag the standby waits on is set during the
+    active's own init, so the active need not run a training step.
+
+    Returns True once the full profile (solution + one file per rank) is
+    present, or False if ``timeout_s`` elapses first (logged as an error; the
+    active still proceeds to a clean shutdown).
+    """
+    if timeout_s is None:
+        timeout_s = job_config.leto.profile_init_wait_timeout_s
+    mode = job_config.leto.init_mode
+    profile_dir = os.path.join(job_config.job.dump_folder, "init_profile", mode)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    expected = [os.path.join(profile_dir, "solution.json")] + [
+        os.path.join(profile_dir, f"rank_{r}.json") for r in range(world_size)
+    ]
+
+    def _ready(path: str) -> bool:
+        # Non-empty guards against observing a file mid-write.
+        try:
+            return os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + timeout_s
+    announced = False
+    while not all(_ready(p) for p in expected):
+        if time.monotonic() >= deadline:
+            missing = [p for p in expected if not _ready(p)]
+            logger.error(
+                f"profile_init: timed out after {timeout_s:.0f}s waiting for the "
+                f"standby init profile under {profile_dir}; {len(missing)} "
+                f"file(s) still missing (e.g. {missing[:3]}). A progressive_init "
+                f"run consuming this profile will fail until it is regenerated."
+            )
+            return False
+        if not announced:
+            logger.info(
+                f"profile_init: active group init complete; holding (no training) "
+                f"until the standby finishes profiling {world_size} rank(s) under "
+                f"{profile_dir}"
+            )
+            announced = True
+        time.sleep(1.0)
+    logger.info(
+        "profile_init: standby init profile complete; terminating active group"
+    )
+    return True

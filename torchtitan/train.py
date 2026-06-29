@@ -1221,6 +1221,21 @@ def main(trainer_class: type[Trainer]) -> None:
             ), "Must enable checkpointing when creating a seed checkpoint."
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
+        elif config.leto.profile_init:
+            # A profile_init run exists only to capture the init-cost profile;
+            # the active group must not run the training loop, whose
+            # activation/optimizer allocations would OOM on top of the standby
+            # group's still-resident init memory. When a standby is present it is
+            # the one writing the profile (init_profile/<mode>/...), so the active
+            # group must stay alive until those files land — exiting first trips
+            # the master's shutdown, which SIGKILLs the standby mid-profile. Once
+            # the profile is on disk the wait returns and we fall through to the
+            # clean close()/destroy_process_group() in the `else` clause below.
+            logger.info("leto.profile_init enabled - skipping training execution")
+            if config.leto.enable_standby:
+                from torchtitan.init import wait_for_standby_init_profile
+
+                wait_for_standby_init_profile(config)
         else:
             trainer.train()
     except Exception:
