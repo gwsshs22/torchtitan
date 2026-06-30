@@ -39,7 +39,6 @@ from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor as _build_metrics_processor,
     ensure_pp_loss_visible,
-    GPUMemoryMonitor,
 )
 from torchtitan.components.rmp_manager import RmpManager
 from leto.rmp.flags import FLAG_KIND_CPU, FLAG_KIND_GPU
@@ -91,7 +90,6 @@ class InitContext:
     _color: Any = None
 
     # components
-    gpu_memory_monitor: GPUMemoryMonitor | None = None
     ft_manager: FTManager | None = None
     gc_handler: utils.GarbageCollection | None = None
     train_spec: train_spec_module.TrainSpec | None = None
@@ -202,22 +200,6 @@ def set_device_attr(ctx: InitContext) -> None:
     ctx.device = torch.device(f"{ctx._device_type}:{int(os.environ['LOCAL_RANK'])}")
 
 
-def start_gpu_memory_monitor(ctx: InitContext) -> None:
-    job_config = ctx.job_config
-    if job_config.metrics.enable_gpu_memory_monitor:
-        save_dir = (
-            os.environ.get("LETO_LOGS_DIR") or job_config.job.dump_folder
-            if job_config.metrics.save_gpu_memory_trace
-            else None
-        )
-        ctx.gpu_memory_monitor = GPUMemoryMonitor(
-            local_rank=int(os.environ["LOCAL_RANK"]),
-            rank=ctx._global_rank,
-            save_dir=save_dir,
-            interval=job_config.metrics.gpu_memory_monitor_interval,
-        )
-
-
 def compute_batch_info(ctx: InitContext) -> None:
     ctx._global_rank = int(os.environ["RANK"])
     ctx._batch_degree, ctx._batch_rank = ctx.parallel_dims.get_batch_info(
@@ -313,7 +295,6 @@ def build_metrics_processor(ctx: InitContext) -> None:
         job_config,
         ctx.parallel_dims,
         ctx._model_args,
-        gpu_memory_monitor=ctx.gpu_memory_monitor,
     )
     ctx._color = ctx.metrics_processor.color
 
@@ -812,7 +793,6 @@ def warmup_stages(ctx: InitContext) -> None:
 
 REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
     set_device_attr,
-    start_gpu_memory_monitor,
     compute_batch_info,
     init_ft_manager,
     init_garbage_collection,
@@ -849,7 +829,6 @@ BASELINE_SEQUENCE: list[Callable[[InitContext], None]] = [
     activate_cuda_device,
     # --- CUDA context set immediately ---
     set_device_attr,
-    start_gpu_memory_monitor,
     compute_batch_info,
     init_ft_manager,
     init_garbage_collection,

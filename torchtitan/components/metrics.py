@@ -4,9 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import csv
 import os
-import threading
 import time
 from collections import namedtuple
 from datetime import datetime
@@ -104,89 +102,6 @@ def build_device_memory_monitor():
         f"with {device_memory_monitor.device_capacity_gib:.2f}GiB memory"
     )
     return device_memory_monitor
-
-
-class GPUMemoryMonitor:
-    """Background thread polling pynvml for nvidia-smi-level GPU memory per rank."""
-
-    def __init__(
-        self,
-        local_rank: int,
-        rank: int,
-        save_dir: str | None = None,
-        interval: float = 1.0,
-    ):
-        from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo, nvmlInit
-
-        nvmlInit()
-        self._handle = nvmlDeviceGetHandleByIndex(local_rank)
-        self._nvmlDeviceGetMemoryInfo = nvmlDeviceGetMemoryInfo
-        self._rank = rank
-        self._interval = interval
-
-        # Peak tracking (thread-safe via GIL for simple reads/writes)
-        self._current_used_bytes: int = 0
-        self._peak_used_bytes: int = 0
-        self._total_bytes: int = 0
-
-        # CSV output
-        self._csv_file = None
-        self._csv_writer = None
-        if save_dir is not None:
-            mem_dir = os.path.join(save_dir, "mem")
-            os.makedirs(mem_dir, exist_ok=True)
-            path = os.path.join(mem_dir, f"rank_{rank:04d}.csv")
-            self._csv_file = open(path, "w", newline="")
-            self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow(["timestamp", "used_MiB", "total_MiB"])
-            logger.info(f"GPU memory trace will be saved to {path}")
-
-        # Start polling thread
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
-
-    def _poll_loop(self):
-        from pynvml import nvmlMemory_v2
-        while not self._stop_event.is_set():
-            try:
-                info = self._nvmlDeviceGetMemoryInfo(self._handle, version=nvmlMemory_v2)
-                self._current_used_bytes = info.used
-                self._total_bytes = info.total
-                if info.used > self._peak_used_bytes:
-                    self._peak_used_bytes = info.used
-
-                if self._csv_writer is not None:
-                    self._csv_writer.writerow([
-                        f"{time.time():.3f}",
-                        info.used // (1024 * 1024),
-                        info.total // (1024 * 1024),
-                    ])
-                    self._csv_file.flush()
-            except Exception:
-                pass
-            self._stop_event.wait(self._interval)
-
-    def get_current_usage_gib(self) -> float:
-        return self._current_used_bytes / (1024**3)
-
-    def get_peak_usage_gib(self) -> float:
-        return self._peak_used_bytes / (1024**3)
-
-    def reset_peak(self):
-        self._peak_used_bytes = self._current_used_bytes
-
-    def close(self):
-        self._stop_event.set()
-        self._thread.join(timeout=5.0)
-        if self._csv_file is not None:
-            self._csv_file.close()
-            self._csv_file = None
-        try:
-            from pynvml import nvmlShutdown
-            nvmlShutdown()
-        except Exception:
-            pass
 
 
 class BaseLogger:
@@ -433,7 +348,6 @@ class MetricsProcessor:
     parallel_dims: ParallelDims
     job_config: JobConfig
     device_memory_monitor: DeviceMemoryMonitor
-    gpu_memory_monitor: GPUMemoryMonitor | None
     color: utils.NoColor | utils.Color
 
     gpu_peak_flops: float
@@ -451,13 +365,11 @@ class MetricsProcessor:
         job_config: JobConfig,
         parallel_dims: ParallelDims,
         tag: str | None = None,
-        gpu_memory_monitor: GPUMemoryMonitor | None = None,
     ):
         self.logger = _build_metric_logger(job_config, parallel_dims, tag)
         self.parallel_dims = parallel_dims
         self.job_config = job_config
         self.device_memory_monitor = build_device_memory_monitor()
-        self.gpu_memory_monitor = gpu_memory_monitor
         # used for colorful printing
         self.color = (
             utils.NoColor()
@@ -528,14 +440,6 @@ class MetricsProcessor:
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
 
-        if self.gpu_memory_monitor is not None:
-            metrics["memory/nvidia_smi_used(GiB)"] = (
-                self.gpu_memory_monitor.get_current_usage_gib()
-            )
-            metrics["memory/nvidia_smi_peak(GiB)"] = (
-                self.gpu_memory_monitor.get_peak_usage_gib()
-            )
-
         if extra_metrics:
             metrics.update(extra_metrics)
 
@@ -543,17 +447,12 @@ class MetricsProcessor:
 
         color = self.color
 
-        nvidia_smi_str = ""
-        if self.gpu_memory_monitor is not None:
-            nvidia_smi_gib = self.gpu_memory_monitor.get_current_usage_gib()
-            nvidia_smi_str = f"  {color.yellow}nvidia-smi: {nvidia_smi_gib:5.2f}GiB"
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:7.10f}  "
             f"{color.orange}grad_norm: {grad_norm:7.10f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)"
-            f"{nvidia_smi_str}  "
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
@@ -563,8 +462,6 @@ class MetricsProcessor:
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
-        if self.gpu_memory_monitor is not None:
-            self.gpu_memory_monitor.reset_peak()
 
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
@@ -606,8 +503,6 @@ class MetricsProcessor:
         self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
-        if self.gpu_memory_monitor is not None:
-            self.gpu_memory_monitor.close()
         self.logger.close()
 
 
@@ -616,7 +511,6 @@ def build_metrics_processor(
     parallel_dims: ParallelDims,
     model_args: "BaseModelArgs | None" = None,
     tag: str | None = None,
-    gpu_memory_monitor: GPUMemoryMonitor | None = None,
 ) -> MetricsProcessor:
     """Create a metrics processor.
 
@@ -625,12 +519,8 @@ def build_metrics_processor(
         parallel_dims (ParallelDims): Parallel dimensions.
         model_args (BaseModelArgs | None): Model-specific arguments. Defaults to None.
         tag (str | None): Tag to use for TensorBoard or WandB. Defaults to None.
-        gpu_memory_monitor (GPUMemoryMonitor | None): Optional pynvml-based GPU memory
-            monitor for nvidia-smi-level memory tracking. Defaults to None.
 
     Returns:
         MetricsProcessor: A metrics processor.
     """
-    return MetricsProcessor(
-        job_config, parallel_dims, tag, gpu_memory_monitor=gpu_memory_monitor
-    )
+    return MetricsProcessor(job_config, parallel_dims, tag)
