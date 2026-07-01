@@ -364,12 +364,60 @@ def init_gemini_checkpoint_partial(ctx: InitContext) -> None:
         )
 
 
+def _maybe_standby_oom_test_alloc(ctx: InitContext) -> None:
+    """OOM-safeguard E2E test hook (standby side). Make this standby rank
+    reserve (through the active's broker) and HOLD a controlled amount of GPU
+    memory after its progressive init, so the active's reclaim of the standby
+    is the difference between OOM and success when the active's usage spikes
+    (maybe_alloc_for_oom_test). Gated on leto.oom_test_standby_alloc_mb and
+    progressive_init. The tensor is stashed on ctx so it survives parking."""
+    cfg = ctx.job_config.leto
+    alloc_mb = int(getattr(cfg, "oom_test_standby_alloc_mb", 0))
+    if alloc_mb <= 0 or not cfg.progressive_init:
+        return
+    rank = int(os.environ.get("RANK", "0"))
+    # Reserve through the broker (raise our grant to cover current footprint
+    # plus the test allocation). Only HOLD if the broker grants it -- a
+    # relaunched standby after a reclaim has less free memory and would
+    # OOM-loop if it allocated past what the broker can give it.
+    try:
+        from torchtitan.components.init.progressive import _reserve
+
+        cur_mb = _get_gpu_mem_mb() or 0.0
+        target_b = int((cur_mb + alloc_mb + 256) * 1024 * 1024)
+        kind, _ = _reserve(rank, target_b, 0.01, None)
+        logger.info(
+            f"[oom_test] standby rank={rank} reserve(+{alloc_mb}MiB, "
+            f"target~{int(cur_mb + alloc_mb)}MiB) -> {kind}"
+        )
+    except Exception:
+        logger.warning("[oom_test] standby reservation failed", exc_info=True)
+        kind = "deny"
+    if kind != "grant":
+        logger.info(
+            f"[oom_test] standby rank={rank} reservation not granted; "
+            f"skipping the {alloc_mb}MiB hold"
+        )
+        return
+    n = (alloc_mb * 1024 * 1024) // 2  # bf16 = 2 bytes/elem
+    ctx._oom_test_hold = torch.empty(n, dtype=torch.bfloat16, device="cuda")
+    ctx._oom_test_hold.fill_(0)
+    torch.cuda.synchronize()
+    free_b, _ = torch.cuda.mem_get_info()
+    logger.info(
+        f"[oom_test] standby rank={rank} holding {alloc_mb}MiB; "
+        f"device free now {int(free_b // (1024 * 1024))}MiB"
+    )
+
+
 def maybe_wait_for_resuming(ctx: InitContext) -> None:
     """Standby poll — blocks until activated or terminated."""
     if not _LETO_AVAILABLE:
         return
     if not leto_is_standby():
         return
+
+    _maybe_standby_oom_test_alloc(ctx)
 
     logger.info("Entering standby mode - polling for activation...")
     poll_interval = ctx.job_config.leto.standby_poll_interval
@@ -866,27 +914,47 @@ _NVML_STATE: dict | None = None
 def _get_gpu_mem_mb() -> float | None:
     """Return GPU memory used (MiB) by the current PID via pynvml, or None.
 
-    Caches the NVML init + device handle across calls so profiling many
-    init tasks does not repeatedly pay the handle-lookup cost.
+    Finds this process's physical GPU by scanning every NVML device for the
+    current PID, then caches that handle. This is robust to CUDA_VISIBLE_DEVICES
+    / hostfile `devices=` remapping: NVML indexes *physical* GPUs and ignores
+    CUDA visibility, so resolving the handle by LOCAL_RANK (as before) queried
+    the wrong card whenever `devices=` didn't start at 0 -> the per-PID lookup
+    matched nothing and returned 0. Matching by PID sidesteps the mapping
+    entirely (mirrors the reservation broker, which resolves by PCI bus id).
     """
     global _NVML_STATE
     try:
-        from pynvml import nvmlDeviceGetComputeRunningProcesses_v3
+        from pynvml import (
+            nvmlDeviceGetComputeRunningProcesses_v3,
+            nvmlDeviceGetCount,
+            nvmlDeviceGetHandleByIndex,
+            nvmlInit,
+        )
+
+        my_pid = os.getpid()
         if _NVML_STATE is None:
-            from pynvml import nvmlDeviceGetHandleByIndex, nvmlInit
             nvmlInit()
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-            _NVML_STATE = {
-                "handle": nvmlDeviceGetHandleByIndex(local_rank),
-                "pid": os.getpid(),
-            }
-        procs = nvmlDeviceGetComputeRunningProcesses_v3(_NVML_STATE["handle"])
-        my_pid = _NVML_STATE["pid"]
-        used = 0
-        for p in procs:
-            if p.pid == my_pid and p.usedGpuMemory is not None:
-                used += p.usedGpuMemory
-        return used / (1024 * 1024)
+            _NVML_STATE = {"handle": None, "count": nvmlDeviceGetCount()}
+
+        # Once we've found our GPU, query only it; otherwise scan all (the CUDA
+        # context may not exist yet -> not on any GPU -> a correct 0).
+        cached = _NVML_STATE["handle"]
+        handles = (
+            [cached]
+            if cached is not None
+            else [nvmlDeviceGetHandleByIndex(i) for i in range(_NVML_STATE["count"])]
+        )
+        for h in handles:
+            used = 0
+            found = False
+            for p in nvmlDeviceGetComputeRunningProcesses_v3(h):
+                if p.pid == my_pid and p.usedGpuMemory is not None:
+                    used += p.usedGpuMemory
+                    found = True
+            if found:
+                _NVML_STATE["handle"] = h  # cache our GPU for subsequent calls
+                return used / (1024 * 1024)
+        return 0.0
     except Exception:
         return None
 
@@ -902,6 +970,7 @@ def _run_progressive_sequence(
     from torchtitan.components.init.progressive import (
         load_rank_deltas,
         load_solution,
+        standby_register,
         try_advance,
     )
 
@@ -927,7 +996,6 @@ def _run_progressive_sequence(
             f"Re-run profiling to refresh the schedule."
         )
 
-    safety_mb = float(job_config.leto.progressive_safety_mb)
     threshold_mb = float(job_config.leto.progressive_zero_delta_threshold_mb)
     poll_s = float(job_config.leto.progressive_poll_interval_ms) / 1000.0
 
@@ -938,16 +1006,27 @@ def _run_progressive_sequence(
             logger.warning("Error polling standby status", exc_info=True)
             return STANDBY_ACTION_TERMINATE
 
+    # Identify this standby instance to the active's broker before driving the
+    # shm reservation handshake. (The C++/Python ledger layout is verified by
+    # test_reservation.py, not at runtime, so the standby stays pure-Python.)
+    standby_register(rank)
+
     activated = False
+    cumulative_mb = 0.0  # running target footprint of reserved tasks so far
     for name in ordered_names:
         if not activated:
             delta_mb = deltas.get(name, 0.0)
-            logger.info(f"[progressive] rank={rank} next_task={name} delta_mb={delta_mb:.1f}")
+            if delta_mb >= threshold_mb:
+                cumulative_mb += delta_mb
+            logger.info(
+                f"[progressive] rank={rank} next_task={name} "
+                f"delta_mb={delta_mb:.1f} cumulative_mb={cumulative_mb:.1f}"
+            )
             while True:
                 outcome, extra = try_advance(
                     ctx.standby_gloo_pg,
                     delta_mb,
-                    safety_mb,
+                    cumulative_mb,
                     threshold_mb,
                     poll_s,
                     status_check=_status_check,

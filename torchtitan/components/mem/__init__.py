@@ -8,6 +8,15 @@ below `threshold_mb` during a cache-miss expansion, and registers an
 atexit hook that clears the callback before interpreter teardown so the
 static `py::object` in the C++ module never decrefs after Python is
 finalized.
+
+The FreeMemoryCallback interface receives no arguments, so it cannot see
+how large the allocation that triggered it is. Passing `request_aware=True`
+installs a transparent `LetoRecordingAllocator` -- a pass-through wrapper
+around the native CUDA allocator that stamps each in-flight allocation's
+size into a thread-local before delegating. The callback then reads that
+size and reclaims the standby only when the pending request (plus
+`request_margin_mb` headroom) would not fit in free GPU memory, which is
+far more precise than the absolute `threshold_mb` floor.
 """
 
 import atexit
@@ -90,6 +99,7 @@ def _build_with_fcntl_lock(build_dir: str, src_path: str) -> object:
             sources=[src_path],
             extra_include_paths=[os.path.join(cuda_home, "include")],
             extra_ldflags=[
+                "-lc10",
                 "-lc10_cuda",
                 "-lcudart",
                 "-lnvidia-ml",
@@ -128,24 +138,81 @@ def _load_module():
 
 
 def install_oom_safeguard(
-    threshold_mb: int, kill_callback: Callable[[], bool]
+    threshold_mb: int,
+    kill_callback: Callable[[], bool],
+    request_aware: bool = False,
+    request_margin_mb: int = 0,
 ) -> None:
     """Install the OOM safeguard. No-op if threshold_mb <= 0.
 
     Args:
-        threshold_mb: Free GPU MiB below which the kill_callback fires.
+        threshold_mb: Free GPU MiB below which the kill_callback fires
+            (legacy absolute-floor criterion, used when request_aware is
+            False).
         kill_callback: Zero-arg callable returning True if memory was freed
             (so PyTorch retries the allocation), False otherwise.
+        request_aware: When True, install the RecordingAllocator and switch
+            the firing criterion to the request-aware form: fire iff free
+            GPU MiB < (pending allocation MiB + request_margin_mb). This is
+            more precise than the absolute floor because it reclaims only
+            when the allocation actually in flight would not fit.
+        request_margin_mb: Safety headroom (MiB) added to the pending
+            request in the request-aware criterion. Ignored unless
+            request_aware is True.
     """
     global _atexit_registered
     if threshold_mb <= 0:
         return
     m = _load_module()
     m.set_threshold_mb(int(threshold_mb))
+    if request_aware:
+        # Order matters: install the recorder before flipping the criterion
+        # so the callback never reads a stale request size on its first fire.
+        m.install_recording_allocator()
+        m.set_request_margin_mb(int(request_margin_mb))
+        m.set_request_aware(True)
     m.set_kill_callback(kill_callback)
     if not _atexit_registered:
         atexit.register(m.clear_kill_callback)
         _atexit_registered = True
+
+
+def install_recording_allocator() -> bool:
+    """Install the transparent RecordingAllocator as the current CUDA
+    allocator so the FreeMemoryCallback can read the in-flight allocation
+    size. Idempotent; safe to call at any point in the process. Returns
+    False if no CUDA backend allocator exists yet."""
+    return bool(_load_module().install_recording_allocator())
+
+
+def is_recording_allocator_installed() -> bool:
+    if _module is None:
+        return False
+    return bool(_module.is_recording_allocator_installed())
+
+
+def set_request_aware(enabled: bool) -> None:
+    """Toggle the request-aware firing criterion. Requires the
+    RecordingAllocator to be installed to be meaningful."""
+    if _module is None:
+        return
+    _module.set_request_aware(bool(enabled))
+
+
+def set_request_margin_mb(mb: int) -> None:
+    """Headroom (MiB) added to the pending request in the request-aware
+    criterion: fire iff free MiB < request MiB + margin."""
+    if _module is None:
+        return
+    _module.set_request_margin_mb(int(mb))
+
+
+def get_last_request_mb() -> int:
+    """Most recent allocation request (MiB) seen by the RecordingAllocator,
+    across all threads. Observability only."""
+    if _module is None:
+        return 0
+    return int(_module.get_last_request_mb())
 
 
 def set_threshold_mb(mb: int) -> None:
@@ -171,3 +238,107 @@ def reset_num_kill_standby_called() -> None:
     if _module is None:
         return
     _module.reset_num_kill_standby_called()
+
+
+# ---------------------------------------------------------------------------
+# Reservation broker (active side)
+# ---------------------------------------------------------------------------
+
+_reservation_atexit_registered = False
+
+
+def install_reservation_broker(
+    ledger_path: str,
+    margin_mb: int,
+    kill_callback: Optional[Callable[[], tuple]] = None,
+) -> None:
+    """Active-side setup for standby memory reservation.
+
+    Installs the RecordingAllocator (so the active's allocations serialize
+    against grants via the broker mutex), mmaps the per-rank shm ledger, and
+    starts the C++ broker thread. The broker reads NVML and grants/denies
+    reservations posted by the co-located standby, keeping
+    `others_used + granted <= capacity - margin`.
+
+    Args:
+        ledger_path: per-rank shm file shared with the standby
+            (e.g. f"{LETO_PROGRESSIVE_SHM_PREFIX}{rank}").
+        margin_mb: global safety headroom (MiB) the broker keeps free.
+        kill_callback: zero-arg callable returning (memory_freed, killed_pid),
+            invoked by the reservation-aware FreeMemoryCallback to *reclaim*
+            (kill) the standby. Pass None to run the broker in grant-only mode
+            (the standby still comes up via grants, but the active never
+            reclaims it) -- this is the "no safeguard" control.
+    """
+    global _reservation_atexit_registered
+    m = _load_module()
+    if not m.install_recording_allocator():
+        raise RuntimeError(
+            "install_reservation_broker: no CUDA backend allocator yet "
+            "(call after torch.cuda is initialized)"
+        )
+    if not m.attach_reservation_ledger(ledger_path):
+        raise RuntimeError(
+            f"install_reservation_broker: attach_reservation_ledger("
+            f"{ledger_path}) failed"
+        )
+    m.set_reservation_margin_mb(int(margin_mb))
+    if kill_callback is not None:
+        m.set_kill_callback(kill_callback)
+    if not m.start_broker(int(margin_mb)):
+        raise RuntimeError("install_reservation_broker: start_broker failed")
+    if not _reservation_atexit_registered:
+        atexit.register(m.stop_broker)
+        atexit.register(m.clear_kill_callback)
+        _reservation_atexit_registered = True
+
+
+def reset_granted() -> None:
+    """Void the cumulative grant (e.g. after the standby is killed/activated).
+    A fresh standby instance also resets it automatically via its epoch."""
+    if _module is None:
+        return
+    _module.reset_granted()
+
+
+def is_broker_running() -> bool:
+    if _module is None:
+        return False
+    return bool(_module.is_broker_running())
+
+
+def get_granted_mb() -> int:
+    if _module is None:
+        return 0
+    return int(_module.get_granted_mb())
+
+
+def get_assert_b_violations() -> int:
+    """Number of times the broker observed standby_actual > granted (+tol):
+    a protocol violation (a task over-allocated past its profiled delta)."""
+    if _module is None:
+        return 0
+    return int(_module.get_assert_b_violations())
+
+
+def ledger_constants() -> dict:
+    """Ledger byte-layout constants (from the C++ struct). Used by the standby
+    to drive the shm handshake and to assert the Python layout matches."""
+    m = _load_module()
+    return {
+        "LEDGER_NBYTES": int(m.LEDGER_NBYTES),
+        "LEDGER_MAGIC": int(m.LEDGER_MAGIC),
+        "VERDICT_PENDING": int(m.VERDICT_PENDING),
+        "VERDICT_DENY": int(m.VERDICT_DENY),
+        "VERDICT_GRANT": int(m.VERDICT_GRANT),
+        "OFF_MAGIC": int(m.OFF_MAGIC),
+        "OFF_STANDBY_PID": int(m.OFF_STANDBY_PID),
+        "OFF_STANDBY_EPOCH": int(m.OFF_STANDBY_EPOCH),
+        "OFF_REQ_SEQ": int(m.OFF_REQ_SEQ),
+        "OFF_REQ_BYTES": int(m.OFF_REQ_BYTES),
+        "OFF_RESP_SEQ": int(m.OFF_RESP_SEQ),
+        "OFF_RESP_VERDICT": int(m.OFF_RESP_VERDICT),
+        "OFF_GRANTED": int(m.OFF_GRANTED),
+        "OFF_EFFECTIVE_FREE": int(m.OFF_EFFECTIVE_FREE),
+        "OFF_STANDBY_ACTUAL": int(m.OFF_STANDBY_ACTUAL),
+    }

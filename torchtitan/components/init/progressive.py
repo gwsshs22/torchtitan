@@ -1,11 +1,19 @@
-"""Progressive standby init — shared-memory advance signal.
+"""Progressive standby init — explicit GPU-memory reservation.
 
-At end of each training iteration, the active rank writes its current
-`cudaMemGetInfo` free-MiB (int32) into `/dev/shm/leto_progressive_rank_{R}`.
-The paired standby rank polls that file between init tasks, decides locally
-whether the next task fits its memory budget, and all-reduces that decision
-(MIN) across standby ranks over a CPU-only gloo PG. Tasks only advance when
-all ranks agree.
+A standby ("shadow") rank runs its init tasks against an explicit reservation
+with the co-located active rank, instead of guessing from a stale free-memory
+reading. Both share a per-rank shm ledger `/dev/shm/leto_progressive_rank_{R}`
+(the file the worker controller pre-creates). The active process runs the C++
+reservation broker (see `torchtitan/components/mem`), which owns the device's
+NVML view and grants/denies; the standby here only posts requests and waits.
+
+Per init task the standby posts its *cumulative* target footprint (sum of the
+profiled deltas of all reserved tasks so far). The broker grants iff
+`others_used + granted <= capacity - margin`, accounting the standby at its
+reservation rather than its current usage. Cumulative targets make a request
+idempotent under the MIN all-reduce retry across standby ranks: a task only
+advances when *all* ranks are granted, and re-requesting the same target never
+double-counts.
 """
 
 from __future__ import annotations
@@ -15,7 +23,6 @@ import logging
 import mmap
 import os
 import struct
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -27,8 +34,31 @@ logger = logging.getLogger(__name__)
 
 
 _PREFIX_ENV = "LETO_PROGRESSIVE_SHM_PREFIX"
-_INT32 = struct.Struct("<i")
+
+# Reservation-ledger byte layout. MUST match `struct ReservationLedger` in
+# torchtitan/components/mem/leto_free_mem_callback.cpp. assert_ledger_layout()
+# (and tests) verify this against the C++ module's exported offsets.
+LEDGER_NBYTES = 64
+LEDGER_MAGIC = 0x4C54524E  # "LTRN"
+OFF_MAGIC = 0
+OFF_STANDBY_PID = 4
+OFF_STANDBY_EPOCH = 8
+OFF_REQ_SEQ = 12
+OFF_REQ_BYTES = 16
+OFF_RESP_SEQ = 24
+OFF_RESP_VERDICT = 28
+OFF_GRANTED = 32
+OFF_EFFECTIVE_FREE = 40
+OFF_STANDBY_ACTUAL = 48
+VERDICT_PENDING = -1
+VERDICT_DENY = 0
+VERDICT_GRANT = 1
+
+_I32 = struct.Struct("<i")
+_U32 = struct.Struct("<I")
+_I64 = struct.Struct("<q")
 _mmap_cache: dict[int, mmap.mmap] = {}
+_resv_seq: dict[int, int] = {}  # rank -> last request seq we posted
 
 
 def _shm_path(rank: int) -> str:
@@ -48,175 +78,160 @@ def _get_mmap(rank: int) -> mmap.mmap:
     path = _shm_path(rank)
     fd = os.open(path, os.O_RDWR)
     try:
-        mm = mmap.mmap(fd, 4, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        # The worker controller creates the file at LEDGER_NBYTES; grow it
+        # defensively in case an older controller created the 4-byte version.
+        if os.fstat(fd).st_size < LEDGER_NBYTES:
+            os.ftruncate(fd, LEDGER_NBYTES)
+        mm = mmap.mmap(fd, LEDGER_NBYTES, prot=mmap.PROT_READ | mmap.PROT_WRITE)
     finally:
         os.close(fd)
     _mmap_cache[rank] = mm
     return mm
 
 
-# ---------------------------------------------------------------------------
-# Active side
-# ---------------------------------------------------------------------------
-
-def write_free_mb(rank: int, free_mb: int) -> None:
-    """Publish current free-GPU MiB to this rank's shm file."""
-    mm = _get_mmap(rank)
-    _INT32.pack_into(mm, 0, int(free_mb))
-
-
 def get_free_mb() -> int:
-    """Current GPU free memory in MiB via torch.cuda.mem_get_info."""
+    """Current GPU free memory in MiB via torch.cuda.mem_get_info. Kept for
+    callers (e.g. the active OOM-safeguard kill callback); the reservation
+    broker itself reads NVML, not this."""
     free_b, _ = torch.cuda.mem_get_info()
     return int(free_b // (1024 * 1024))
 
 
-_signal_thread: Optional[threading.Thread] = None
-_signal_thread_lock = threading.Lock()
+def assert_ledger_layout() -> None:
+    """Verify this module's layout constants match the C++ struct. Raises on
+    drift. Cheap; call from tests (or once at standby startup)."""
+    from torchtitan.components.mem import ledger_constants
 
-
-def start_signal_thread(rank: int, device: int, interval_s: float = 1.0) -> None:
-    """Start a daemon thread that publishes free-GPU MiB to this rank's shm
-    file every `interval_s` seconds. Idempotent: a second call is a no-op.
-
-    Shares the process's primary CUDA context — no extra context is created
-    for the thread. `device` (= LOCAL_RANK) is set thread-locally so
-    mem_get_info queries the right device.
-    """
-    global _signal_thread
-    with _signal_thread_lock:
-        if _signal_thread is not None:
-            return
-
-        def _loop():
-            # Per-thread current device. Primary context for `device` already
-            # exists (created by main thread during activate_cuda_device), so
-            # this is a thread-local pointer flip — zero GPU allocation.
-            torch.cuda.set_device(device)
-            while True:
-                try:
-                    write_free_mb(rank, get_free_mb())
-                except Exception:
-                    logger.exception("[progressive] signal thread error")
-                time.sleep(interval_s)
-
-        _signal_thread = threading.Thread(
-            target=_loop, daemon=True, name="leto-progressive-signal"
-        )
-        _signal_thread.start()
-        logger.info(
-            f"[progressive] rank={rank} device={device} started signal thread "
-            f"(interval={interval_s}s)"
-        )
+    c = ledger_constants()
+    here = {
+        "LEDGER_NBYTES": LEDGER_NBYTES,
+        "LEDGER_MAGIC": LEDGER_MAGIC,
+        "VERDICT_PENDING": VERDICT_PENDING,
+        "VERDICT_DENY": VERDICT_DENY,
+        "VERDICT_GRANT": VERDICT_GRANT,
+        "OFF_MAGIC": OFF_MAGIC,
+        "OFF_STANDBY_PID": OFF_STANDBY_PID,
+        "OFF_STANDBY_EPOCH": OFF_STANDBY_EPOCH,
+        "OFF_REQ_SEQ": OFF_REQ_SEQ,
+        "OFF_REQ_BYTES": OFF_REQ_BYTES,
+        "OFF_RESP_SEQ": OFF_RESP_SEQ,
+        "OFF_RESP_VERDICT": OFF_RESP_VERDICT,
+        "OFF_GRANTED": OFF_GRANTED,
+        "OFF_EFFECTIVE_FREE": OFF_EFFECTIVE_FREE,
+        "OFF_STANDBY_ACTUAL": OFF_STANDBY_ACTUAL,
+    }
+    for k, v in here.items():
+        if c.get(k) != v:
+            raise RuntimeError(
+                f"reservation ledger layout drift: {k} python={v} cpp={c.get(k)}"
+            )
 
 
 # ---------------------------------------------------------------------------
-# Standby side
+# Standby side — reservation client
 # ---------------------------------------------------------------------------
 
-def _read_int32(rank: int) -> int:
+def standby_register(rank: int, epoch: Optional[int] = None) -> None:
+    """Identify this standby instance in the ledger (call once before the
+    first reservation). `epoch` defaults to LETO_PROCESS_GROUP_ID so a fresh
+    standby instance makes the broker void the prior grant."""
+    if epoch is None:
+        epoch = int(os.environ.get("LETO_PROCESS_GROUP_ID", os.getpid()))
     mm = _get_mmap(rank)
-    return _INT32.unpack_from(mm, 0)[0]
-
-
-def _consume_signal(rank: int) -> None:
-    mm = _get_mmap(rank)
-    _INT32.pack_into(mm, 0, -1)
+    # Start our request-seq above the broker's last response so the first
+    # reserve() doesn't mistake a stale response for its own.
+    _resv_seq[rank] = _U32.unpack_from(mm, OFF_RESP_SEQ)[0]
+    _I32.pack_into(mm, OFF_STANDBY_PID, int(os.getpid()))
+    _U32.pack_into(mm, OFF_STANDBY_EPOCH, int(epoch) & 0xFFFFFFFF)
 
 
 StatusCheck = Callable[[], Optional[int]]
 
 
-def wait_for_signal(
+def _reserve(
     rank: int,
+    cumulative_bytes: int,
     poll_interval_s: float,
-    status_check: Optional[StatusCheck] = None,
+    status_check: Optional[StatusCheck],
     status_interval_s: float = 1.0,
 ) -> Tuple[str, int]:
-    """Block until shm[rank] >= 0, then consume and return ("signal", free_mb).
+    """Post a cumulative-target reservation and block for the broker's verdict.
 
-    If status_check is provided, it is invoked every status_interval_s while
-    waiting; a truthy return aborts the wait and returns ("status", code).
+    Returns ("grant"|"deny", 0) or ("status", code) if status_check trips.
     """
+    mm = _get_mmap(rank)
+    seq = (_resv_seq.get(rank, 0) + 1) & 0xFFFFFFFF
+    if seq == 0:
+        seq = 1  # 0 is the ledger's initial resp_seq; never use it as a req
+    _resv_seq[rank] = seq
+    _I64.pack_into(mm, OFF_REQ_BYTES, int(cumulative_bytes))
+    _U32.pack_into(mm, OFF_REQ_SEQ, seq)  # publish last → signals the request
     next_status = time.monotonic() + status_interval_s
     while True:
-        v = _read_int32(rank)
-        if v >= 0:
-            _consume_signal(rank)
-            return ("signal", v)
-        if status_check is not None:
-            now = time.monotonic()
-            if now >= next_status:
-                code = status_check()
-                if code:
-                    return ("status", int(code))
-                next_status = now + status_interval_s
+        if _U32.unpack_from(mm, OFF_RESP_SEQ)[0] == seq:
+            verdict = _I32.unpack_from(mm, OFF_RESP_VERDICT)[0]
+            return ("grant" if verdict == VERDICT_GRANT else "deny", 0)
+        if status_check is not None and time.monotonic() >= next_status:
+            code = status_check()
+            if code:
+                return ("status", int(code))
+            next_status = time.monotonic() + status_interval_s
         time.sleep(poll_interval_s)
 
 
 def try_advance(
     gloo_pg,
     delta_mb: float,
-    safety_mb: float,
+    cumulative_mb: float,
     threshold_mb: float,
     poll_interval_s: float,
     status_check: Optional[StatusCheck] = None,
 ) -> Tuple[str, Optional[int]]:
     """Decide, across all standby ranks, whether the next task can advance.
 
-    Each rank reads its own delta_mb from its profile. Tasks with
-    `delta_mb < threshold_mb` skip the shm wait (treated as CPU-only).
-    Otherwise the rank waits for a fresh advance signal, checks locally
-    whether `free_mb - delta_mb - safety_mb >= 0`, then joins a MIN
-    all-reduce. The caller should loop on "retry".
+    Tasks with `delta_mb < threshold_mb` allocate ~no GPU memory and skip the
+    reservation. Otherwise this rank reserves its `cumulative_mb` target and
+    joins the unanimous MIN all-reduce. Caller loops on "retry".
 
     Returns:
-      ("advance", None) — all ranks agree; run the task
-      ("retry",   None) — at least one rank said no; poll again
+      ("advance", None) — all ranks granted; run the task
+      ("retry",   None) — at least one rank denied; poll again
       ("status",  code) — status_check tripped (ACTIVATE / TERMINATE)
     """
     rank = int(os.environ.get("RANK", "0"))
 
     local_status = 0
     if delta_mb < threshold_mb:
-        local_ok = 1
-        logger.info(f"[progressive] rank={rank} delta_mb={delta_mb:.1f} < threshold, skip wait")
+        local_ok = 1  # tiny / CPU-only task: no reservation needed
     else:
-        logger.info(f"[progressive] rank={rank} waiting for signal (delta_mb={delta_mb:.1f})")
-        kind, val = wait_for_signal(rank, poll_interval_s, status_check)
+        kind, code = _reserve(
+            rank,
+            int(cumulative_mb * 1024 * 1024),
+            poll_interval_s,
+            status_check,
+        )
         if kind == "status":
-            logger.info(f"[progressive] rank={rank} status={val} during wait")
             # Don't return yet — every rank must enter the all_reduce below,
-            # otherwise peers that already got a signal hang in gloo. Carry
-            # the status code into the reduce and bail in unison.
-            local_status = int(val)
+            # else peers that already decided hang in gloo. Carry the status
+            # into the reduce and bail in unison.
+            local_status = int(code)
             local_ok = 0
         else:
-            free_mb = val
-            local_ok = 1 if (free_mb - delta_mb - safety_mb) >= 0 else 0
+            local_ok = 1 if kind == "grant" else 0
             logger.info(
-                f"[progressive] rank={rank} free_mb={free_mb} - delta={delta_mb:.1f} - "
-                f"safety={safety_mb:.1f} → local_ok={local_ok}"
+                f"[progressive] rank={rank} cumulative_mb={cumulative_mb:.1f} "
+                f"→ {kind}"
             )
 
-    logger.info(
-        f"[progressive] rank={rank} entering all_reduce "
-        f"local_ok={local_ok} local_status={local_status}"
-    )
     s = torch.tensor([local_status], dtype=torch.int32)
     dist.all_reduce(s, op=dist.ReduceOp.MAX, group=gloo_pg)
     global_status = int(s.item())
     if global_status > 0:
-        logger.info(
-            f"[progressive] rank={rank} all_reduce done → status={global_status}"
-        )
         return ("status", global_status)
 
     t = torch.tensor([local_ok], dtype=torch.int32)
     dist.all_reduce(t, op=dist.ReduceOp.MIN, group=gloo_pg)
-    result = "advance" if t.item() == 1 else "retry"
-    logger.info(f"[progressive] rank={rank} all_reduce done → {result}")
-    return (result, None)
+    return ("advance" if t.item() == 1 else "retry", None)
 
 
 # ---------------------------------------------------------------------------

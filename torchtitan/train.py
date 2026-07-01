@@ -23,9 +23,6 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
-from torchtitan.components.init.progressive import (
-    start_signal_thread as _progressive_start_signal_thread,
-)
 from torchtitan.components.rmp_manager import RmpManager
 from torchtitan.components.skip_shape_infer import maybe_record_stage_inputs
 from torchtitan.config import ConfigManager, JobConfig
@@ -916,12 +913,50 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # pre-activation standbys never get here because they're parked
         # in run_init_sequence polling for activation. This guarantees
         # KillStandby is only ever issued by an active rank.
-        if self.job_config.leto.oom_safeguard_threshold_mb > 0:
-            from torchtitan.components.mem import install_oom_safeguard
-            from torchtitan.components.init.progressive import get_free_mb
+        from torchtitan.components.init.progressive import get_free_mb
 
-            _oom_threshold_mb = int(self.job_config.leto.oom_safeguard_threshold_mb)
-            _oom_rank = int(os.environ.get("RANK", -1))
+        leto_cfg = self.job_config.leto
+        _oom_rank = int(os.environ.get("RANK", -1))
+
+        if leto_cfg.progressive_init and leto_cfg.enable_standby:
+            # Reservation broker: the active process is the broker for the
+            # standby's GPU memory. The broker always *grants* reservations
+            # (the standby needs that to come up under progressive_init); the
+            # *reclaim* (killing the standby before the active grows into
+            # reserved memory) is gated on oom_safeguard_threshold_mb > 0, so
+            # the same job can be run with the safeguard on (reclaim) or off
+            # (grant-only control that OOMs under pressure).
+            from torchtitan.components.mem import (
+                install_reservation_broker,
+                reset_granted,
+            )
+            from torchtitan.components.init.progressive import _shm_path
+
+            margin_mb = int(leto_cfg.progressive_reservation_margin_mb)
+            ledger_path = _shm_path(_oom_rank)
+            reclaim_enabled = leto_cfg.oom_safeguard_threshold_mb > 0
+            kill_cb = None
+            if reclaim_enabled:
+                def _on_oom() -> tuple[bool, int]:
+                    freed, pid = kill_standby_for_oom_safeguard(
+                        get_free_mb(), 0, rank=_oom_rank
+                    )
+                    if freed:
+                        reset_granted()
+                    return (freed, pid)
+
+                kill_cb = _on_oom
+
+            logger.info(
+                f"Installing reservation broker: rank={_oom_rank} "
+                f"margin={margin_mb}MiB reclaim={'on' if reclaim_enabled else 'off'} "
+                f"ledger={ledger_path}"
+            )
+            install_reservation_broker(ledger_path, margin_mb, kill_cb)
+        elif leto_cfg.oom_safeguard_threshold_mb > 0:
+            from torchtitan.components.mem import install_oom_safeguard
+
+            _oom_threshold_mb = int(leto_cfg.oom_safeguard_threshold_mb)
 
             def _on_oom() -> tuple[bool, int]:
                 return kill_standby_for_oom_safeguard(
@@ -997,11 +1032,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.checkpointer.load(step=job_config.checkpoint.load_step)
 
         self._restored_step = self.step
-
-        # Track whether this train() call has started the progressive signal
-        # thread yet. Reset per train() invocation, so post-recovery (where
-        # self.step starts > 1) still triggers it after the first executed iter.
-        progressive_signal_started = False
 
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
@@ -1120,16 +1150,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     report_duration(DURATION_ITERATION, time.monotonic() - _iter_start, step=self.step)
                     report_event(EVENT_STEP_DONE, step=self.step)
 
-                if (
-                    not progressive_signal_started
-                    and job_config.leto.progressive_init
-                    and job_config.leto.enable_standby
-                ):
-                    _progressive_start_signal_thread(
-                        int(os.environ["RANK"]),
-                        int(os.environ["LOCAL_RANK"]),
-                    )
-                    progressive_signal_started = True
                 self._maybe_install_oom_safeguard()
 
 

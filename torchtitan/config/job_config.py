@@ -1113,11 +1113,20 @@ class Leto:
     signal (see init_profile/{mode}/solution.json). Requires enable_standby."""
 
     progressive_safety_mb: float = 512.0
-    """Per-rank safety margin (MiB) subtracted from free GPU memory when the
-    standby decides whether to run the next task under progressive_init."""
+    """Deprecated (pre-reservation heuristic). Per-rank safety margin (MiB)
+    once subtracted from free GPU memory; superseded by
+    progressive_reservation_margin_mb on the broker side."""
+
+    progressive_reservation_margin_mb: int = 128
+    """Global safety headroom (MiB) the active's reservation broker keeps free
+    at all times under progressive_init: it grants a standby reservation only
+    while `others_used + granted <= capacity - margin`. Absorbs profiling
+    error, NVML granularity, and allocations outside the caching allocator
+    (CUDA context growth, NCCL, cuBLAS workspaces). Bump it if the active OOMs
+    from un-brokered allocations the broker can't see."""
 
     progressive_poll_interval_ms: int = 10
-    """Standby poll interval (ms) on the shared-memory advance signal."""
+    """Standby poll interval (ms) while waiting for a reservation verdict."""
 
     progressive_zero_delta_threshold_mb: float = 1.0
     """Tasks with delta_mb below this threshold are treated as CPU-only and
@@ -1214,6 +1223,14 @@ class Leto:
     so that free GPU MiB before allocation < oom_safeguard_threshold_mb (so
     the kill callback actually fires) and so the allocation can succeed
     after the standby is killed."""
+
+    oom_test_standby_alloc_mb: int = 0
+    """OOM-safeguard E2E test hook (standby side). If > 0, each standby rank
+    reserves (through the broker) and holds this many MiB of GPU memory after
+    its progressive init, before parking. This gives the standby a controlled,
+    substantial footprint so that the active's reclaim of it is the difference
+    between OOM and success when the active's usage spikes
+    (oom_test_alloc_step / oom_test_alloc_mb). Requires progressive_init."""
 
 @dataclass
 class JobConfig:
