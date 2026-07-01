@@ -40,7 +40,6 @@ class InMemState:
         train_states,
         state_type,
         snapshot_container,
-        rmp_manager=None,
     ):
         self._state_id = state_id
         self._model_wrapper = model_wrapper
@@ -48,7 +47,6 @@ class InMemState:
         self._train_states = train_states
         self._state_type = state_type
         self._snapshot_container = snapshot_container
-        self._rmp_manager = rmp_manager
 
         self._model_gpu_tensors = None
         self._optim_gpu_tensors = None
@@ -100,16 +98,10 @@ class InMemState:
         # Phase 3: Allocate shared pool -> touch -> pin.
         
         t0 = time.perf_counter()
-        if self._rmp_manager is not None:
-            pool_key = f"gemini_{self._state_type.name}_{self._state_id}"
-            # RMP server allocates and persists the pool across restarts.
-            pool_storage, rmp_allocated = self._rmp_manager.get_or_allocate_cpu_memory(
-                pool_key, total_bytes
-            )
-        else:
-            # Allocate filename-backed shm directly to avoid the fd-to-filename
-            # copy that _share_filename_cpu_() would do on fd-based storage.
-            pool_storage = torch.UntypedStorage._new_using_filename_cpu(total_bytes)
+        # Allocate filename-backed shm directly to avoid the fd-to-filename copy
+        # that _share_filename_cpu_() would do on fd-based storage. Gemini is
+        # decoupled from RMP: the checkpoint pool is always process-owned shm.
+        pool_storage = torch.UntypedStorage._new_using_filename_cpu(total_bytes)
         t1 = time.perf_counter()
 
         pool_share_info = pool_storage._share_filename_cpu_()
@@ -119,8 +111,7 @@ class InMemState:
             f"Pool: state_id={self._state_id}, type={self._state_type}, "
             f"size={total_bytes / (1024 * 1024):.2f}MB, "
             f"data_ptr=0x{pool_storage.data_ptr():x}, "
-            f"shm_file={pool_share_info[0] if pool_share_info else 'N/A'}, "
-            f"rmp={'yes' if self._rmp_manager is not None else 'no'}"
+            f"shm_file={pool_share_info[0] if pool_share_info else 'N/A'}"
         )
 
         pool_view = torch.empty(0, dtype=torch.uint8)

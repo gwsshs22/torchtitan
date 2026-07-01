@@ -20,7 +20,6 @@ from torchtitan.components.gemini.snapshot_strategy import get_snapshot_strategy
 from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
 
-from leto.rmp.flags import FLAG_KIND_CPU
 
 try:
     from leto.launch.worker_controller_client import (
@@ -103,8 +102,6 @@ class SnapshotExecutor:
         pp_process_group: dist.ProcessGroup | None = None,
         tp_process_group: dist.ProcessGroup | None = None,
         fsdp_process_group: dist.ProcessGroup | None = None,
-        rmp_manager=None,
-        enable_rmp_cpu: bool = False,
     ) -> None:
         if not self.enable:
             return
@@ -114,8 +111,6 @@ class SnapshotExecutor:
         self.states = states
         self.pp_process_group = pp_process_group
         self.tp_process_group = tp_process_group
-        self.rmp_manager = rmp_manager
-        self.enable_rmp_cpu = enable_rmp_cpu
 
         self._fsdp_pg = fsdp_process_group
         self.snapshot_group = SnapshotGroup(self._fsdp_pg)
@@ -133,7 +128,6 @@ class SnapshotExecutor:
                     states,
                     state_type,
                     self.snapshot_container,
-                    rmp_manager=rmp_manager if enable_rmp_cpu else None,
                 ) for state_id in range(2)
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
@@ -175,9 +169,6 @@ class SnapshotExecutor:
         t0 = time.monotonic()
         self.remote_prev.init_cpu_tensors()
         logger.info(f"[Gemini Load R{self.rank}] remote_prev.init_cpu_tensors: {time.monotonic() - t0:.3f}s")
-
-        if self.enable_rmp_cpu and self.rmp_manager is not None:
-            self.rmp_manager.rmp_client.set_allocation_flag(FLAG_KIND_CPU)
 
         t0 = time.monotonic()
         self._gpu_blocks = self.remote_curr.compute_tensor_blocks(self.block_size, return_gpu_blocks=True)

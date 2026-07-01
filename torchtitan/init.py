@@ -41,7 +41,7 @@ from torchtitan.components.metrics import (
     ensure_pp_loss_visible,
 )
 from torchtitan.components.rmp_manager import RmpManager
-from leto.rmp.flags import FLAG_KIND_CPU, FLAG_KIND_GPU
+from leto.rmp.flags import FLAG_KIND_GPU
 from torchtitan.experiments.resilient_opt.resilient_opt import ResilientOptimizer
 from torchtitan.experiments.resilient_opt.resilient_opt_cpu_snapshot import (
     AsyncCpuSnapshotOptimizer,
@@ -699,17 +699,14 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
     collective_manager = FsdpCollectiveManager()
 
     if job_config.checkpoint.use_gemini:
-        if job_config.leto.enable_rmp_cpu and ctx.is_standby:
-            _standby_wait_for_allocation_flag(
-                ctx.rmp_manager.rmp_client, FLAG_KIND_CPU,
-            )
+        # Gemini is decoupled from RMP: its CPU checkpoint pool is
+        # process-owned shm, so there's no RMP CPU allocation to wait on and
+        # no rmp_manager to hand down.
         ctx.checkpointer.lazy_init(
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,
             lr_schedulers=ctx.lr_schedulers,
             parallel_dims=ctx.parallel_dims,
-            rmp_manager=ctx.rmp_manager,
-            enable_rmp_cpu=job_config.leto.enable_rmp_cpu,
             collective_manager=collective_manager,
         )
     else:
