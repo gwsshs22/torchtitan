@@ -1088,9 +1088,6 @@ class Leto:
     enable_rmp_gpu: bool = False
     """Enable RMP (Remote Memory Provider) for shared GPU memory across processes."""
 
-    enable_rmp_cpu: bool = False
-    """Enable RMP for Gemini CPU shared memory pools."""
-
     enable_skip_commit: bool = False
 
     rmp_server_port: int = 29051

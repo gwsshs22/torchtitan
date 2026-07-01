@@ -133,7 +133,7 @@ class RmpManager:
         self.disable_resilient_opt = leto_config.disable_resilient_opt
         self.device = device
 
-        if self.enabled or leto_config.enable_rmp_cpu:
+        if self.enabled:
             # RMP client configuration
             # Server address: localhost:{rmp_server_port + local_rank}
             base_port = leto_config.rmp_server_port
