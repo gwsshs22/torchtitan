@@ -1,13 +1,14 @@
 import itertools
 import math
+import os
 import time
 from typing import Any
 
 import torch
-from torch.cuda._pin_memory_utils import pin_memory
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
+from torchtitan.components.gemini import pool_shm
 from torchtitan.components.gemini.snapshot_container import SnapshotContainer
 from torchtitan.components.gemini.utils import InMemStateType
 from torchtitan.tools.logging import logger
@@ -40,6 +41,7 @@ class InMemState:
         train_states,
         state_type,
         snapshot_container,
+        mem_fs_folder,
     ):
         self._state_id = state_id
         self._model_wrapper = model_wrapper
@@ -47,6 +49,9 @@ class InMemState:
         self._train_states = train_states
         self._state_type = state_type
         self._snapshot_container = snapshot_container
+        self._mem_fs_folder = mem_fs_folder
+        self._global_rank = int(os.environ["RANK"])
+        self._pool_path = None
 
         self._model_gpu_tensors = None
         self._optim_gpu_tensors = None
@@ -95,31 +100,42 @@ class InMemState:
             total_bytes = aligned + size_bytes
         total_bytes = (total_bytes + _POOL_ALIGNMENT - 1) // _POOL_ALIGNMENT * _POOL_ALIGNMENT
 
-        # Phase 3: Allocate shared pool -> touch -> pin.
-        
+        # Phase 3: Allocate self-managed shm pool -> parallel-prefault -> pin.
+        #
+        # Instead of _new_using_filename_cpu (which posix_fallocate's every page
+        # single-threaded — the dominant cost of pool init, ~2-3x the pinning) we map a
+        # sparse tmpfs-backed file (gemini_mem_fs_folder is on /dev/shm) with
+        # from_file/ALLOCATOR_MAPPED_SHARED (no fallocate, no torch_shm_manager), fault
+        # the pages with a bounded parallel memset, and pin with a single
+        # cudaHostRegister. Shared to the container by path (see Phase 5); the container
+        # attaches synchronously and the path is then unlinked, so the pool becomes an
+        # anonymous kernel-refcounted mapping (freed when both holders die, incl. SIGKILL).
+        # Include the PID: the active and standby training groups share the same
+        # global rank numbers on the same host, so a rank-only name would collide on
+        # /dev/shm — the second creator's `os.unlink(path)` (stale-file cleanup, and the
+        # post-register unlink) could remove the other group's file and cross-wire which
+        # inode its container attached to, corrupting the FATAL dump. The old
+        # _new_using_filename_cpu avoided this with unique random names; the PID does the
+        # same (active and standby are distinct processes).
+        self._pool_path = os.path.join(
+            self._mem_fs_folder,
+            f"pool_rank{self._global_rank}_{self._state_type}_v{self._state_id}_pid{os.getpid()}",
+        )
         t0 = time.perf_counter()
-        # Allocate filename-backed shm directly to avoid the fd-to-filename copy
-        # that _share_filename_cpu_() would do on fd-based storage. Gemini is
-        # decoupled from RMP: the checkpoint pool is always process-owned shm.
-        pool_storage = torch.UntypedStorage._new_using_filename_cpu(total_bytes)
-        t1 = time.perf_counter()
-
-        pool_share_info = pool_storage._share_filename_cpu_()
-        t1b = time.perf_counter()
+        pool_storage, pool_timings = pool_shm.alloc_and_pin(self._pool_path, total_bytes)
+        t3 = time.perf_counter()
+        pool_share_info = (self._pool_path, total_bytes)
 
         logger.info(
             f"Pool: state_id={self._state_id}, type={self._state_type}, "
             f"size={total_bytes / (1024 * 1024):.2f}MB, "
             f"data_ptr=0x{pool_storage.data_ptr():x}, "
-            f"shm_file={pool_share_info[0] if pool_share_info else 'N/A'}"
+            f"shm_file={self._pool_path}, "
+            f"alloc={pool_timings['alloc']:.2f}ms, "
+            f"prefault={pool_timings['prefault']:.2f}ms "
+            f"(x{pool_timings['threads']} threads), "
+            f"pin={pool_timings['pin']:.2f}ms"
         )
-
-        pool_view = torch.empty(0, dtype=torch.uint8)
-        pool_view.set_(source=pool_storage, storage_offset=0, size=(total_bytes,))
-        t2 = time.perf_counter()
-
-        pin_memory(pool_storage.data_ptr(), pool_storage.nbytes())
-        t3 = time.perf_counter()
 
         self._pool_storage = pool_storage
 
@@ -194,21 +210,29 @@ class InMemState:
         )
         t5_reg_end = time.perf_counter()
 
+        # The container has now mmap'd the pool (register is synchronous). Unlink the
+        # path so the pool becomes an anonymous kernel-refcounted mapping: freed
+        # automatically once the training process and the container both exit (even on
+        # SIGKILL), with no torch_shm_manager. A crash in the create->register window
+        # leaves a named file that gemini_mem_fs_folder cleanup sweeps on next start /
+        # fatal restart.
+        try:
+            os.unlink(self._pool_path)
+        except FileNotFoundError:
+            pass
+
         t_init_end = time.perf_counter()
 
         logger.info(
             f"Pool timings: "
-            f"_new_shared={(t1 - t0) * 1000:.2f}ms, "
-            f"_share_filename_cpu_={(t1b - t1) * 1000:.2f}ms, "
-            f"touch={(t2 - t1b) * 1000:.2f}ms, "
-            f"pin={(t3 - t2) * 1000:.2f}ms, "
+            f"alloc+prefault+pin={(t3 - t0) * 1000:.2f}ms, "
             f"views={(t4_end - t4_start) * 1000:.2f}ms, "
             f"register={(t5_reg_end - t5_reg_start) * 1000:.2f}ms, "
             f"total={(t_init_end - t_init_start) * 1000:.2f}ms"
         )
 
         if _LETO_AVAILABLE:
-            report_duration(DURATION_CHECKPOINT_ALLOC, t1b - t0)
+            report_duration(DURATION_CHECKPOINT_ALLOC, t3 - t0)
             report_duration(DURATION_CHECKPOINT_INIT_TOTAL, t_init_end - t_init_start)
 
     def compute_tensor_blocks(

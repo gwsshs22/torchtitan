@@ -57,6 +57,18 @@ llama3_args = {
         multiple_of=1024,
         rope_theta=500000,
     ),
+    # Small dense flavor for fault-injection / gemini verification: keeps the real
+    # llama3 vocab (so fineweb's tokenizer matches) but tiny dim/layers, so the
+    # per-rank gemini checkpoint pool is ~1GB and active+standby fit in /dev/shm.
+    "small_test": TransformerModelArgs(
+        dim=1024,
+        n_layers=4,
+        n_heads=8,
+        n_kv_heads=4,
+        ffn_dim_multiplier=1.3,
+        multiple_of=256,
+        rope_theta=500000,
+    ),
     "8B": TransformerModelArgs(
         dim=4096,
         n_layers=32,

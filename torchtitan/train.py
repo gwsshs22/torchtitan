@@ -775,6 +775,44 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             json.dump(dump, f, indent=2)
         logger.info(f"Dumped optimizer info to {dump_path}")
 
+    def _opt_fingerprint(self, tag: str):
+        """Compact, env-gated fingerprint of optimizer state for debugging
+        FATAL-recovery divergence. Enable with LETO_OPT_FP=1. Logs lr + the
+        L2 norms of param / exp_avg / exp_avg_sq + the step tensor for the
+        first two params that have optimizer state, so a normal run and a
+        faulted run can be diffed at the recovery boundary to see which
+        quantity (lr / moments / step) is wrong."""
+        if os.environ.get("LETO_OPT_FP") != "1":
+            return
+        try:
+            lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        except Exception:
+            lr = float("nan")
+        def _loc(t):
+            return t.to_local() if hasattr(t, "to_local") else t
+        # Order-independent, rank-stable global checksums (double precision so
+        # tiny per-element differences accumulate visibly): total squared L2 of
+        # params / exp_avg / exp_avg_sq across ALL this-rank shards.
+        psum = msum = vsum = 0.0
+        sv0 = None
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p)
+                    if not st or "exp_avg" not in st:
+                        continue
+                    psum += _loc(p).detach().double().pow(2).sum().item()
+                    msum += _loc(st["exp_avg"]).detach().double().pow(2).sum().item()
+                    vsum += _loc(st["exp_avg_sq"]).detach().double().pow(2).sum().item()
+                    if sv0 is None:
+                        s = st["step"]
+                        sv0 = s.item() if torch.is_tensor(s) else s
+        rank = int(os.environ.get("RANK", "0"))
+        logger.info(
+            f"[OPTFP] tag={tag} rank={rank} step={self.step} lr={lr:.12e} "
+            f"pstep={sv0} P2={psum:.15e} M2={msum:.15e} V2={vsum:.15e}"
+        )
+
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -854,6 +892,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dist.barrier()
         
 
+        self._opt_fingerprint("pre_step")
         if not fault_triggered:
             if self._resilient_opt is not None:
                 self._resilient_opt.step()
@@ -1032,6 +1071,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.checkpointer.load(step=job_config.checkpoint.load_step)
 
         self._restored_step = self.step
+        self._opt_fingerprint("post_recovery")
 
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:

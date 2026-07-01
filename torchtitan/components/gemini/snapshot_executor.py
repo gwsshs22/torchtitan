@@ -128,6 +128,7 @@ class SnapshotExecutor:
                     states,
                     state_type,
                     self.snapshot_container,
+                    self.mem_fs_folder,
                 ) for state_id in range(2)
             ] for state_type in [InMemStateType.LOCAL, InMemStateType.REMOTE]
         ]
@@ -439,6 +440,27 @@ class SnapshotExecutor:
             curr_stream.wait_stream(self._copy_stream)
             curr_stream.wait_stream(self._p2p_stream)
             curr_stream.wait_event(self._local_copy_event)
+
+            # Durability barrier before commit. The wait_stream/wait_event calls
+            # above only order *GPU* work on curr_stream — they do NOT block the
+            # host, so the async D2H copies filling the LOCAL pool
+            # (snapshot_gpu_state) and the REMOTE pool (the P2P block copies on
+            # _copy_stream) may still be in flight when the CPU marks this
+            # version committed below. On a FATAL fault the training process is
+            # SIGKILLed; if the kill lands after commit but before those copies
+            # land, tearing down the CUDA context aborts the DMAs mid-flight and
+            # the "committed" pool is left with partial (torn) data. The
+            # SnapshotContainer then persists that partial pool as a valid
+            # checkpoint, and recovery loads stale/torn optimizer moments — the
+            # loss diverges by a timing-dependent amount (the REMOTE pool is the
+            # usual victim: its copies are staged during the *next* step's
+            # forward, so they are the ones still in flight at commit, which is
+            # why peer-replica RECV recovery on the failed worker is worst hit).
+            # Block the host until the copies have actually landed so a committed
+            # version is always durable across a SIGKILL.
+            self._copy_stream.synchronize()
+            self._p2p_stream.synchronize()
+            self._local_copy_event.synchronize()
 
             self.snapshot_container.commit(self._curr_version, self._snapshot_step)
             # Mark snapshot step as complete

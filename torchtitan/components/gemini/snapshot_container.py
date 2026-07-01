@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional
 import torch
 import torch.multiprocessing as mp
 
+from torchtitan.components.gemini import pool_shm
 from torchtitan.components.gemini.utils import InMemStateType
 
 # Leto integration for checkpoint timing reporting
@@ -254,10 +255,11 @@ class SnapshotContainer:
             cmd, data = msg
 
             if cmd == 'REGISTER':
-                # Reconstruct pool storage from share info
-                pool_storage = torch.UntypedStorage._new_shared_filename_cpu(
-                    *data['pool_share_info']
-                )
+                # Attach to the self-managed shm pool by path (see pool_shm). The
+                # training process unlinks the path right after this synchronous
+                # REGISTER, so this mapping keeps the (now anonymous) pool alive.
+                pool_path, pool_nbytes = data['pool_share_info']
+                pool_storage = pool_shm.attach(pool_path, pool_nbytes)
                 view = InMemStateView(
                     state_id=data['state_id'],
                     state_type=data['state_type'],
