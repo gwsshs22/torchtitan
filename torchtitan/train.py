@@ -376,9 +376,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         """OOM-safeguard test hook: at the configured step, allocate
         `oom_test_alloc_mb` MiB of GPU memory in 64 MiB chunks (a list of
         fresh tensors). Each fresh-size 64 MiB tensor causes a cache-miss
-        expansion, so the FreeMemoryCallback should fire on each one
-        whenever free GPU MiB has dropped below
-        `oom_safeguard_threshold_mb`.
+        expansion, so the reservation-aware FreeMemoryCallback should fire on
+        each one whenever the allocation would push effective free GPU memory
+        below `progressive_reservation_margin_mb`.
 
         The tensors are held in `self._oom_tensors` so they stay alive
         for the rest of the step. They're freed naturally when the
@@ -404,8 +404,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"[oom_test] rank={rank} step={self.step}: free={free_mb_before}MiB "
             f"total={total_mb}MiB; allocating {n_chunks} x {chunk_mb}MiB "
-            f"(target {alloc_mb}MiB total, threshold="
-            f"{leto_cfg.oom_safeguard_threshold_mb}MiB)"
+            f"(target {alloc_mb}MiB total, reservation margin="
+            f"{leto_cfg.progressive_reservation_margin_mb}MiB)"
         )
 
         from torchtitan.components.mem import (
@@ -959,54 +959,42 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if leto_cfg.progressive_init and leto_cfg.enable_standby:
             # Reservation broker: the active process is the broker for the
-            # standby's GPU memory. The broker always *grants* reservations
-            # (the standby needs that to come up under progressive_init); the
-            # *reclaim* (killing the standby before the active grows into
-            # reserved memory) is gated on oom_safeguard_threshold_mb > 0, so
-            # the same job can be run with the safeguard on (reclaim) or off
-            # (grant-only control that OOMs under pressure).
+            # standby's GPU memory. progressive_reservation_margin_mb is the
+            # master switch: > 0 installs the broker (grant + reclaim, i.e.
+            # kill the standby before the active grows into reserved memory);
+            # == 0 skips the broker entirely, so the standby runs its init
+            # tasks ungated (grant-only control that OOMs under pressure) and
+            # the active never reclaims.
+            margin_mb = int(leto_cfg.progressive_reservation_margin_mb)
+            if margin_mb <= 0:
+                logger.info(
+                    f"OOM safeguard disabled: reservation margin=0 on "
+                    f"rank={_oom_rank} — standby runs reordered init ungated, "
+                    f"no reclaim (grant-only OOM control)"
+                )
+                return
+
             from torchtitan.components.mem import (
                 install_reservation_broker,
                 reset_granted,
             )
             from torchtitan.components.init.progressive import _shm_path
 
-            margin_mb = int(leto_cfg.progressive_reservation_margin_mb)
             ledger_path = _shm_path(_oom_rank)
-            reclaim_enabled = leto_cfg.oom_safeguard_threshold_mb > 0
-            kill_cb = None
-            if reclaim_enabled:
-                def _on_oom() -> tuple[bool, int]:
-                    freed, pid = kill_standby_for_oom_safeguard(
-                        get_free_mb(), 0, rank=_oom_rank
-                    )
-                    if freed:
-                        reset_granted()
-                    return (freed, pid)
 
-                kill_cb = _on_oom
+            def _on_oom() -> tuple[bool, int]:
+                freed, pid = kill_standby_for_oom_safeguard(
+                    get_free_mb(), 0, rank=_oom_rank
+                )
+                if freed:
+                    reset_granted()
+                return (freed, pid)
 
             logger.info(
                 f"Installing reservation broker: rank={_oom_rank} "
-                f"margin={margin_mb}MiB reclaim={'on' if reclaim_enabled else 'off'} "
-                f"ledger={ledger_path}"
+                f"margin={margin_mb}MiB reclaim=on ledger={ledger_path}"
             )
-            install_reservation_broker(ledger_path, margin_mb, kill_cb)
-        elif leto_cfg.oom_safeguard_threshold_mb > 0:
-            from torchtitan.components.mem import install_oom_safeguard
-
-            _oom_threshold_mb = int(leto_cfg.oom_safeguard_threshold_mb)
-
-            def _on_oom() -> tuple[bool, int]:
-                return kill_standby_for_oom_safeguard(
-                    get_free_mb(), _oom_threshold_mb, rank=_oom_rank
-                )
-
-            logger.info(
-                f"Installing OOM safeguard: threshold={_oom_threshold_mb}MiB "
-                f"rank={_oom_rank}"
-            )
-            install_oom_safeguard(_oom_threshold_mb, _on_oom)
+            install_reservation_broker(ledger_path, margin_mb, _on_oom)
 
 
     @record

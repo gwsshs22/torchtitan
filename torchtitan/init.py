@@ -376,23 +376,32 @@ def _maybe_standby_oom_test_alloc(ctx: InitContext) -> None:
     if alloc_mb <= 0 or not cfg.progressive_init:
         return
     rank = int(os.environ.get("RANK", "0"))
-    # Reserve through the broker (raise our grant to cover current footprint
-    # plus the test allocation). Only HOLD if the broker grants it -- a
-    # relaunched standby after a reclaim has less free memory and would
-    # OOM-loop if it allocated past what the broker can give it.
-    try:
-        from torchtitan.components.init.progressive import _reserve
-
-        cur_mb = _get_gpu_mem_mb() or 0.0
-        target_b = int((cur_mb + alloc_mb + 256) * 1024 * 1024)
-        kind, _ = _reserve(rank, target_b, 0.01, None)
+    if int(cfg.progressive_reservation_margin_mb) <= 0:
+        # No broker (grant-only OOM control): hold the memory ungated. Asking a
+        # broker that isn't running would block the _reserve handshake forever.
+        kind = "grant"
         logger.info(
-            f"[oom_test] standby rank={rank} reserve(+{alloc_mb}MiB, "
-            f"target~{int(cur_mb + alloc_mb)}MiB) -> {kind}"
+            f"[oom_test] standby rank={rank} reservation disabled (margin=0); "
+            f"holding {alloc_mb}MiB ungated"
         )
-    except Exception:
-        logger.warning("[oom_test] standby reservation failed", exc_info=True)
-        kind = "deny"
+    else:
+        # Reserve through the broker (raise our grant to cover current footprint
+        # plus the test allocation). Only HOLD if the broker grants it -- a
+        # relaunched standby after a reclaim has less free memory and would
+        # OOM-loop if it allocated past what the broker can give it.
+        try:
+            from torchtitan.components.init.progressive import _reserve
+
+            cur_mb = _get_gpu_mem_mb() or 0.0
+            target_b = int((cur_mb + alloc_mb + 256) * 1024 * 1024)
+            kind, _ = _reserve(rank, target_b, 0.01, None)
+            logger.info(
+                f"[oom_test] standby rank={rank} reserve(+{alloc_mb}MiB, "
+                f"target~{int(cur_mb + alloc_mb)}MiB) -> {kind}"
+            )
+        except Exception:
+            logger.warning("[oom_test] standby reservation failed", exc_info=True)
+            kind = "deny"
     if kind != "grant":
         logger.info(
             f"[oom_test] standby rank={rank} reservation not granted; "
@@ -1002,6 +1011,25 @@ def _run_progressive_sequence(
         except Exception:
             logger.warning("Error polling standby status", exc_info=True)
             return STANDBY_ACTION_TERMINATE
+
+    # margin == 0 means the active does not run the reservation broker (see
+    # Trainer._maybe_install_oom_safeguard), so the shm reservation handshake
+    # would block forever with no one to answer. Run the init tasks in the
+    # reordered (solver-scheduled) order, ungated — the grant-only OOM control.
+    # Still poll standby status between tasks so TERMINATE stays responsive.
+    margin_mb = int(job_config.leto.progressive_reservation_margin_mb)
+    if margin_mb <= 0:
+        logger.info(
+            f"[progressive] rank={rank} reservation disabled (margin=0); "
+            f"running {len(ordered_names)} tasks reordered, ungated"
+        )
+        for name in ordered_names:
+            if _status_check() == STANDBY_ACTION_TERMINATE:
+                logger.info("[progressive] standby terminated")
+                os._exit(0)
+            logger.info(f"[progressive] task={name} → running (ungated)")
+            name_to_fn[name](ctx)
+        return
 
     # Identify this standby instance to the active's broker before driving the
     # shm reservation handshake. (The C++/Python ledger layout is verified by

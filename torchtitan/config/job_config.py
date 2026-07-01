@@ -1112,18 +1112,25 @@ class Leto:
     """If True, standby advances through init tasks gated on the active's free-GPU
     signal (see init_profile/{mode}/solution.json). Requires enable_standby."""
 
-    progressive_safety_mb: float = 512.0
-    """Deprecated (pre-reservation heuristic). Per-rank safety margin (MiB)
-    once subtracted from free GPU memory; superseded by
-    progressive_reservation_margin_mb on the broker side."""
-
     progressive_reservation_margin_mb: int = 128
-    """Global safety headroom (MiB) the active's reservation broker keeps free
-    at all times under progressive_init: it grants a standby reservation only
-    while `others_used + granted <= capacity - margin`. Absorbs profiling
-    error, NVML granularity, and allocations outside the caching allocator
-    (CUDA context growth, NCCL, cuBLAS workspaces). Bump it if the active OOMs
-    from un-brokered allocations the broker can't see."""
+    """Global safety headroom (MiB) the active's reservation broker keeps free,
+    and the master switch for the whole reservation/reclaim mechanism under
+    progressive_init + enable_standby:
+
+      * > 0 — the active installs the reservation broker: it grants a standby
+        reservation only while `others_used + granted <= capacity - margin`,
+        and reclaims (kills) the standby before growing into reserved memory
+        when an allocation would breach the margin. The standby drives the shm
+        reservation handshake, advancing each init task only once granted.
+      * == 0 — no broker, no reclaim. The standby skips the reservation
+        handshake entirely and just runs its init tasks in the reordered
+        (solver-scheduled) order, ungated. This is the grant-only control that
+        OOMs under memory pressure.
+
+    The margin absorbs profiling error, NVML granularity, and allocations
+    outside the caching allocator (CUDA context growth, NCCL, cuBLAS
+    workspaces). Bump it if the active OOMs from un-brokered allocations the
+    broker can't see."""
 
     progressive_poll_interval_ms: int = 10
     """Standby poll interval (ms) while waiting for a reservation verdict."""
@@ -1202,27 +1209,20 @@ class Leto:
     ``enable_skip_commit`` to isolate the GPU mirror cost alone, or leave
     ``enable_skip_commit`` off to isolate the CPU-metadata-commit cost."""
 
-    oom_safeguard_threshold_mb: int = 0
-    """If > 0, install a CUDACachingAllocator FreeMemoryCallback in the active
-    training process that synchronously kills the local standby torchrun group
-    when free GPU MiB falls below this threshold during cache-miss expansion.
-    The worker controller relaunches a fresh standby in the background. 0 disables.
-    Only takes effect on non-standby ranks and when the leto worker controller
-    client is reachable (i.e., LETO_WORKER_CONTROLLER_PORT is set)."""
-
     oom_test_alloc_step: int = 0
     """Test hook for the OOM safeguard. If > 0, allocate a fresh CUDA tensor
     of size `oom_test_alloc_mb` MiB at the start of this training step on
     every active rank. The allocation is sized to be a cache-miss expansion
     (so the FreeMemoryCallback fires) and is freed immediately afterwards.
-    0 disables. Use together with oom_safeguard_threshold_mb to verify the
-    end-to-end kill+relaunch path."""
+    0 disables. Use together with progressive_reservation_margin_mb > 0 to
+    verify the end-to-end reclaim+relaunch path."""
 
     oom_test_alloc_mb: int = 0
     """MiB of GPU memory to allocate at oom_test_alloc_step. Should be sized
-    so that free GPU MiB before allocation < oom_safeguard_threshold_mb (so
-    the kill callback actually fires) and so the allocation can succeed
-    after the standby is killed."""
+    so that the allocation would push effective free GPU memory below the
+    reservation margin (progressive_reservation_margin_mb) — so the broker's
+    reclaim callback actually fires — and so the allocation can succeed after
+    the standby is reclaimed."""
 
     oom_test_standby_alloc_mb: int = 0
     """OOM-safeguard E2E test hook (standby side). If > 0, each standby rank
@@ -1230,7 +1230,9 @@ class Leto:
     its progressive init, before parking. This gives the standby a controlled,
     substantial footprint so that the active's reclaim of it is the difference
     between OOM and success when the active's usage spikes
-    (oom_test_alloc_step / oom_test_alloc_mb). Requires progressive_init."""
+    (oom_test_alloc_step / oom_test_alloc_mb). Requires progressive_init and
+    progressive_reservation_margin_mb > 0 (the reclaim path); with margin == 0
+    the standby holds the memory ungated (the OOM control)."""
 
 @dataclass
 class JobConfig:
