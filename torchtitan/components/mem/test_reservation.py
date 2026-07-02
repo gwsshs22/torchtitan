@@ -15,6 +15,14 @@ Covers:
                   no active OOM.
   5. assert_b   — (2 processes) a standby allocates past its grant; the broker
                   counts the standby_actual > granted violation.
+  6. cache      — (2 processes) RC-A regression for the AWS
+                  measure_mem_standby_progressive_init_oom_safe failure. The
+                  active holds a large freed-but-cached region; a fresh
+                  allocation bigger than NVML-free but smaller than
+                  free+cache must NOT reclaim the standby (the allocator can
+                  satisfy it by releasing its own cached segments — killing
+                  the standby is futile churn). A second allocation bigger
+                  than free+cache MUST still reclaim (genuine pressure).
 """
 import atexit
 import mmap
@@ -110,7 +118,13 @@ def test_deadlock(m):
     m.set_kill_callback(kill_cb)
     assert m.start_broker(10 ** 7)
     atexit.register(m.clear_kill_callback)
-    _I32.pack_into(mm, m.OFF_STANDBY_PID, 999999)
+    # Use our own pid as the "standby": the huge margin denies every grant
+    # (granted stays 0), and the reclaim gate only fires when there is
+    # something reclaimable (standby_actual > 0 or granted > 0). Our own
+    # GPU usage gives standby_actual > 0 so the reclaim path is exercised;
+    # this test only cares about concurrency (reclaim under the GIL vs the
+    # broker thread servicing grants), not reclaim semantics.
+    _I32.pack_into(mm, m.OFF_STANDBY_PID, os.getpid())
     _U32.pack_into(mm, m.OFF_STANDBY_EPOCH, 1)
     stop = threading.Event()
 
@@ -154,8 +168,12 @@ def _run_child(mode):
     torch.cuda.init()
     torch.empty(1, device="cuda:0")
     progressive.standby_register(0, epoch=1)
-    reserve_mb = 70000 if mode == "adversary" else 1000
-    alloc_mb = 2000 if mode == "adversary" else 3000
+    if mode == "cache":
+        reserve_mb, alloc_mb = 3600, 3000
+    elif mode == "adversary":
+        reserve_mb, alloc_mb = 70000, 2000
+    else:
+        reserve_mb, alloc_mb = 1000, 3000
     kind, _ = progressive._reserve(0, reserve_mb * 1024 * 1024, 0.005, None)
     print(f"CHILD reserve({reserve_mb}) -> {kind}", flush=True)
     buf = torch.empty(alloc_mb * 1024 * 1024 // 4, dtype=torch.float32, device="cuda:0")
@@ -235,6 +253,123 @@ def _run_e2e(m, mode):
     return ok
 
 
+def _run_cache_test(m):
+    """[6] RC-A regression (AWS churn bug): the reclaim criterion must account
+    for the active allocator's own releasable cached segments.
+
+    Geometry on an ~80GB device (margin 128MiB, standby holds 3GiB granted):
+      hold H=30GiB live, cache C=25GiB freed-but-cached (1GiB segments),
+      leaving NVML-free F ~= total - H - C - standby - ctx.
+      S2: fresh R1=30GiB:  F < R1 + margin  BUT  F + C > R1 + margin
+          -> must NOT kill the standby (allocator self-satisfies by
+             releasing cached segments). Pre-fix this fires the futile
+             kill that caused the AWS standby churn.
+      S3: empty_cache, fresh R2 ~= F' + 1GiB: F' + 0 < R2 + margin and the
+          standby's 3GiB covers the shortfall -> MUST kill (genuine
+          pressure), and the allocation succeeds after the reclaim.
+    """
+    import torch
+    import torchtitan.components.mem as mem
+
+    GiB = 1024 ** 3
+    mm = _mk_ledger(m, _LEDGER)
+
+    def kill_cb():
+        pid = _I32.unpack_from(mm, m.OFF_STANDBY_PID)[0]
+        if pid > 0:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        # Mirror the production _on_oom (train.py): a confirmed kill voids
+        # the cumulative grant so the dead standby's reservation stops
+        # poisoning effective_free.
+        m.reset_granted()
+        return (True, pid)
+
+    mem.install_reservation_broker(_LEDGER, margin_mb=128, kill_callback=kill_cb)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="0")
+    child = subprocess.Popen(
+        [sys.executable, __file__, "child", "cache"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    ready = False
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        line = child.stdout.readline()
+        if not line:
+            break
+        if "CHILD_READY" in line:
+            ready = True
+            break
+    assert ready, "child never became ready"
+    time.sleep(0.5)
+
+    ok = True
+    try:
+        # --- build the geometry ---
+        held = [torch.empty(GiB, dtype=torch.uint8, device="cuda:0")
+                for _ in range(30)]
+        cached = [torch.empty(GiB, dtype=torch.uint8, device="cuda:0")
+                  for _ in range(25)]
+        del cached  # 25GiB now freed-but-cached (whole releasable segments)
+        torch.cuda.synchronize()
+        time.sleep(0.2)  # let the broker refresh its NVML snapshot
+        free_mb = m.get_cached_free_mb()
+        stats = torch.cuda.memory_stats(0)
+        reserved_mb = stats["reserved_bytes.all.current"] // 2 ** 20
+        alloc_mb = stats["allocated_bytes.all.current"] // 2 ** 20
+        print(f"[6] setup: nvml_free={free_mb}MiB reserved={reserved_mb}MiB "
+              f"allocated={alloc_mb}MiB cached={(reserved_mb - alloc_mb)}MiB")
+        assert free_mb < 30 * 1024, "geometry broken: too much NVML-free"
+
+        # --- S2: self-satisfiable big alloc must NOT reclaim the standby ---
+        m.reset_num_kill_standby_called()
+        big = torch.empty(30 * GiB, dtype=torch.uint8, device="cuda:0")
+        torch.cuda.synchronize()
+        nkill = m.get_num_kill_standby_called()
+        s2_ok = nkill == 0 and child.poll() is None
+        print(f"[6] S2 (self-satisfiable 30GiB alloc): num_kill={nkill} "
+              f"standby_alive={child.poll() is None} -> "
+              f"{'OK' if s2_ok else 'FAIL (futile churn kill)'}")
+        ok = ok and s2_ok
+
+        # --- S3: genuine pressure must still reclaim ---
+        del big
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        time.sleep(0.3)
+        free_mb = m.get_cached_free_mb()
+        r2_mb = free_mb + 1024  # ~1GiB more than device-free; standby has 3GiB
+        m.reset_num_kill_standby_called()
+        oom = False
+        try:
+            big2 = torch.empty(r2_mb * 2 ** 20, dtype=torch.uint8,
+                               device="cuda:0")
+            torch.cuda.synchronize()
+            del big2
+        except torch.cuda.OutOfMemoryError:
+            oom = True
+        nkill = m.get_num_kill_standby_called()
+        s3_ok = (not oom) and nkill >= 1
+        print(f"[6] S3 (genuine pressure {r2_mb}MiB vs free={free_mb}MiB): "
+              f"num_kill={nkill} OOM={oom} -> {'OK' if s3_ok else 'FAIL'}")
+        ok = ok and s3_ok
+        del held
+    finally:
+        if child.poll() is None:
+            child.send_signal(signal.SIGKILL)
+        child.wait(timeout=10)
+        m.stop_broker()
+        m.clear_kill_callback()
+        torch.cuda.empty_cache()
+        try:
+            os.unlink(_LEDGER)
+        except FileNotFoundError:
+            pass
+    return ok
+
+
 def main():
     import torch
     import torchtitan.components.mem as mem
@@ -249,7 +384,8 @@ def main():
     test_deadlock(m)
     ok_adv = _run_e2e(m, "adversary")
     ok_b = _run_e2e(m, "assert_b")
-    if ok_adv and ok_b:
+    ok_cache = _run_cache_test(m)
+    if ok_adv and ok_b and ok_cache:
         print("ALL RESERVATION TESTS PASSED")
         sys.exit(0)
     sys.exit(1)

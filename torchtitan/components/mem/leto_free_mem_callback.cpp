@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <c10/core/Allocator.h>
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -580,30 +581,110 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
                          static_cast<long long>(granted / (1024 * 1024)));
           }
         }
-        // Only reclaim when the ledger-registered standby is actually holding
-        // reclaimable GPU memory. standby_actual == 0 means no standby, a
-        // stale/dead pid, or a standby that has NOT yet entered the reservation
-        // handshake (standby_register writes standby_pid only after
-        // init_distributed). Firing then would either free nothing (futile) or
-        // SIGKILL a mid-NCCL-init standby that lingers 10+ s on the GPU and can
-        // wedge the active with a shared-mem/CUDA-IPC SIGBUS. So gate the kill
-        // on there being a live, registered standby with memory to reclaim.
-        should_fire = (eff_free - req_a < margin_b) && (standby_actual > 0);
-        // Diagnostic: log EVERY reservation-mode callback evaluation (all MiB),
-        // with the KILL/keep verdict and the exact comparison. KILL iff
-        // slack < margin, where slack = eff_free - request.
+        // The active's own releasable cache: this callback runs BEFORE the
+        // allocator tries cudaMalloc / release_available_cached_blocks /
+        // release_cached_blocks in the malloc chain, so a cache-missing
+        // request is NOT yet a device-memory shortage — the allocator can
+        // return (reserved - allocated) bytes to the device by itself.
+        // NVML cannot see that (cached segments count as used), so without
+        // this term any big irregular allocation on a near-ceiling workload
+        // (e.g. MoE token-routing buffers) reclaims the standby although the
+        // active never needed new device memory — the futile kill/relaunch
+        // churn that broke the AWS measure_mem standby runs. inactive_split
+        // (free blocks inside split segments) can't be cudaFree'd
+        // individually on the native allocator, so subtract it; with
+        // expandable segments those pages are page-wise unmappable, making
+        // this a conservative underestimate (may fire early, never late).
+        // getDeviceStats re-takes the device allocator lock; safe here
+        // because it is a recursive mutex and we're on the allocating
+        // thread (same reentrancy PyTorch's own IPC callback relies on).
+        int64_t releasable_b = 0;
+        try {
+          const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
+              c10::cuda::current_device());
+          constexpr size_t kAgg = static_cast<size_t>(
+              c10::CachingDeviceAllocator::StatType::AGGREGATE);
+          releasable_b = std::max<int64_t>(
+              0,
+              stats.reserved_bytes[kAgg].current -
+                  stats.allocated_bytes[kAgg].current -
+                  stats.inactive_split_bytes[kAgg].current);
+        } catch (const std::exception& e) {
+          // Stats unavailable -> assume nothing is releasable (conservative:
+          // reverts to the NVML-only criterion for this evaluation).
+          std::fprintf(stderr, "[leto] getDeviceStats failed: %s\n", e.what());
+        }
+
+        // Three-tier decision. hard_slack ignores the active's own cache;
+        // full_slack assumes it can all be released.
+        //
+        //  keep    — the allocation fits without touching the standby's
+        //            granted-but-unallocated reservation (hard_slack >=
+        //            margin), or there is nothing granted/held to protect
+        //            (PyTorch's native release-then-cudaMalloc flow handles
+        //            the rest).
+        //  RELEASE — the allocation would physically grow into the protected
+        //            reservation (hard_slack < margin) although the active's
+        //            cache could cover it (full_slack >= margin). PyTorch
+        //            attempts cudaMalloc BEFORE releasing its own cache, so
+        //            without intervention the active eats the memory the
+        //            broker just promised the standby and the standby's
+        //            granted allocation OOMs (invariant (A) erosion during
+        //            the grant->alloc window). Force-release the cache and
+        //            retry: the allocation then recycles the active's own
+        //            memory. Only possible while protected > 0, i.e. during
+        //            a standby's init window — steady state never pays this.
+        //  KILL    — even the released cache cannot cover the request
+        //            (full_slack < margin) and there is something to take
+        //            back (standby_actual > 0 or granted > 0): reclaim the
+        //            standby before the active OOMs. A grant-only standby
+        //            must stay reclaimable (its reservation subtracts from
+        //            eff_free until voided). Firing with nothing held and
+        //            nothing granted stays suppressed (futile kill; a
+        //            SIGKILL'd mid-NCCL-init context lingers 10+ s on the
+        //            GPU and can wedge the device).
+        // RELEASE only while the unallocated grant is bigger than the margin:
+        // a fully-allocated standby leaves a small rounding remainder of
+        // protected memory (a few MiB), and paying an emptyCache on every
+        // near-boundary allocation to protect it costs ~20% throughput; the
+        // margin cushion absorbs sub-margin remainders instead.
+        const int64_t hard_slack_b = eff_free - req_a;
+        const int64_t full_slack_b = eff_free + releasable_b - req_a;
+        const bool release_cache = protected_b > margin_b &&
+                                   hard_slack_b < margin_b &&
+                                   full_slack_b >= margin_b;
+        should_fire = (full_slack_b < margin_b) &&
+                      (standby_actual > 0 || granted > 0);
+        // Diagnostic: log EVERY reservation-mode callback evaluation (all MiB).
         std::fprintf(stderr,
                      "[leto %s] fmcb request=%d MiB -> %s | nvml_free=%lld "
                      "standby_actual=%lld granted=%lld protected=%lld "
-                     "eff_free=%lld slack=%lld margin=%d MiB\n",
-                     leto_ts(), request_mb, should_fire ? "KILL" : "keep",
+                     "eff_free=%lld releasable=%lld hard_slack=%lld "
+                     "slack=%lld margin=%d MiB\n",
+                     leto_ts(), request_mb,
+                     should_fire ? "KILL" : (release_cache ? "RELEASE" : "keep"),
                      static_cast<long long>(nvml_free / (1024 * 1024)),
                      static_cast<long long>(standby_actual / (1024 * 1024)),
                      static_cast<long long>(granted / (1024 * 1024)),
                      static_cast<long long>(protected_b / (1024 * 1024)),
                      static_cast<long long>(eff_free / (1024 * 1024)),
-                     static_cast<long long>((eff_free - req_a) / (1024 * 1024)),
+                     static_cast<long long>(releasable_b / (1024 * 1024)),
+                     static_cast<long long>(hard_slack_b / (1024 * 1024)),
+                     static_cast<long long>(full_slack_b / (1024 * 1024)),
                      margin_mb_used);
+        if (release_cache && !should_fire) {
+          try {
+            // Same recursive device lock as getDeviceStats above; safe on
+            // the allocating thread. Returning true retries the allocation,
+            // which then draws from the freed cache instead of the
+            // standby's reservation.
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            return true;
+          } catch (const std::exception& e) {
+            std::fprintf(stderr, "[leto] emptyCache failed: %s\n", e.what());
+            // fall through: no kill; PyTorch proceeds natively
+          }
+        }
       }
     }
     if (!used_reservation) {
