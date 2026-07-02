@@ -1231,6 +1231,17 @@ class Leto:
     progressive_reservation_margin_mb > 0 (the reclaim path); with margin == 0
     the standby holds the memory ungated (the OOM control)."""
 
+    standby_test_occupy_mbs: str = ""
+    """OOM-safeguard test hook: comma-separated MiB sizes (e.g. "100,500,2048").
+    For each entry i a synthetic init task `standby_test_occupy_{i}` is
+    appended to the init sequence; on STANDBY ranks it allocates and HOLDS that
+    much GPU memory (no-op on the active). This gives the standby a controlled,
+    tunable footprint so the OOM-safeguard reclaim path can be exercised even
+    when the model's natural standby footprint is small. The tasks participate
+    in the init profile and the solver schedule, so changing this value
+    requires re-running profile_init. On activation (promotion) the held
+    ballast is released before training starts."""
+
 @dataclass
 class JobConfig:
     """

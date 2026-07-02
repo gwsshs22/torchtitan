@@ -144,6 +144,21 @@ def solve(profile_path, dependency_path=None, time_limit=None, gap=None, verbose
     profile_map = {t["task"]: t for t in profile["tasks"]}
     names = [t["name"] for t in dep["tasks"]]
 
+    # Synthetic standby ballast tasks (leto.standby_test_occupy_mbs) are
+    # config-dependent, so they can't live in the static dependency.json.
+    # Auto-declare any present in the profile, pinned to the END of the
+    # schedule (each depends on every previously declared task, and on the
+    # prior occupy task so the configured order is preserved).
+    occupy = sorted(
+        (t for t in profile_map if t.startswith("standby_test_occupy_")),
+        key=lambda n: int(n.rsplit("_", 1)[1]),
+    )
+    dep_tasks = list(dep["tasks"])
+    base_names = list(names)
+    for i, n in enumerate(occupy):
+        dep_tasks.append({"name": n, "depends_on": base_names + occupy[:i]})
+        names.append(n)
+
     missing = [n for n in names if n not in profile_map]
     if missing:
         raise ValueError(f"tasks in dependency.json missing from profile: {missing}")
@@ -159,7 +174,7 @@ def solve(profile_path, dependency_path=None, time_limit=None, gap=None, verbose
     name_to_i = {n: i for i, n in enumerate(names)}
     edges = [
         (name_to_i[p], name_to_i[t["name"]])
-        for t in dep["tasks"]
+        for t in dep_tasks
         for p in t["depends_on"]
     ]
 

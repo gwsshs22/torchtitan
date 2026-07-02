@@ -996,6 +996,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             install_reservation_broker(ledger_path, margin_mb, _on_oom)
 
+            # RMP-server allocations (e.g. lazy gradient-persistence tensors
+            # at the first backward) happen in a different process, so a CUDA
+            # OOM there never reaches the FreeMemoryCallback above. Route
+            # those failures through the same standby reclaim + one retry.
+            try:
+                from leto.rmp.client import set_oom_reclaim_hook
+
+                set_oom_reclaim_hook(lambda: _on_oom()[0])
+            except ImportError:
+                pass
+
 
     @record
     def train(self):

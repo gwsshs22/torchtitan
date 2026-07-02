@@ -442,6 +442,8 @@ def maybe_wait_for_resuming(ctx: InitContext) -> None:
             os._exit(0)
         if action == STANDBY_ACTION_ACTIVATE:
             logger.info("Standby activated - resuming initialization")
+            ctx.standby_activated = True
+            _release_occupy_holds(ctx)
             return
         elif action == STANDBY_ACTION_TERMINATE:
             logger.info("Standby terminated")
@@ -638,8 +640,48 @@ def init_trainer_states(ctx: InitContext) -> None:
     ctx._prev_step_faulted = False
 
 
+def _maybe_register_rmp_oom_reclaim(ctx: InitContext) -> None:
+    """Active side: route RMP-server CUDA OOM through the standby reclaim.
+
+    RMP allocations (model/optim pools, gradient-persistence tensors) happen
+    in the RMP server process, so an OOM there never reaches the active's
+    CUDACachingAllocator FreeMemoryCallback. Registered here — before the
+    first RMP allocation at init — rather than with the broker install at
+    train start, because the gradient tensors are allocated during THIS init
+    task; a standby holding grants (e.g. after a restart, or leftover from a
+    prior attempt) could otherwise starve them and crash the active."""
+    cfg = ctx.job_config.leto
+    if ctx.is_standby or not (
+        cfg.enable_standby
+        and cfg.progressive_init
+        and int(cfg.progressive_reservation_margin_mb) > 0
+    ):
+        return
+    try:
+        from leto.launch.worker_controller_client import (
+            kill_standby_for_oom_safeguard,
+        )
+        from leto.rmp.client import set_oom_reclaim_hook
+        from torchtitan.components.init.progressive import get_free_mb
+        from torchtitan.components.mem import reset_granted
+    except ImportError:
+        return
+    rank = int(os.environ.get("RANK", -1))
+
+    def _reclaim() -> bool:
+        freed, _pid = kill_standby_for_oom_safeguard(get_free_mb(), 0, rank=rank)
+        if freed:
+            reset_granted()
+        return freed
+
+    set_oom_reclaim_hook(_reclaim)
+    logger.info(f"[RMP] OOM-reclaim hook registered on active rank={rank}")
+
+
 def init_rmp_and_resilient_opt(ctx: InitContext) -> None:
     job_config = ctx.job_config
+
+    _maybe_register_rmp_oom_reclaim(ctx)
 
     ctx.rmp_manager = RmpManager(
         leto_config=job_config.leto,
@@ -879,6 +921,58 @@ REORDERED_SEQUENCE: list[Callable[[InitContext], None]] = [
     warmup_stages,
 ]
 
+def _parse_occupy_mbs(job_config: JobConfig) -> list[int]:
+    """Parse leto.standby_test_occupy_mbs ("100,500,2048") into [100, 500, 2048]."""
+    raw = str(getattr(job_config.leto, "standby_test_occupy_mbs", "") or "").strip()
+    if not raw:
+        return []
+    return [int(tok) for tok in raw.split(",") if tok.strip()]
+
+
+def _make_occupy_task(idx: int, mb: int) -> Callable[[InitContext], None]:
+    """Synthetic standby-only ballast task (OOM-safeguard testing).
+
+    Allocates and HOLDS `mb` MiB of GPU memory on standby ranks; no-op on the
+    active and on a standby that has already been activated (a promoted active
+    must not carry the ballast — see maybe_wait_for_resuming, which releases
+    any held ballast on activation)."""
+
+    def _task(ctx: InitContext) -> None:
+        if not ctx.is_standby or getattr(ctx, "standby_activated", False):
+            return
+        n = (mb * 1024 * 1024) // 2  # bf16 = 2 bytes/elem
+        t = torch.empty(n, dtype=torch.bfloat16, device="cuda")
+        t.fill_(0)
+        torch.cuda.synchronize()
+        holds = getattr(ctx, "_occupy_holds", None)
+        if holds is None:
+            holds = []
+            ctx._occupy_holds = holds
+        holds.append(t)
+        logger.info(
+            f"[occupy] standby rank={os.environ.get('RANK')} holding +{mb}MiB "
+            f"(task standby_test_occupy_{idx})"
+        )
+
+    _task.__name__ = f"standby_test_occupy_{idx}"
+    return _task
+
+
+def _release_occupy_holds(ctx: InitContext) -> None:
+    """Free any standby ballast (called on activation/promotion)."""
+    holds = getattr(ctx, "_occupy_holds", None)
+    if not holds:
+        return
+    total_mb = sum(t.numel() * t.element_size() for t in holds) // (1024 * 1024)
+    ctx._occupy_holds = None
+    del holds
+    torch.cuda.empty_cache()
+    logger.info(
+        f"[occupy] rank={os.environ.get('RANK')} released {total_mb}MiB "
+        f"ballast on activation"
+    )
+
+
 BASELINE_SEQUENCE: list[Callable[[InitContext], None]] = [
     activate_cuda_device,
     # --- CUDA context set immediately ---
@@ -1067,6 +1161,11 @@ def _run_progressive_sequence(
                             f"running remaining tasks unconditionally"
                         )
                         activated = True
+                        # Mark promotion so synthetic ballast tasks
+                        # (standby_test_occupy_*) skip allocating and any
+                        # already-held ballast is released before training.
+                        ctx.standby_activated = True
+                        _release_occupy_holds(ctx)
                         break
                     if extra == STANDBY_ACTION_TERMINATE:
                         logger.info("[progressive] standby terminated")
@@ -1095,6 +1194,15 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
     if profile:
         time.sleep(10)
 
+    # Synthetic standby ballast tasks (OOM-safeguard testing). Appended to the
+    # end of the sequence so they run after real init; they no-op on the
+    # active, so both groups execute the same task list (and the profile /
+    # solver schedule stays consistent with the runtime sequence).
+    occupy_mbs = _parse_occupy_mbs(job_config)
+    sequence = sequences[mode] + [
+        _make_occupy_task(i, mb) for i, mb in enumerate(occupy_mbs)
+    ]
+
     profile_records: list[dict] = []
     t0 = time.monotonic()
 
@@ -1118,9 +1226,9 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
     )
 
     if progressive:
-        _run_progressive_sequence(ctx, sequences[mode], mode)
+        _run_progressive_sequence(ctx, sequence, mode)
     else:
-        for task_fn in sequences[mode]:
+        for task_fn in sequence:
             if profile:
                 mem_before = _get_gpu_mem_mb()
                 t_start = time.monotonic() - t0
