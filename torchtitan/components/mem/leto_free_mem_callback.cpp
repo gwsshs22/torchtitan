@@ -4,8 +4,10 @@
 #include <nvml.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <ctime>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -26,6 +28,19 @@
 namespace py = pybind11;
 
 namespace leto {
+
+// Compact wall-clock timestamp (HH:MM:SS.mmm) so the reservation-broker and
+// free-memory-callback event series can be correlated with the [titan] logs.
+static const char* leto_ts() {
+  static thread_local char buf[24];
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm tmv;
+  localtime_r(&tv.tv_sec, &tmv);
+  std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tmv.tm_hour,
+                tmv.tm_min, tmv.tm_sec, static_cast<int>(tv.tv_usec / 1000));
+  return buf;
+}
 
 static std::mutex g_mu;
 static int g_threshold_mb = 0;
@@ -358,21 +373,24 @@ static void broker_loop() {
     if (ok && req_seq != last_req_seq) {
       const int64_t req_bytes = resv_load_acq(&L->req_bytes);
       int verdict = RESV_VERDICT_DENY;
-      int64_t granted_after = 0, eff_free = 0;
+      // Hoisted out of the lock scope so the diagnostic log below can print
+      // every input that fed the grant/deny decision.
+      int64_t granted_after = 0, eff_free = 0, free_now = 0, pid_now = 0;
+      int64_t protected_b = 0, margin_b = 0, needed = 0, granted_before = 0;
       {
         std::lock_guard<std::mutex> lk(g_broker_mutex);
         // Read NVML fresh under the lock so the grant is consistent with the
         // active's allocations (which also take g_broker_mutex).
-        int64_t free_now = 0, pid_now = 0;
         if (read_nvml_mem(handle, target_pid, &free_now, &pid_now)) {
           int64_t granted_cur = g_granted.load(std::memory_order_relaxed);
-          const int64_t protected_b = std::max<int64_t>(0, granted_cur - pid_now);
+          granted_before = granted_cur;
+          protected_b = std::max<int64_t>(0, granted_cur - pid_now);
           eff_free = free_now - protected_b;
-          const int64_t margin_b =
+          margin_b =
               static_cast<int64_t>(
                   g_reservation_margin_mb.load(std::memory_order_relaxed)) *
               1024 * 1024;
-          const int64_t needed = req_bytes - granted_cur;
+          needed = req_bytes - granted_cur;
           if (needed <= 0) {
             verdict = RESV_VERDICT_GRANT;  // already covered; no change
           } else if (eff_free - margin_b >= needed) {
@@ -389,14 +407,24 @@ static void broker_loop() {
       resv_store_rel(&L->resp_verdict, verdict);
       resv_store_rel(&L->resp_seq, req_seq);  // bump last → signals done
       last_req_seq = req_seq;
+      // Diagnostic: full broker grant decision with every input (all MiB).
+      // GRANT iff needed<=0 (already covered) or eff_free-margin>=needed.
       std::fprintf(
           stderr,
-          "[leto] broker req_seq=%u bytes=%lld -> %s (granted=%lld, "
-          "eff_free=%lld)\n",
-          req_seq, static_cast<long long>(req_bytes),
+          "[leto %s] broker req_seq=%u request=%lld MiB -> %s | nvml_free=%lld "
+          "standby_actual=%lld granted_before=%lld needed=%lld protected=%lld "
+          "eff_free=%lld margin=%lld granted_after=%lld MiB\n",
+          leto_ts(), req_seq,
+          static_cast<long long>(req_bytes / (1024 * 1024)),
           verdict == RESV_VERDICT_GRANT ? "GRANT" : "DENY",
-          static_cast<long long>(granted_after),
-          static_cast<long long>(eff_free));
+          static_cast<long long>(free_now / (1024 * 1024)),
+          static_cast<long long>(pid_now / (1024 * 1024)),
+          static_cast<long long>(granted_before / (1024 * 1024)),
+          static_cast<long long>(needed / (1024 * 1024)),
+          static_cast<long long>(protected_b / (1024 * 1024)),
+          static_cast<long long>(eff_free / (1024 * 1024)),
+          static_cast<long long>(margin_b / (1024 * 1024)),
+          static_cast<long long>(granted_after / (1024 * 1024)));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
   }
@@ -552,18 +580,30 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
                          static_cast<long long>(granted / (1024 * 1024)));
           }
         }
-        should_fire = (eff_free - req_a < margin_b);
-        if (should_fire) {
-          std::fprintf(stderr,
-                       "[leto] Kill standby (reservation). nvml_free=%lld MiB, "
-                       "standby_actual=%lld MiB, granted=%lld MiB, "
-                       "eff_free=%lld MiB, request=%d MiB, margin=%d MiB\n",
-                       static_cast<long long>(nvml_free / (1024 * 1024)),
-                       static_cast<long long>(standby_actual / (1024 * 1024)),
-                       static_cast<long long>(granted / (1024 * 1024)),
-                       static_cast<long long>(eff_free / (1024 * 1024)),
-                       request_mb, margin_mb_used);
-        }
+        // Only reclaim when the ledger-registered standby is actually holding
+        // reclaimable GPU memory. standby_actual == 0 means no standby, a
+        // stale/dead pid, or a standby that has NOT yet entered the reservation
+        // handshake (standby_register writes standby_pid only after
+        // init_distributed). Firing then would either free nothing (futile) or
+        // SIGKILL a mid-NCCL-init standby that lingers 10+ s on the GPU and can
+        // wedge the active with a shared-mem/CUDA-IPC SIGBUS. So gate the kill
+        // on there being a live, registered standby with memory to reclaim.
+        should_fire = (eff_free - req_a < margin_b) && (standby_actual > 0);
+        // Diagnostic: log EVERY reservation-mode callback evaluation (all MiB),
+        // with the KILL/keep verdict and the exact comparison. KILL iff
+        // slack < margin, where slack = eff_free - request.
+        std::fprintf(stderr,
+                     "[leto %s] fmcb request=%d MiB -> %s | nvml_free=%lld "
+                     "standby_actual=%lld granted=%lld protected=%lld "
+                     "eff_free=%lld slack=%lld margin=%d MiB\n",
+                     leto_ts(), request_mb, should_fire ? "KILL" : "keep",
+                     static_cast<long long>(nvml_free / (1024 * 1024)),
+                     static_cast<long long>(standby_actual / (1024 * 1024)),
+                     static_cast<long long>(granted / (1024 * 1024)),
+                     static_cast<long long>(protected_b / (1024 * 1024)),
+                     static_cast<long long>(eff_free / (1024 * 1024)),
+                     static_cast<long long>((eff_free - req_a) / (1024 * 1024)),
+                     margin_mb_used);
       }
     }
     if (!used_reservation) {
