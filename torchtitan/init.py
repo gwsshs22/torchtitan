@@ -1153,6 +1153,13 @@ def _run_progressive_sequence(
                 if outcome == "advance":
                     break
                 if outcome == "retry":
+                    # A denied reservation cannot succeed until the active's
+                    # memory situation changes; pacing retries at 1s keeps
+                    # the broker handshake + gloo unanimity traffic
+                    # negligible (immediate retries ran continuously during
+                    # the 2026-07 AWS runs). Promotion stays responsive: the
+                    # next _reserve poll runs status_check within ~1s.
+                    time.sleep(1.0)
                     continue
                 if outcome == "status":
                     if extra == STANDBY_ACTION_ACTIVATE:

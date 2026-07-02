@@ -408,10 +408,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"{leto_cfg.progressive_reservation_margin_mb}MiB)"
         )
 
-        from torchtitan.components.mem import (
-            get_num_kill_standby_called,
-            set_threshold_mb,
-        )
+        from torchtitan.components.mem import get_num_kill_standby_called
 
         self._oom_tensors: list[torch.Tensor] = []
         safeguard_disabled = False
@@ -429,17 +426,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
                 return
             self._oom_tensors.append(t)
-            # Once the safeguard has fired even once, disable it so the
-            # remaining allocations of this test surface OOM cleanly
-            # without re-invoking the kill path.
+            # Once the safeguard has fired, it self-disarms: the kill voids
+            # the grant (reset_granted), so with nothing reserved and no
+            # standby memory held the reclaim gate cannot fire again —
+            # remaining allocations of this test surface OOM cleanly.
             logger.info(f"get_num_kill_standby_called()={get_num_kill_standby_called()}")
             if not safeguard_disabled and get_num_kill_standby_called() >= 1:
-                set_threshold_mb(0)
                 safeguard_disabled = True
                 logger.info(
                     f"[oom_test] rank={rank} safeguard fired during chunk "
-                    f"{i + 1}/{n_chunks}; threshold cleared for the rest "
-                    f"of the test"
+                    f"{i + 1}/{n_chunks}; self-disarmed for the rest of "
+                    f"the test"
                 )
 
         free_b_after, _ = torch.cuda.mem_get_info()

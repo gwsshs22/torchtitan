@@ -1,22 +1,18 @@
-"""Leto OOM-safeguard installation for torchtitan training processes.
+"""Leto standby memory reservation for torchtitan training processes.
 
-`install_oom_safeguard(threshold_mb, kill_callback)` builds the
-`leto_free_mem_callback` C++ extension on first call (lazy + memoized),
-registers a Python kill_callback that gets invoked synchronously by the
-CUDACachingAllocator's FreeMemoryCallback whenever free GPU MiB falls
-below `threshold_mb` during a cache-miss expansion, and registers an
-atexit hook that clears the callback before interpreter teardown so the
-static `py::object` in the C++ module never decrefs after Python is
-finalized.
+`install_reservation_broker(ledger_path, margin_mb, kill_callback)` builds
+the `leto_free_mem_callback` C++ extension on first call (lazy + memoized),
+installs the RecordingAllocator (a pass-through wrapper that records each
+in-flight allocation's size), mmaps the per-rank shm ledger shared with the
+co-located standby, and starts the broker thread.
 
-The FreeMemoryCallback interface receives no arguments, so it cannot see
-how large the allocation that triggered it is. Passing `request_aware=True`
-installs a transparent `LetoRecordingAllocator` -- a pass-through wrapper
-around the native CUDA allocator that stamps each in-flight allocation's
-size into a thread-local before delegating. The callback then reads that
-size and reclaims the standby only when the pending request (plus
-`request_margin_mb` headroom) would not fit in free GPU memory, which is
-far more precise than the absolute `threshold_mb` floor.
+The CUDACachingAllocator's FreeMemoryCallback (Execute) fires on every
+cache miss: it takes one NVML read, publishes `used_estimate`
+(= physical used excl. standby + in-flight bytes + margin) for the broker's
+grant decisions, and reclaims (kills) the standby when even releasing the
+active's whole cache could not keep the pending allocations out of the
+standby's reservation. The broker and the callback share only three plain
+atomics — no locks touch the allocation path.
 """
 
 import atexit
@@ -137,46 +133,6 @@ def _load_module():
         return _module
 
 
-def install_oom_safeguard(
-    threshold_mb: int,
-    kill_callback: Callable[[], bool],
-    request_aware: bool = False,
-    request_margin_mb: int = 0,
-) -> None:
-    """Install the OOM safeguard. No-op if threshold_mb <= 0.
-
-    Args:
-        threshold_mb: Free GPU MiB below which the kill_callback fires
-            (legacy absolute-floor criterion, used when request_aware is
-            False).
-        kill_callback: Zero-arg callable returning True if memory was freed
-            (so PyTorch retries the allocation), False otherwise.
-        request_aware: When True, install the RecordingAllocator and switch
-            the firing criterion to the request-aware form: fire iff free
-            GPU MiB < (pending allocation MiB + request_margin_mb). This is
-            more precise than the absolute floor because it reclaims only
-            when the allocation actually in flight would not fit.
-        request_margin_mb: Safety headroom (MiB) added to the pending
-            request in the request-aware criterion. Ignored unless
-            request_aware is True.
-    """
-    global _atexit_registered
-    if threshold_mb <= 0:
-        return
-    m = _load_module()
-    m.set_threshold_mb(int(threshold_mb))
-    if request_aware:
-        # Order matters: install the recorder before flipping the criterion
-        # so the callback never reads a stale request size on its first fire.
-        m.install_recording_allocator()
-        m.set_request_margin_mb(int(request_margin_mb))
-        m.set_request_aware(True)
-    m.set_kill_callback(kill_callback)
-    if not _atexit_registered:
-        atexit.register(m.clear_kill_callback)
-        _atexit_registered = True
-
-
 def install_recording_allocator() -> bool:
     """Install the transparent RecordingAllocator as the current CUDA
     allocator so the FreeMemoryCallback can read the in-flight allocation
@@ -191,38 +147,12 @@ def is_recording_allocator_installed() -> bool:
     return bool(_module.is_recording_allocator_installed())
 
 
-def set_request_aware(enabled: bool) -> None:
-    """Toggle the request-aware firing criterion. Requires the
-    RecordingAllocator to be installed to be meaningful."""
-    if _module is None:
-        return
-    _module.set_request_aware(bool(enabled))
-
-
-def set_request_margin_mb(mb: int) -> None:
-    """Headroom (MiB) added to the pending request in the request-aware
-    criterion: fire iff free MiB < request MiB + margin."""
-    if _module is None:
-        return
-    _module.set_request_margin_mb(int(mb))
-
-
 def get_last_request_mb() -> int:
     """Most recent allocation request (MiB) seen by the RecordingAllocator,
     across all threads. Observability only."""
     if _module is None:
         return 0
     return int(_module.get_last_request_mb())
-
-
-def set_threshold_mb(mb: int) -> None:
-    """Update the OOM-safeguard threshold. Pass 0 to disable firing
-    without unregistering the callback (e.g. once the first kill has
-    been observed and we want subsequent allocations to surface OOM
-    cleanly)."""
-    if _module is None:
-        return
-    _module.set_threshold_mb(int(mb))
 
 
 def get_num_kill_standby_called() -> int:
@@ -254,11 +184,12 @@ def install_reservation_broker(
 ) -> None:
     """Active-side setup for standby memory reservation.
 
-    Installs the RecordingAllocator (so the active's allocations serialize
-    against grants via the broker mutex), mmaps the per-rank shm ledger, and
-    starts the C++ broker thread. The broker reads NVML and grants/denies
-    reservations posted by the co-located standby, keeping
-    `others_used + granted <= capacity - margin`.
+    Installs the RecordingAllocator (which records in-flight allocation
+    sizes — no locks), mmaps the per-rank shm ledger, and starts the C++
+    broker thread. The broker grants/denies reservations posted by the
+    co-located standby against the callback-published `used_estimate`,
+    keeping `used_estimate + reserved <= capacity` (margin folded into
+    the estimate).
 
     Args:
         ledger_path: per-rank shm file shared with the standby

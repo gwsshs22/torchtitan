@@ -218,7 +218,11 @@ def try_advance(
             local_ok = 0
         else:
             local_ok = 1 if kind == "grant" else 0
-            logger.info(
+            # Per-attempt outcome is debug-only: with 1s retry pacing a
+            # starved task would still log once per rank per second, and the
+            # broker's DENY / grant-raising stderr line is the authoritative
+            # record of every decision.
+            logger.debug(
                 f"[progressive] rank={rank} cumulative_mb={cumulative_mb:.1f} "
                 f"→ {kind}"
             )
