@@ -1,6 +1,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/AllocatorConfig.h>
 #include <cuda_runtime.h>
 #include <nvml.h>
 #include <fcntl.h>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +44,154 @@ static const char* leto_ts() {
   std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tmv.tm_hour,
                 tmv.tm_min, tmv.tm_sec, static_cast<int>(tv.tv_usec / 1000));
   return buf;
+}
+
+// Rank tag resolved once from torchrun's env (RANK, falling back to
+// LOCAL_RANK; "?" outside torchrun). Multiple ranks' stderr interleave in
+// one per-node log file, so untagged lines leave forensics guessing which
+// GPU's callback said what (the 2026-07 AWS OOM analysis took a detour
+// over exactly this).
+static const char* leto_rank() {
+  static const std::string tag = [] {
+    const char* r = std::getenv("RANK");
+    if (r == nullptr) r = std::getenv("LOCAL_RANK");
+    return std::string(r != nullptr ? r : "?");
+  }();
+  return tag.c_str();
+}
+
+// Single-write log line "[leto r<rank> HH:MM:SS.mmm] <msg>" so concurrent
+// ranks' lines don't shear inside the shared stderr pipe.
+static void leto_log(const char* fmt, ...) {
+  char msg[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  std::fprintf(stderr, "[leto r%s %s] %s\n", leto_rank(), leto_ts(), msg);
+}
+
+// ---------------------------------------------------------------------------
+// Releasable-memory estimation (page-exact, snapshot-based)
+// ---------------------------------------------------------------------------
+
+// Mirror of DeviceCachingAllocator::round_size, upper-bounded: 512 B
+// granularity by default; when roundup_power2_divisions is configured the
+// allocator rounds to the next power-of-2 division, which never exceeds
+// the next power of two -- bound by that.
+static int64_t round_request(int64_t size) {
+  constexpr int64_t kMinBlockSize = 512;
+  if (size < kMinBlockSize) {
+    return kMinBlockSize;
+  }
+  const auto divisions = c10::CachingAllocator::AcceleratorAllocatorConfig::
+      roundup_power2_divisions(static_cast<size_t>(size));
+  if (divisions > 1 &&
+      size > kMinBlockSize * static_cast<int64_t>(divisions)) {
+    const int64_t floor_p2 = int64_t{1}
+        << (63 - __builtin_clzll(static_cast<uint64_t>(size)));
+    return floor_p2 == size ? size : floor_p2 << 1;
+  }
+  return kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+}
+
+// Upper bound on the physical bytes a request will newly map if it cannot
+// be served from cache. The expandable path maps round_size(req) rounded
+// up to whole pages (2 MiB small pool, large_segment_size() -- 20 MiB
+// default -- large pool) within page-aligned mapped ranges, so newly
+// mapped bytes never exceed the page-rounded request. The non-expandable
+// path cudaMallocs get_allocation_size(req), at least kLargeBuffer for
+// large-pool requests -- the max() keeps the bound valid there too.
+static int64_t request_physical_ub(int64_t req) {
+  constexpr int64_t kSmallSize = int64_t{1} << 20;    // <= 1 MiB: small pool
+  constexpr int64_t kSmallBuffer = int64_t{2} << 20;  // small-pool page
+  constexpr int64_t kLargeBuffer = int64_t{20} << 20;
+  if (req <= kSmallSize) {
+    return kSmallBuffer;
+  }
+  const int64_t page = static_cast<int64_t>(
+      c10::CachingAllocator::AcceleratorAllocatorConfig::large_segment_size());
+  const int64_t r = round_request(req);
+  return std::max((r + page - 1) / page * page, kLargeBuffer);
+}
+
+// Sound lower bound on the bytes release_cached_blocks()/emptyCache() can
+// return to the driver right now, for `device`. Replays the allocator's
+// own release logic over snapshot():
+//  - non-expandable segment: cudaFree-able iff nothing in it is active
+//    (adjacent free blocks always merge, so active_size == 0 means the
+//    segment is one whole free block);
+//  - expandable segment: for each inactive block, only the whole pages
+//    strictly inside it unmap (ExpandableSegment::unmap rounds begin up
+//    and end down to the page); snapshot() reports one SegmentInfo per
+//    contiguous *mapped* range, whose boundaries are page-aligned by
+//    construction, so block offsets from `address` give exact page math.
+// Do NOT use the stats formula reserved - allocated - inactive_split for
+// this: PyTorch keeps no inactive_split stat for expandable segments
+// (free_block explicitly skips them), so under expandable_segments it
+// credits every cached byte -- including the sub-page fragments wedged
+// between live tensors that no release path can ever return. On the
+// 2026-07 AWS OOM that phantom credit was 945 MiB: used_estimate ran a
+// full margin too low and the must-KILL evaluation kept instead.
+// Event-pending blocks count as active in snapshot() although the release
+// path would sync-and-free them, and private pools are skipped although
+// freeable ones would be released: both make this an under-estimate, so
+// the estimate errs toward "used" and never banks on memory that cannot
+// actually be freed. snapshot() re-takes the (recursive) device allocator
+// lock; safe from every caller (same reentrancy as getDeviceStats).
+static int64_t releasable_lower_bound(c10::DeviceIndex device) {
+  const auto snap = c10::cuda::CUDACachingAllocator::snapshot();
+  const int64_t large_page = static_cast<int64_t>(
+      c10::CachingAllocator::AcceleratorAllocatorConfig::large_segment_size());
+  constexpr int64_t small_page = int64_t{2} << 20;  // kSmallBuffer
+  int64_t out = 0;
+  for (const auto& seg : snap.segments) {
+    if (seg.device != device) {
+      continue;
+    }
+    if (seg.owner_private_pool_id.first != 0 ||
+        seg.owner_private_pool_id.second != 0) {
+      continue;
+    }
+    if (!seg.is_expandable) {
+      if (seg.active_size == 0) {
+        out += static_cast<int64_t>(seg.total_size);
+      }
+      continue;
+    }
+    const int64_t page = seg.is_large ? large_page : small_page;
+    int64_t off = static_cast<int64_t>(seg.address);
+    for (const auto& b : seg.blocks) {
+      const int64_t sz = static_cast<int64_t>(b.size);
+      if (!b.active) {
+        const int64_t lo = (off + page - 1) / page * page;
+        const int64_t hi = (off + sz) / page * page;
+        if (hi > lo) {
+          out += hi - lo;
+        }
+      }
+      off += sz;
+    }
+  }
+  return out;
+}
+
+// The walk above is O(all blocks) -- measured 1.8 ms at ~18k blocks
+// (mew2, 2026-07) -- far too heavy for every cache miss. Split its two
+// consumers: the *published* estimate (broker grant admission) tolerates
+// ~100 ms staleness (admission already races the standby's allocation by
+// design), so it reuses a TTL-cached value clamped to the cache's current
+// size; keep/KILL *decisions* never ride on a stale credit -- Execute()
+// forces a fresh walk exactly when the zero-credit conservative check
+// shows pressure (see there).
+constexpr int64_t kLbTtlMs = 100;
+static std::atomic<int64_t> g_lb_cached{0};
+static std::atomic<int64_t> g_lb_cached_at_ms{-kLbTtlMs};
+
+static int64_t mono_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 // Guards g_kill_cb (a py::object) only.
@@ -204,13 +354,17 @@ static int g_broker_device = 0;
 // grant admission subtracts g_inflight_bytes from NVML-free: completed
 // mallocs are in the NVML reading, mid-cudaMalloc ones are in this counter,
 // and everything that starts after a grant is bounded by the allocator cap.
-// Queued allocations that will be served from cache are overcounted —
-// conservative (worst case a DENY the standby retries ~1s later).
+// Charged at request_physical_ub (page-rounded physical footprint), not raw
+// bytes: a cache miss maps whole pages, and the raw charge under-counts by
+// up to a page. Queued allocations that will be served from cache are
+// overcounted — conservative (worst case a DENY the standby retries ~1s
+// later).
 static std::atomic<int64_t> g_inflight_bytes{0};
 
 struct InflightRecord {
   int64_t n_;
-  explicit InflightRecord(size_t n) : n_(static_cast<int64_t>(n)) {
+  explicit InflightRecord(size_t n)
+      : n_(request_physical_ub(static_cast<int64_t>(n))) {
     g_inflight_bytes.fetch_add(n_, std::memory_order_relaxed);
   }
   ~InflightRecord() {
@@ -233,8 +387,7 @@ static void init_nvml_once() {
   std::call_once(g_nvml_init_once, []() {
     g_nvml_init_status = nvmlInit_v2();
     if (g_nvml_init_status != NVML_SUCCESS) {
-      std::fprintf(stderr, "[leto] nvmlInit_v2 failed: %s\n",
-                   nvmlErrorString(g_nvml_init_status));
+      leto_log("nvmlInit_v2 failed: %s", nvmlErrorString(g_nvml_init_status));
     }
   });
 }
@@ -252,15 +405,13 @@ static bool resolve_nvml_handle(nvmlDevice_t* out) {
   int cuda_dev = 0;
   cudaError_t cerr = cudaGetDevice(&cuda_dev);
   if (cerr != cudaSuccess) {
-    std::fprintf(stderr, "[leto] cudaGetDevice failed: %s\n",
-                 cudaGetErrorString(cerr));
+    leto_log("cudaGetDevice failed: %s", cudaGetErrorString(cerr));
     return false;
   }
   cudaDeviceProp prop;
   cerr = cudaGetDeviceProperties(&prop, cuda_dev);
   if (cerr != cudaSuccess) {
-    std::fprintf(stderr, "[leto] cudaGetDeviceProperties failed: %s\n",
-                 cudaGetErrorString(cerr));
+    leto_log("cudaGetDeviceProperties failed: %s", cudaGetErrorString(cerr));
     return false;
   }
   char pci[64];
@@ -269,9 +420,8 @@ static bool resolve_nvml_handle(nvmlDevice_t* out) {
   nvmlDevice_t handle;
   nvmlReturn_t nerr = nvmlDeviceGetHandleByPciBusId_v2(pci, &handle);
   if (nerr != NVML_SUCCESS) {
-    std::fprintf(stderr,
-                 "[leto] nvmlDeviceGetHandleByPciBusId_v2(%s) failed: %s\n",
-                 pci, nvmlErrorString(nerr));
+    leto_log("nvmlDeviceGetHandleByPciBusId_v2(%s) failed: %s", pci,
+             nvmlErrorString(nerr));
     return false;
   }
   {
@@ -310,8 +460,7 @@ static bool get_free_mb_nvml(int* free_mb_out, int* total_mb_out) {
   const char* nvml_api_name = "nvmlDeviceGetMemoryInfo";
 #endif
   if (nerr != NVML_SUCCESS) {
-    std::fprintf(stderr, "[leto] %s failed: %s\n",
-                 nvml_api_name, nvmlErrorString(nerr));
+    leto_log("%s failed: %s", nvml_api_name, nvmlErrorString(nerr));
     return false;
   }
   unsigned long long free_b = (mem.total > mem.used)
@@ -339,8 +488,8 @@ static bool read_nvml_mem(nvmlDevice_t handle, int target_pid,
   nvmlReturn_t nerr = nvmlDeviceGetMemoryInfo(handle, &mem);
 #endif
   if (nerr != NVML_SUCCESS) {
-    std::fprintf(stderr, "[leto] broker nvmlDeviceGetMemoryInfo failed: %s\n",
-                 nvmlErrorString(nerr));
+    leto_log("broker nvmlDeviceGetMemoryInfo failed: %s",
+             nvmlErrorString(nerr));
     return false;
   }
   const int64_t total_b = static_cast<int64_t>(mem.total);
@@ -358,10 +507,8 @@ static bool read_nvml_mem(nvmlDevice_t handle, int target_pid,
       procs.resize(count);
     }
     if (r != NVML_SUCCESS) {
-      std::fprintf(stderr,
-                   "[leto] broker nvmlDeviceGetComputeRunningProcesses "
-                   "failed: %s\n",
-                   nvmlErrorString(r));
+      leto_log("broker nvmlDeviceGetComputeRunningProcesses failed: %s",
+               nvmlErrorString(r));
       return false;
     }
     for (unsigned int i = 0; i < count; ++i) {
@@ -415,8 +562,7 @@ static void apply_reservation_budget() {
     c10::cuda::CUDACachingAllocator::setMemoryFraction(
         frac, static_cast<c10::DeviceIndex>(g_broker_device));
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "[leto] setMemoryFraction(%.4f) failed: %s\n", frac,
-                 e.what());
+    leto_log("setMemoryFraction(%.4f) failed: %s", frac, e.what());
   }
 }
 
@@ -428,25 +574,34 @@ static void apply_reservation_budget() {
 // Counting in-flight allocations makes the value post-malloc-correct (a raw
 // pre-malloc reading over-credits free by the triggering allocation's size);
 // in-flight allocations that end up served from cache leave it conservative
-// until the next publish. Subtracting the releasable cache (reserved -
-// allocated - inactive_split, an in-process counter read measured at ~68ns)
-// counts only LIVE memory as used: without it, a cache-full device makes
-// the kill condition true on every miss (2026-06 futile-kill churn) and
-// starves grant admission forever (2026-07 runs). The cache is legitimately
-// creditable because the allocator cap forces it back to the device — but
-// only lazily, on the active's next cache miss, so a grant admitted against
-// cache races the standby's allocation for ~0.1-5s (accepted; the standby
-// dies and rotates if it loses). Raw values go to the out-params for the
-// caller's own decision math. Returns false (estimate untouched) on NVML
-// failure.
+// until the next publish. Subtracting the releasable cache counts only LIVE
+// memory as used: without it, a cache-full device makes the kill condition
+// true on every miss (2026-06 futile-kill churn) and starves grant
+// admission forever (2026-07 runs). The cache is legitimately creditable
+// because the allocator cap forces it back to the device — but only lazily,
+// on the active's next cache miss, so a grant admitted against cache races
+// the standby's allocation for ~0.1-5s (accepted; the standby dies and
+// rotates if it loses).
+//
+// The credit is the page-exact releasable_lower_bound (see there), NOT the
+// stats formula reserved - allocated - inactive_split: under
+// expandable_segments that formula credits stranded sub-page fragments no
+// release path can return (945 MiB on the 2026-07 AWS OOM — a full margin
+// of phantom credit, enough to flip a must-KILL into keep). The walk costs
+// ~1.8 ms at 18k blocks, so `exact_lb` picks the freshness: false reuses a
+// kLbTtlMs-cached value (grant admission; clamped to the cache's current
+// size), true forces a fresh walk (decisions at the pressure boundary).
+// Raw values go to the out-params for the caller's own decision math.
+// Returns false (estimate untouched) on NVML failure.
 static bool refresh_used_estimate(nvmlDevice_t handle, int target_pid,
                                   int64_t* free_b_out, int64_t* total_b_out,
-                                  int64_t* standby_actual_out) {
+                                  int64_t* standby_actual_out,
+                                  bool exact_lb = false) {
   int64_t free_b = 0, total_b = 0, actual_b = 0;
   if (!read_nvml_mem(handle, target_pid, &free_b, &total_b, &actual_b)) {
     return false;
   }
-  int64_t releasable_b = 0;
+  int64_t cache_b = 0;  // reserved - allocated: cheap cap on the credit
   try {
     // getDeviceStats re-takes the device allocator lock; safe from every
     // caller (recursive on the allocating thread inside Execute; briefly
@@ -455,14 +610,35 @@ static bool refresh_used_estimate(nvmlDevice_t handle, int target_pid,
         c10::cuda::current_device());
     constexpr size_t kAgg = static_cast<size_t>(
         c10::CachingDeviceAllocator::StatType::AGGREGATE);
-    releasable_b = std::max<int64_t>(
+    cache_b = std::max<int64_t>(
         0,
         stats.reserved_bytes[kAgg].current -
-            stats.allocated_bytes[kAgg].current -
-            stats.inactive_split_bytes[kAgg].current);
+            stats.allocated_bytes[kAgg].current);
   } catch (const std::exception& e) {
     // Stats unavailable -> count the cache as used (conservative).
-    std::fprintf(stderr, "[leto] getDeviceStats failed: %s\n", e.what());
+    leto_log("getDeviceStats failed: %s", e.what());
+  }
+  int64_t releasable_b = 0;
+  if (cache_b > 0) {
+    const int64_t now = mono_ms();
+    if (exact_lb ||
+        now - g_lb_cached_at_ms.load(std::memory_order_relaxed) >= kLbTtlMs) {
+      try {
+        releasable_b = releasable_lower_bound(c10::cuda::current_device());
+      } catch (const std::exception& e) {
+        // Snapshot unavailable -> count the cache as used (conservative).
+        leto_log("releasable_lower_bound failed: %s", e.what());
+      }
+      g_lb_cached.store(releasable_b, std::memory_order_relaxed);
+      g_lb_cached_at_ms.store(now, std::memory_order_relaxed);
+    } else {
+      // TTL reuse for the published (grant) estimate; never credit more
+      // than the cache currently holds.
+      releasable_b =
+          std::min(g_lb_cached.load(std::memory_order_relaxed), cache_b);
+    }
+  } else {
+    g_lb_cached.store(0, std::memory_order_relaxed);
   }
   const int64_t inflight_b = g_inflight_bytes.load(std::memory_order_relaxed);
   const int64_t margin_b =
@@ -565,12 +741,11 @@ static void broker_loop() {
       // re-grants (needed<=0, one per peer-denied unanimity round) only
       // with LETO_FMCB_VERBOSE=1.
       if (verdict == RESV_VERDICT_DENY || needed > 0 || g_verbose_decisions)
-        std::fprintf(
-            stderr,
-            "[leto %s] broker req_seq=%u request=%lld MiB -> %s | "
+        leto_log(
+            "broker req_seq=%u request=%lld MiB -> %s | "
             "used_est=%lld capacity=%lld granted_before=%lld needed=%lld "
-            "granted_after=%lld MiB\n",
-            leto_ts(), req_seq,
+            "granted_after=%lld MiB",
+            req_seq,
             static_cast<long long>(req_bytes / (1024 * 1024)),
             verdict == RESV_VERDICT_GRANT ? "GRANT" : "DENY",
             static_cast<long long>(used_est / (1024 * 1024)),
@@ -588,14 +763,13 @@ static void broker_loop() {
 static bool attach_reservation_ledger(const std::string& path) {
   int fd = ::open(path.c_str(), O_RDWR);
   if (fd < 0) {
-    std::fprintf(stderr,
-                 "[leto] attach_reservation_ledger open(%s) failed: %s\n",
-                 path.c_str(), std::strerror(errno));
+    leto_log("attach_reservation_ledger open(%s) failed: %s", path.c_str(),
+             std::strerror(errno));
     return false;
   }
   if (::ftruncate(fd, sizeof(ReservationLedger)) != 0) {
-    std::fprintf(stderr, "[leto] attach_reservation_ledger ftruncate failed: %s\n",
-                 std::strerror(errno));
+    leto_log("attach_reservation_ledger ftruncate failed: %s",
+             std::strerror(errno));
     ::close(fd);
     return false;
   }
@@ -603,8 +777,8 @@ static bool attach_reservation_ledger(const std::string& path) {
                    MAP_SHARED, fd, 0);
   ::close(fd);
   if (p == MAP_FAILED) {
-    std::fprintf(stderr, "[leto] attach_reservation_ledger mmap failed: %s\n",
-                 std::strerror(errno));
+    leto_log("attach_reservation_ledger mmap failed: %s",
+             std::strerror(errno));
     return false;
   }
   g_ledger = static_cast<ReservationLedger*>(p);
@@ -624,7 +798,7 @@ static bool attach_reservation_ledger(const std::string& path) {
 
 static bool start_broker(int margin_mb) {
   if (g_ledger == nullptr) {
-    std::fprintf(stderr, "[leto] start_broker: no ledger attached\n");
+    leto_log("start_broker: no ledger attached");
     return false;
   }
   if (g_broker_running.load(std::memory_order_acquire)) {
@@ -640,7 +814,7 @@ static bool start_broker(int margin_mb) {
           static_cast<c10::DeviceIndex>(g_broker_device));
       g_orig_fraction_saved = true;
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "[leto] getMemoryFraction failed: %s\n", e.what());
+      leto_log("getMemoryFraction failed: %s", e.what());
     }
   }
   // Seed the estimate once (also captures NVML capacity, the constant the
@@ -715,8 +889,34 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       // PyTorch's native release-then-retry flow proceeds.
       return false;
     }
-    const int64_t est =
+    int64_t est =
         g_used_estimate.load(std::memory_order_relaxed);  // just published
+    // The published estimate may credit the releasable cache from the TTL
+    // cache (see refresh_used_estimate) — fine for grant admission, but a
+    // keep/KILL decision must not ride on a stale credit in either
+    // direction (stale-high: wrong keep, the 2026-07 AWS OOM; stale-low:
+    // spurious kill against the one-shot latch). If even ZERO cache credit
+    // shows no pressure, keep is provably safe with any credit; otherwise
+    // re-refresh with a fresh page-exact walk and decide on that. This
+    // bounds the O(blocks) walk to boundary evaluations.
+    {
+      const int64_t inflight_b =
+          g_inflight_bytes.load(std::memory_order_relaxed);
+      const int64_t margin_b =
+          static_cast<int64_t>(
+              g_reservation_margin_mb.load(std::memory_order_relaxed)) *
+          1024 * 1024;
+      const int64_t used_zero_credit =
+          std::max<int64_t>(0, total_b - nvml_free - standby_actual) +
+          inflight_b + margin_b;
+      if (used_zero_credit + reserved > total_b &&
+          (standby_actual > 0 || reserved > 0)) {
+        if (refresh_used_estimate(handle, target_pid, &nvml_free, &total_b,
+                                  &standby_actual, /*exact_lb=*/true)) {
+          est = g_used_estimate.load(std::memory_order_relaxed);
+        }
+      }
+    }
 
     // (B) standby_actual <= reserved. A breach means the standby physically
     // holds more than it reserved; loud, rate-limited diagnostic.
@@ -724,11 +924,10 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       const uint64_t n =
           g_assert_b_violations.fetch_add(1, std::memory_order_relaxed);
       if ((n & (n + 1)) == 0) {  // print at n = 0,1,3,7,15,...
-        std::fprintf(stderr,
-                     "[leto] ASSERT(B) VIOLATED: standby_actual=%lld MiB > "
-                     "reserved=%lld MiB (+tol)\n",
-                     static_cast<long long>(standby_actual / (1024 * 1024)),
-                     static_cast<long long>(reserved / (1024 * 1024)));
+        leto_log("ASSERT(B) VIOLATED: standby_actual=%lld MiB > "
+                 "reserved=%lld MiB (+tol)",
+                 static_cast<long long>(standby_actual / (1024 * 1024)),
+                 static_cast<long long>(reserved / (1024 * 1024)));
       }
     }
 
@@ -753,16 +952,19 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     // LETO_FMCB_VERBOSE=1 (they dominate log volume ~40:1 and the fprintf
     // sits on the allocation path).
     if (should_fire || g_verbose_decisions) {
-      std::fprintf(
-          stderr,
-          "[leto %s] fmcb request=%d MiB -> %s | used_est=%lld "
+      // releasable = last page-exact walk (fresh whenever this evaluation
+      // was at the pressure boundary; TTL-aged otherwise).
+      leto_log(
+          "fmcb request=%d MiB -> %s | used_est=%lld "
           "reserved=%lld standby_actual=%lld nvml_free=%lld "
-          "capacity=%lld MiB\n",
-          leto_ts(), request_mb, should_fire ? "KILL" : "keep",
+          "releasable=%lld capacity=%lld MiB",
+          request_mb, should_fire ? "KILL" : "keep",
           static_cast<long long>(est / (1024 * 1024)),
           static_cast<long long>(reserved / (1024 * 1024)),
           static_cast<long long>(standby_actual / (1024 * 1024)),
           static_cast<long long>(nvml_free / (1024 * 1024)),
+          static_cast<long long>(
+              g_lb_cached.load(std::memory_order_relaxed) / (1024 * 1024)),
           static_cast<long long>(total_b / (1024 * 1024)));
     }
     if (!should_fire) {
@@ -802,7 +1004,7 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
         e.discard_as_unraisable("leto_free_mem_callback");
         return false;
       } catch (const std::exception& e) {
-        std::fprintf(stderr, "[leto] kill callback threw: %s\n", e.what());
+        leto_log("kill callback threw: %s", e.what());
         return false;
       }
     }
@@ -814,8 +1016,7 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       // Kill happened but no specific pid to wait for (standby's matching
       // rank was not registered when the kill landed). Trust the
       // callback and let PyTorch retry the allocation.
-      std::fprintf(stderr,
-                   "[leto] kill confirmed; no pid to track\n");
+      leto_log("kill confirmed; no pid to track");
       return true;
     }
 
@@ -823,9 +1024,7 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     // waiting for `killed_pid` to disappear from this GPU (reuses the
     // handle resolved above). Mirrors the enumeration used by PyTorch's
     // CUDACachingAllocator::reportProcessMemoryInfo.
-    std::fprintf(stderr,
-                 "[leto] waiting for killed pid=%u to leave GPU\n",
-                 killed_pid);
+    leto_log("waiting for killed pid=%u to leave GPU", killed_pid);
     auto poll_start = std::chrono::steady_clock::now();
     auto deadline = poll_start + std::chrono::seconds(10);
     // Header maps the unversioned call to nvmlDeviceGetComputeRunningProcesses_v3,
@@ -841,9 +1040,8 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
         procs.resize(count);
       }
       if (r != NVML_SUCCESS) {
-        std::fprintf(stderr,
-                     "[leto] nvmlDeviceGetComputeRunningProcesses failed: %s\n",
-                     nvmlErrorString(r));
+        leto_log("nvmlDeviceGetComputeRunningProcesses failed: %s",
+                 nvmlErrorString(r));
         return false;
       }
       bool still_present = false;
@@ -858,10 +1056,8 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - poll_start)
                 .count();
-        std::fprintf(stderr,
-                     "[leto] killed pid=%u gone from GPU; kill confirmed "
-                     "after %lldms\n",
-                     killed_pid, static_cast<long long>(elapsed_ms));
+        leto_log("killed pid=%u gone from GPU; kill confirmed after %lldms",
+                 killed_pid, static_cast<long long>(elapsed_ms));
         return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -870,10 +1066,8 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - poll_start)
             .count();
-    std::fprintf(stderr,
-                 "[leto] poll timeout after %lldms; pid=%u still present "
-                 "on GPU\n",
-                 static_cast<long long>(elapsed_ms), killed_pid);
+    leto_log("poll timeout after %lldms; pid=%u still present on GPU",
+             static_cast<long long>(elapsed_ms), killed_pid);
     return false;
   }
 };
@@ -1184,6 +1378,21 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
         (1024ULL * 1024ULL));
   });
 
+  // Page-exact lower bound (bytes) on what emptyCache() can return to the
+  // driver for the current device right now. Exposed for validation: the
+  // used_estimate credit uses this same computation.
+  m.def("compute_releasable_lb_bytes", []() {
+    return leto::releasable_lower_bound(c10::cuda::current_device());
+  });
+
+  // Upper bound (bytes) on the physical memory a request of `req_bytes`
+  // newly maps on a cache miss (round_size + whole-page rounding); the
+  // charge InflightRecord applies per in-flight allocation.
+  m.def(
+      "request_physical_ub_bytes",
+      [](int64_t req_bytes) { return leto::request_physical_ub(req_bytes); },
+      py::arg("req_bytes"));
+
   // --- reservation broker (standby memory reservation) ---
 
   m.def(
@@ -1251,9 +1460,11 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
     py::gil_scoped_release nogil;  // NVML driver call; no Python touched
     nvmlDevice_t handle{};
     if (!leto::resolve_nvml_handle(&handle)) return false;
+    // exact_lb: an explicit observability refresh wants the current truth,
+    // not a TTL-aged credit (tests assert against this value).
     return leto::refresh_used_estimate(
         handle, leto::g_standby_pid.load(std::memory_order_relaxed), nullptr,
-        nullptr, nullptr);
+        nullptr, nullptr, /*exact_lb=*/true);
   });
 
   m.def("get_assert_b_violations", []() {
