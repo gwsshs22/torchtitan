@@ -1049,6 +1049,86 @@ static void reset_granted() {
   apply_reservation_budget();
 }
 
+// At most one background (async) standby kill in flight — the latch already
+// bounds kills to one per standby generation; this bounds detached threads
+// across generations.
+static std::atomic<bool> g_async_kill_inflight{false};
+// mono_ms() of the last async kill dispatch: follow-up allocations that
+// need the reclaimed memory wait for it (see Execute) only within this
+// kill's materialization window.
+static std::atomic<int64_t> g_last_async_kill_ms{-100000};
+
+// Wait (<=10s, 1ms poll) until the device shows at least `need_b` free
+// bytes via cudaMemGetInfo. Used to confirm a standby kill's reclaim:
+// the memory is usable the moment the driver tears the context down —
+// no need to wait for the pid to leave NVML's compute-process list.
+static bool wait_for_free_at_least(int64_t need_b) {
+  auto poll_start = std::chrono::steady_clock::now();
+  auto deadline = poll_start + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    size_t cu_free = 0, cu_total = 0;
+    if (cudaMemGetInfo(&cu_free, &cu_total) != cudaSuccess) {
+      leto_log("cudaMemGetInfo failed during reclaim wait");
+      return false;
+    }
+    if (static_cast<int64_t>(cu_free) >= need_b) {
+      auto elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - poll_start)
+              .count();
+      leto_log("reclaim confirmed: free=%lld MiB >= %lld MiB after %lldms",
+               static_cast<long long>(cu_free / (1024 * 1024)),
+               static_cast<long long>(need_b / (1024 * 1024)),
+               static_cast<long long>(elapsed_ms));
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  leto_log("reclaim wait timeout: free still short of %lld MiB",
+           static_cast<long long>(need_b / (1024 * 1024)));
+  return false;
+}
+
+// Invoke the registered Python kill callback under the GIL. Returns false if
+// no callback is registered or it threw. The callback returns
+// (memory_freed, killed_pid):
+//   memory_freed: did any standby kill happen in this OOM episode
+//   killed_pid:   pid of the standby training proc on this rank's GPU
+//                 (0 if no specific pid is known — e.g. the standby was
+//                 mid-startup and that rank had not yet registered when the
+//                 kill landed).
+// Callable from the allocating thread (blocking kill) or a detached thread
+// (async kill) — both acquire the GIL here.
+static bool run_kill_callback(bool* memory_freed_out = nullptr,
+                              unsigned int* killed_pid_out = nullptr) {
+  py::gil_scoped_acquire gil;
+  py::object cb;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_kill_cb || g_kill_cb.is_none()) {
+      return false;
+    }
+    cb = g_kill_cb;  // refcount bump (safe: GIL held)
+  }
+  try {
+    py::object ret = cb();
+    py::tuple t = py::cast<py::tuple>(ret);
+    if (memory_freed_out != nullptr) {
+      *memory_freed_out = py::cast<bool>(t[0]);
+    }
+    if (killed_pid_out != nullptr) {
+      *killed_pid_out = py::cast<unsigned int>(t[1]);
+    }
+    return true;
+  } catch (py::error_already_set& e) {
+    e.discard_as_unraisable("leto_free_mem_callback");
+    return false;
+  } catch (const std::exception& e) {
+    leto_log("kill callback threw: %s", e.what());
+    return false;
+  }
+}
+
 struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
   bool Execute() override {
     // Fires on every allocator cache miss, BEFORE the allocator tries
@@ -1171,108 +1251,91 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
           g_kill_armed.load(std::memory_order_relaxed) ? 1 : 0,
           pressure ? 1 : 0);
     }
+    const int64_t free_now = g_pub_free.load(std::memory_order_relaxed);
+    const int64_t req_charge =
+        g_pub_req_charge.load(std::memory_order_relaxed);
+
     if (!should_fire) {
+      // An async kill dispatched moments ago may still be materializing
+      // (SIGKILL is instant; the driver's context teardown returns the
+      // memory 0.1-3s later). The latch is already consumed, so a
+      // follow-up allocation that genuinely needs that memory
+      // (req_charge > free) must WAIT for it here rather than fall
+      // through and OOM in the release ladder — the exact race the
+      // adversary test caught: balloon chunk N triggers the async kill,
+      // chunk N+1 arrives before the reclaim lands.
+      if (req_charge > free_now &&
+          mono_ms() - g_last_async_kill_ms.load(std::memory_order_relaxed) <
+              10000) {
+        return wait_for_free_at_least(req_charge);
+      }
       return false;
     }
     g_num_kill_standby_called.fetch_add(1, std::memory_order_relaxed);
-    // Below threshold — invoke the registered Python kill callback under
-    // the GIL. Synchronous: when the call returns, the standby's
-    // worker-controller-side kill has been awaited; the kernel may still
-    // be tearing down the dead context, which is what the NVML poll
-    // below verifies.
+
+    // Kill dispatch. Two regimes, decided by whether THIS allocation
+    // actually needs the standby's memory:
     //
-    // The callback returns (memory_freed, killed_pid):
-    //   memory_freed: did any standby kill happen in this OOM episode
-    //   killed_pid:   pid of the standby training proc on this rank's
-    //                 GPU (0 if no specific pid is known — e.g. the
-    //                 standby was mid-startup and that rank had not yet
-    //                 registered when the kill landed).
-    bool memory_freed = false;
-    unsigned int killed_pid = 0;
-    {
-      py::gil_scoped_acquire gil;
-      py::object cb;
-      {
-        std::lock_guard<std::mutex> lk(g_mu);
-        if (!g_kill_cb || g_kill_cb.is_none()) {
-          return false;
-        }
-        cb = g_kill_cb;  // refcount bump (safe: GIL held)
-      }
-      try {
-        py::object ret = cb();
-        py::tuple t = py::cast<py::tuple>(ret);
-        memory_freed = py::cast<bool>(t[0]);
-        killed_pid = py::cast<unsigned int>(t[1]);
-      } catch (py::error_already_set& e) {
-        e.discard_as_unraisable("leto_free_mem_callback");
-        return false;
-      } catch (const std::exception& e) {
-        leto_log("kill callback threw: %s", e.what());
+    //   req_charge <= free   — the request is self-servable (free plus the
+    //     active's own releasable cache covers it: the serve-path bound in
+    //     compute_used_estimate already folded the releasable credit into
+    //     req_charge). The kill only enforces the reservation invariant,
+    //     not this allocation — run it on a detached thread and return
+    //     false so the allocator proceeds with its normal release-retry.
+    //     This removes the multi-second kill stall from the training
+    //     thread entirely (every kill observed in the 2026-07 runs was of
+    //     this shape).
+    //
+    //   req_charge > free    — the allocation genuinely needs reclaimed
+    //     memory NOW: kill synchronously, then wait for the device to show
+    //     enough free (cudaMemGetInfo at 1ms — the memory is usable the
+    //     moment the driver tears down the context, well before the pid
+    //     leaves NVML's compute-process list, and each NVML enumeration
+    //     costs 10-50ms on top).
+    if (req_charge <= free_now) {
+      if (g_async_kill_inflight.exchange(true, std::memory_order_acq_rel)) {
+        leto_log("KILL(async) skipped: previous async kill still in flight");
         return false;
       }
+      g_last_async_kill_ms.store(mono_ms(), std::memory_order_relaxed);
+      leto_log("KILL(async): self-servable request (req_charge=%lld MiB <= "
+               "free=%lld MiB); reclaiming standby in background",
+               static_cast<long long>(req_charge / (1024 * 1024)),
+               static_cast<long long>(free_now / (1024 * 1024)));
+      // Void the reservation NOW, synchronously: the returning `false`
+      // sends THIS malloc straight to alloc_block, whose
+      // allowed_memory_maximum check still reflects the dead-standby-
+      // to-be's grant — physically-servable or not, the malloc would fail
+      // on the budget cap until the background callback's reset_granted
+      // runs. The reservation is semantically dead the moment the kill is
+      // decided; the callback's own reset is idempotent.
+      reset_granted();
+      std::thread([]() {
+        run_kill_callback();  // acquires the GIL itself
+        g_async_kill_inflight.store(false, std::memory_order_release);
+      }).detach();
+      return false;
     }
 
+    // Blocking path: the retry cannot succeed until reclaimed memory
+    // lands. shortfall = what must appear beyond the (already-counted)
+    // free + own-releasable credit.
+    bool memory_freed = false;
+    unsigned int killed_pid = 0;
+    if (!run_kill_callback(&memory_freed, &killed_pid)) {
+      return false;
+    }
     if (!memory_freed) {
       return false;
     }
-    if (killed_pid == 0) {
-      // Kill happened but no specific pid to wait for (standby's matching
-      // rank was not registered when the kill landed). Trust the
-      // callback and let PyTorch retry the allocation.
-      leto_log("kill confirmed; no pid to track");
-      return true;
-    }
 
-    // Poll NVML compute-running processes every 100ms for up to 10s,
-    // waiting for `killed_pid` to disappear from this GPU (reuses the
-    // handle resolved above). Mirrors the enumeration used by PyTorch's
-    // CUDACachingAllocator::reportProcessMemoryInfo.
-    leto_log("waiting for killed pid=%u to leave GPU", killed_pid);
-    auto poll_start = std::chrono::steady_clock::now();
-    auto deadline = poll_start + std::chrono::seconds(10);
-    // Header maps the unversioned call to nvmlDeviceGetComputeRunningProcesses_v3,
-    // which takes nvmlProcessInfo_t (== _v2_t). pid lives at the same offset in
-    // every version, so the v3 struct is fine for our purposes.
-    std::vector<nvmlProcessInfo_t> procs(8);
-    while (std::chrono::steady_clock::now() < deadline) {
-      unsigned int count = static_cast<unsigned int>(procs.size());
-      nvmlReturn_t r;
-      while ((r = nvmlDeviceGetComputeRunningProcesses(
-                  handle, &count, procs.data())) ==
-             NVML_ERROR_INSUFFICIENT_SIZE) {
-        procs.resize(count);
-      }
-      if (r != NVML_SUCCESS) {
-        leto_log("nvmlDeviceGetComputeRunningProcesses failed: %s",
-                 nvmlErrorString(r));
-        return false;
-      }
-      bool still_present = false;
-      for (unsigned int i = 0; i < count; ++i) {
-        if (procs[i].pid == killed_pid) {
-          still_present = true;
-          break;
-        }
-      }
-      if (!still_present) {
-        auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - poll_start)
-                .count();
-        leto_log("killed pid=%u gone from GPU; kill confirmed after %lldms",
-                 killed_pid, static_cast<long long>(elapsed_ms));
-        return true;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    auto elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - poll_start)
-            .count();
-    leto_log("poll timeout after %lldms; pid=%u still present on GPU",
-             static_cast<long long>(elapsed_ms), killed_pid);
-    return false;
+    // Wait for the device to show enough free memory for the retry:
+    // free >= req_charge (the request's net physical need after its own
+    // releasable credit; the allocator's release ladder supplies the
+    // rest). Condition on usable memory, not on full context teardown.
+    leto_log("waiting for free >= %lld MiB after standby kill (pid=%u)",
+             static_cast<long long>(req_charge / (1024 * 1024)), killed_pid);
+    return wait_for_free_at_least(req_charge);
   }
 };
 
