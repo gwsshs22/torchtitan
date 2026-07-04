@@ -662,11 +662,16 @@ static void apply_reservation_budget() {
   double frac = g_orig_fraction;
   int64_t cap_b = g_device_total_bytes;
   if (reserved_b > 0) {
-    const int64_t margin_b =
-        static_cast<int64_t>(
-            g_reservation_margin_mb.load(std::memory_order_relaxed)) *
-        1024 * 1024;
-    cap_b = g_device_total_bytes - reserved_b - margin_b;
+    // Cap = total - granted, NO margin: the margin is admission-time
+    // policy only (RESERVE requires est + margin + cum <= capacity). The
+    // active may consume the margin band at runtime; the hard boundary
+    // the cap enforces is exactly the standby's committed reservation, so
+    // a budget-wall kill means precisely "the reservation itself is the
+    // obstacle" and margin never contributes to a kill. Trade-off
+    // (accepted): raw non-allocator allocations (NCCL/cuBLAS) lose their
+    // continuously-enforced headroom and rely on admission-time slack +
+    // crash-restart in the rare tight corner.
+    cap_b = g_device_total_bytes - reserved_b;
     frac = std::max(
         0.0,
         std::min(g_orig_fraction,
@@ -1253,10 +1258,6 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       alloc_reserved_b = stats.reserved_bytes[kAgg].current;
     } catch (const std::exception&) {
     }
-    const int64_t margin_b =
-        static_cast<int64_t>(
-            g_reservation_margin_mb.load(std::memory_order_relaxed)) *
-        1024 * 1024;
     const int64_t released_b = g_pub_released.load(std::memory_order_relaxed);
     int64_t reserved = 0;
     bool pressure = false, should_fire = false, canceled = false;
@@ -1305,9 +1306,11 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
               free_phys - std::max<int64_t>(0, reserved - standby_actual);
       bool budget_starved = false;
       if (reserved > 0 && alloc_reserved_b >= 0 && g_device_total_bytes > 0) {
+        // Mirrors the exact cap apply_reservation_budget enforces:
+        // total - granted, margin-free (margin is admission-only policy).
         budget_starved =
             alloc_reserved_b - released_b + req_charge >
-            g_device_total_bytes - reserved - margin_b;
+            g_device_total_bytes - reserved;
       }
       pressure = (phys_starved || budget_starved) &&
                  (standby_actual > 0 || reserved > 0);
