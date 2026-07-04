@@ -30,6 +30,12 @@ import subprocess
 import sys
 import time
 
+# The deployment always runs with expandable segments (envs.sh), and the
+# physical used_estimate charges Execute's own request net of the expandable
+# tail reuse — set it before any torch import so the tests exercise the same
+# allocator mode.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 _I32 = struct.Struct("<i")
 _U32 = struct.Struct("<I")
 _I64 = struct.Struct("<q")
@@ -100,6 +106,57 @@ def test_broker_logic(m):
     m.stop_broker()
     os.unlink(path)
     print("[2] broker logic (grant/deny/cumulative/reset/epoch) OK")
+
+
+def test_physical_admission(m):
+    """[2b] Physical admission regression (the 2026-07 standby OOMs): a
+    device whose free memory sits in the ACTIVE'S CACHE must DENY a request
+    that exceeds physical free — the old estimate credited the cache and
+    granted reservations nothing could physically back."""
+    import torch
+
+    GiB = 1024 ** 3
+    path = "/dev/shm/leto_resvtest_phys"
+    mm = _mk_ledger(m, path)
+    assert m.attach_reservation_ledger(path)
+    m.set_reservation_margin_mb(128)
+    assert m.start_broker(128)
+    _I32.pack_into(mm, m.OFF_STANDBY_PID, 999999)  # fake pid -> actual=0
+    _U32.pack_into(mm, m.OFF_STANDBY_EPOCH, 1)
+
+    total_b = torch.cuda.get_device_properties(0).total_memory
+    # Fill most of the device with LIVE memory, then convert a large slab
+    # to CACHE (freed but still mapped): physical free stays small while
+    # the allocator holds a big reusable pool.
+    hold_b = int(total_b * 0.60)
+    cache_b = int(total_b * 0.30)
+    hold = torch.empty(hold_b, dtype=torch.uint8, device="cuda:0")
+    cache = torch.empty(cache_b, dtype=torch.uint8, device="cuda:0")
+    del cache  # stays mapped in the allocator cache
+    torch.cuda.synchronize()
+    assert m.refresh_used_estimate()
+    est_mb = m.get_used_estimate_mb()
+    free_b, _ = torch.cuda.mem_get_info()
+
+    # Request more than physical free (but far less than free+cache):
+    # must DENY under physical admission.
+    req_b = int(free_b + 2 * GiB)
+    verdict = _reserve(m, mm, 1, req_b)
+    print(f"[2b] physical admission: free={free_b // 2**20}MiB "
+          f"cache~{cache_b // 2**20}MiB est={est_mb}MiB "
+          f"request={req_b // 2**20}MiB -> "
+          f"{'DENY' if verdict == m.VERDICT_DENY else 'GRANT'}")
+    assert verdict == m.VERDICT_DENY, "cache credited as grantable again"
+
+    # A request that fits physical free (minus margin) must still GRANT.
+    req_ok_b = max(int(free_b - 2 * GiB), 1 << 30)
+    assert _reserve(m, mm, 2, req_ok_b) == m.VERDICT_GRANT
+    m.reset_granted()
+    m.stop_broker()
+    del hold
+    torch.cuda.empty_cache()
+    os.unlink(path)
+    print("[2b] physical admission (cache-rich/free-poor DENY) OK")
 
 
 def test_deadlock(m):
@@ -409,6 +466,7 @@ def main():
 
     test_layout()
     test_broker_logic(m)
+    test_physical_admission(m)
     test_deadlock(m)
     ok_adv = _run_e2e(m, "adversary")
     ok_b = _run_e2e(m, "assert_b")

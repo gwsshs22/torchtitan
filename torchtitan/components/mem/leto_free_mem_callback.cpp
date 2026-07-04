@@ -176,17 +176,91 @@ static int64_t releasable_lower_bound(c10::DeviceIndex device) {
   return out;
 }
 
-// The walk above is O(all blocks) -- measured 1.8 ms at ~18k blocks
-// (mew2, 2026-07) -- far too heavy for every cache miss. Split its two
-// consumers: the *published* estimate (broker grant admission) tolerates
-// ~100 ms staleness (admission already races the standby's allocation by
-// design), so it reuses a TTL-cached value clamped to the cache's current
-// size; keep/KILL *decisions* never ride on a stale credit -- Execute()
-// forces a fresh walk exactly when the zero-credit conservative check
-// shows pressure (see there).
-constexpr int64_t kLbTtlMs = 100;
-static std::atomic<int64_t> g_lb_cached{0};
-static std::atomic<int64_t> g_lb_cached_at_ms{-kLbTtlMs};
+// Mapped-but-free bytes the expandable-segments allocator will REUSE when
+// serving `Execute()`'s own in-flight request (a guaranteed cache miss).
+// With expandable_segments:True (assumed always on), a miss never plain
+// cudaMallocs: alloc_block -> try_allocate_expandable_block picks the
+// lowest-address unmapped block for (stream, pool) and, when the block
+// immediately before it is mapped+free, fuses it into the candidate chain
+// ("free -> unmapped"), mapping only the shortfall (map_block charges
+// physical memory by exactly mapped_range.size). See pytorch
+// c10/cuda/CUDACachingAllocator.cpp: find_expandable_block (:2799,
+// allocatable(c->prev) at :2825), try_allocate_expandable_block (:2915),
+// map_block stats at :2888.
+//
+// snapshot() reports one SegmentInfo per contiguous MAPPED range; the
+// unmapped remainder of the VA reservation follows it, so the trailing
+// inactive-block bytes of an expandable mapped range are exactly the
+// mapped+free pages an expansion will reuse. Among multiple candidates for
+// the same (stream, pool) we take the LOWEST-ADDRESS one, mirroring
+// find_expandable_block's address-ordered scan. Approximation (documented,
+// small): the allocator also requires the chain's VA space to cover the
+// request (has_available_address_space) — VA extents aren't in the
+// snapshot, but expandable reservations are far larger than any request in
+// practice, so the first chain is the served one. Cost: one snapshot walk
+// (~1.8 ms at 18k blocks), paid only inside Execute for requests large
+// enough to matter (see kReuseWalkMinRequest).
+static int64_t tail_reuse_bytes(
+    c10::DeviceIndex device, cudaStream_t stream, bool small_pool) {
+  const auto snap = c10::cuda::CUDACachingAllocator::snapshot();
+  const int64_t large_page = static_cast<int64_t>(
+      c10::CachingAllocator::AcceleratorAllocatorConfig::large_segment_size());
+  constexpr int64_t small_page = int64_t{2} << 20;  // kSmallBuffer
+  int64_t best = -1;
+  uintptr_t best_addr = 0;
+  for (const auto& seg : snap.segments) {
+    if (seg.device != device || !seg.is_expandable) {
+      continue;
+    }
+    if (seg.owner_private_pool_id.first != 0 ||
+        seg.owner_private_pool_id.second != 0) {
+      continue;
+    }
+    if (seg.stream != stream || seg.is_large == small_pool) {
+      continue;
+    }
+    // Trailing run of inactive blocks at the end of this mapped range,
+    // page-floored: expansion maps whole pages, so only whole free pages
+    // adjacent to the unmapped remainder are reusable without new mapping.
+    int64_t tail = 0;
+    for (auto it = seg.blocks.rbegin(); it != seg.blocks.rend(); ++it) {
+      if (it->active) {
+        break;
+      }
+      tail += static_cast<int64_t>(it->size);
+    }
+    const int64_t page = seg.is_large ? large_page : small_page;
+    tail = tail / page * page;
+    if (best < 0 || seg.address < best_addr) {
+      best = tail;
+      best_addr = seg.address;
+    }
+  }
+  return best < 0 ? 0 : best;
+}
+
+// Below this request size the reuse walk isn't worth 1.8 ms: charging the
+// request in full errs deny-side by less than the margin.
+constexpr int64_t kReuseWalkMinRequest = int64_t{64} << 20;
+
+// Last-publish component snapshot (diagnostics only; relaxed atomics).
+// Written by compute_used_estimate on every publish so (a) the verbose fmcb
+// line can print the full used_estimate equation with the request-charge
+// breakdown, and (b) the broker can print how STALE the estimate it is
+// consuming is (per-rank estimates only move on that rank's cache misses —
+// observed frozen for 5.5+ s across a whole grant sequence, and diverging
+// ~23 GB between ranks purely from WHEN each rank's last publish sampled
+// the cache credit).
+static std::atomic<int64_t> g_pub_total{0};
+static std::atomic<int64_t> g_pub_free{0};
+static std::atomic<int64_t> g_pub_actual{0};
+static std::atomic<int64_t> g_pub_request{0};     // Execute's own request (raw)
+static std::atomic<int64_t> g_pub_req_charge{0};  // its net physical charge
+static std::atomic<int64_t> g_pub_reuse{0};       // expandable tail credited
+static std::atomic<int64_t> g_pub_released{0};    // forced self-release credit
+static std::atomic<int64_t> g_pub_queued{0};      // lock-waiters (observability)
+static std::atomic<int64_t> g_pub_margin{0};
+static std::atomic<int64_t> g_pub_at_ms{0};       // publish time (mono_ms)
 
 static int64_t mono_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -291,37 +365,51 @@ static double g_orig_fraction = 1.0;
 static bool g_orig_fraction_saved = false;
 
 // ---------------------------------------------------------------------------
-// The ONLY state shared between the broker and Execute() — four plain
-// atomics, so the two sides never share a lock and the broker can never
-// stall an allocation:
+// State shared between the broker and Execute():
 //   g_used_estimate  (Execute -> broker)  see definition below
 //   g_granted        (broker -> Execute)  reserved_to_standby, declared above
 //   g_standby_pid    (broker -> Execute)  declared above with broker state
 //   g_kill_armed     (broker arms, Execute consumes)  see below
 //
-//   used_estimate := (physical used excl. standby − releasable cache)
-//                    + in_flight_alloc_bytes + margin                [bytes]
-//                    (i.e. LIVE memory: the active's reusable cache is
-//                    creditable — the cap returns it to the device)
+//   used_estimate := max(0, physical used excl. standby)
+//                    + my_charge + margin                            [bytes]
+//   my_charge     := max(0, request_physical_ub(Execute's own request)
+//                           − expandable tail_reuse)
 //
-// Published by Execute() from its per-cache-miss NVML read (and seeded once
-// at start_broker). The inflight term makes it post-malloc-correct — a raw
-// pre-malloc reading over-credits free by the triggering allocation's size
-// (2026-07 review). Initialized to INT64_MAX so the broker DENIES until the
-// first publish — never grant blind. Broker admission:
+// PHYSICAL semantics: no cache credit. Nothing in this system converts the
+// active's cache into physical free on the standby's behalf, so admission
+// must not bank on it (grants admitted against cache were never physically
+// backed — the 2026-07 standby OOMs). Execute()'s own request is charged at
+// the bytes it will actually newly map (it is a guaranteed miss; with
+// expandable_segments:True the expansion reuses the mapped free tail and
+// maps only the shortfall — see tail_reuse_bytes). Published by Execute()
+// per cache miss (and seeded once at start_broker). Initialized to
+// INT64_MAX so the broker DENIES until the first publish. Broker admission:
 //   GRANT iff used_estimate + new_reservation <= capacity.
+//
+// CONSISTENCY: the pair (g_used_estimate, g_granted) is mutated only under
+// g_state_mutex so the invariant `est + granted <= capacity` is checked and
+// updated atomically: the broker's critical section is just the arithmetic
+// admission test + the granted store (~ns — it must never stall an
+// allocation); Execute's is the est store + the pressure/latch decision.
+// LOCK ORDER: Execute enters holding the device-allocator lock, so
+// g_state_mutex is strictly INNERMOST — never call an allocator API
+// (setMemoryFraction / getDeviceStats / snapshot) or NVML, and never take
+// the GIL, while holding it. The atomics stay atomic for lock-free readers
+// (logging, budget application, pybind getters).
+static std::mutex g_state_mutex;
 static std::atomic<int64_t> g_used_estimate{INT64_MAX};
 
 // Kill latch — at most ONE reclaim per standby generation. The broker arms
 // it whenever it services a reservation request (a live standby is asking);
-// Execute() consumes it on fire. used_estimate deliberately counts the
-// active's cache as used, so on a cache-full device the kill condition
-// (used_estimate + reserved > capacity) holds for essentially every cache
-// miss; without the latch that would re-fire against the same dying standby
-// throughout its teardown window (the 2026-06 churn). With it: one kill,
-// reservation voided, and the replacement standby parks with ZERO GPU
-// footprint (denied before its first grant, no CUDA context) until the
-// device genuinely has room.
+// Execute() consumes it on fire. Under the physical estimate, admission
+// guarantees `est + granted <= capacity` at grant time, so the kill
+// condition (used_estimate + reserved > capacity) turns true only when the
+// active's physical footprint GROWS into the reservation after granting —
+// the latch bounds the response to one kill per generation while the dying
+// standby tears down; the replacement parks with ZERO GPU footprint
+// (denied before its first grant, no CUDA context) until the device
+// genuinely has room.
 static std::atomic<bool> g_kill_armed{false};
 // NVML device capacity (mem.total), captured at the start_broker seed read
 // and constant thereafter. Kept NVML-consistent with used_estimate (the
@@ -350,10 +438,13 @@ static std::atomic<bool> g_broker_running{false};
 static int g_broker_device = 0;
 
 // Lock-free in-flight allocation accounting — the allocator wrapper is pure
-// recording and never takes a lock on the allocation path. The broker's
-// grant admission subtracts g_inflight_bytes from NVML-free: completed
-// mallocs are in the NVML reading, mid-cudaMalloc ones are in this counter,
-// and everything that starts after a grant is bounded by the allocator cap.
+// recording and never takes a lock on the allocation path. DIAGNOSTIC ONLY
+// since the physical-estimate redesign: the estimate charges Execute's own
+// request directly (thread-local g_request_bytes); the remainder of this
+// sum is lock-QUEUED requests from other threads, which need no charge (a
+// queued request either hits the cache — physically neutral — or fires its
+// own Execute() and republishes before mapping). Logged as `queued` so the
+// waiter volume stays observable.
 // Charged at request_physical_ub (page-rounded physical footprint), not raw
 // bytes: a cache miss maps whole pages, and the raw charge under-counts by
 // up to a page. Queued allocations that will be served from cache are
@@ -546,12 +637,13 @@ static void apply_reservation_budget() {
   if (g_device_total_bytes <= 0) return;
   const int64_t reserved_b = g_granted.load(std::memory_order_relaxed);
   double frac = g_orig_fraction;
+  int64_t cap_b = g_device_total_bytes;
   if (reserved_b > 0) {
     const int64_t margin_b =
         static_cast<int64_t>(
             g_reservation_margin_mb.load(std::memory_order_relaxed)) *
         1024 * 1024;
-    const int64_t cap_b = g_device_total_bytes - reserved_b - margin_b;
+    cap_b = g_device_total_bytes - reserved_b - margin_b;
     frac = std::max(
         0.0,
         std::min(g_orig_fraction,
@@ -564,91 +656,144 @@ static void apply_reservation_budget() {
   } catch (const std::exception& e) {
     leto_log("setMemoryFraction(%.4f) failed: %s", frac, e.what());
   }
+  // Diagnostic (always on; grant/reset/epoch events only, so low volume):
+  // whether this budget can EVER force the allocator to release cache.
+  // The cap is derived from device total and ignores every other tenant
+  // (RMP, CUDA ctx, NCCL, foreign processes), so it binds only if the
+  // active's own reserved exceeds it — log both sides to make the
+  // (non-)binding observable per event.
+  int64_t alloc_reserved_b = -1, alloc_alloc_b = -1;
+  try {
+    const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
+        static_cast<c10::DeviceIndex>(g_broker_device));
+    constexpr size_t kAgg = static_cast<size_t>(
+        c10::CachingDeviceAllocator::StatType::AGGREGATE);
+    alloc_reserved_b = stats.reserved_bytes[kAgg].current;
+    alloc_alloc_b = stats.allocated_bytes[kAgg].current;
+  } catch (const std::exception&) {
+    // stats unavailable (e.g. allocator not initialized yet): log -1
+  }
+  leto_log(
+      "budget: reserved_to_standby=%lld margin=%d cap=%lld frac=%.4f | "
+      "alloc_reserved=%lld alloc_allocated=%lld device_total=%lld MiB "
+      "binding=%s",
+      static_cast<long long>(reserved_b / (1024 * 1024)),
+      g_reservation_margin_mb.load(std::memory_order_relaxed),
+      static_cast<long long>(cap_b / (1024 * 1024)),
+      frac,
+      static_cast<long long>(alloc_reserved_b >= 0
+                                 ? alloc_reserved_b / (1024 * 1024)
+                                 : -1),
+      static_cast<long long>(alloc_alloc_b >= 0
+                                 ? alloc_alloc_b / (1024 * 1024)
+                                 : -1),
+      static_cast<long long>(g_device_total_bytes / (1024 * 1024)),
+      (alloc_reserved_b >= 0 && cap_b < alloc_reserved_b) ? "YES" : "NO");
 }
 
-// One fresh NVML read -> recompute and publish g_used_estimate:
-//   used_estimate = max(0, total - free - standby_actual   [used excl. standby]
-//                          - releasable_cache)             [the active's own
-//                                                           reusable cache]
-//                   + g_inflight_bytes + margin
-// Counting in-flight allocations makes the value post-malloc-correct (a raw
-// pre-malloc reading over-credits free by the triggering allocation's size);
-// in-flight allocations that end up served from cache leave it conservative
-// until the next publish. Subtracting the releasable cache counts only LIVE
-// memory as used: without it, a cache-full device makes the kill condition
-// true on every miss (2026-06 futile-kill churn) and starves grant
-// admission forever (2026-07 runs). The cache is legitimately creditable
-// because the allocator cap forces it back to the device — but only lazily,
-// on the active's next cache miss, so a grant admitted against cache races
-// the standby's allocation for ~0.1-5s (accepted; the standby dies and
-// rotates if it loses).
+// One fresh NVML read -> recompute the PHYSICAL used estimate:
+//   used_estimate = max(0, total - free - standby_actual)   [used excl. standby]
+//                   + my_charge + margin
+//   my_charge     = max(0, request_physical_ub(request)
+//                          - tail_reuse(current stream, pool))
+// `request` is Execute()'s own in-flight allocation — a guaranteed cache
+// miss (Execute only fires after get_free_block failed), so no hit-check
+// applies; the only pages it can reuse are the expandable tail
+// (tail_reuse_bytes). Charging it makes the estimate post-malloc-correct: a
+// raw NVML reading over-credits free by the triggering allocation's size.
+// request == 0 (start_broker seed, pybind refresh) charges nothing.
 //
-// The credit is the page-exact releasable_lower_bound (see there), NOT the
-// stats formula reserved - allocated - inactive_split: under
-// expandable_segments that formula credits stranded sub-page fragments no
-// release path can return (945 MiB on the 2026-07 AWS OOM — a full margin
-// of phantom credit, enough to flip a must-KILL into keep). The walk costs
-// ~1.8 ms at 18k blocks, so `exact_lb` picks the freshness: false reuses a
-// kLbTtlMs-cached value (grant admission; clamped to the cache's current
-// size), true forces a fresh walk (decisions at the pressure boundary).
-// Raw values go to the out-params for the caller's own decision math.
-// Returns false (estimate untouched) on NVML failure.
-static bool refresh_used_estimate(nvmlDevice_t handle, int target_pid,
+// No cache credit and no other-thread inflight term, by design:
+//  - The active's cache is NOT subtracted: nothing in this system converts
+//    cache into physical free on the standby's behalf (proven on the
+//    2026-07 runs), so crediting it admits grants the device cannot serve.
+//    Cache-rich devices now DENY instead of granting-then-OOMing; the
+//    standby parks at its last granted footprint.
+//  - Lock-queued allocations from other threads need no charge: the device
+//    allocator lock serializes malloc, so a queued request either hits the
+//    cache (physically neutral) or fires its own Execute() and republishes
+//    before mapping anything.
+//
+// NOTE: computes and returns the value; the caller stores it into
+// g_used_estimate under g_state_mutex (see there for the locking
+// discipline). Returns false (out-params untouched) on NVML failure.
+static bool compute_used_estimate(nvmlDevice_t handle, int target_pid,
+                                  int64_t request_bytes,
+                                  int64_t* est_out,
                                   int64_t* free_b_out, int64_t* total_b_out,
-                                  int64_t* standby_actual_out,
-                                  bool exact_lb = false) {
+                                  int64_t* standby_actual_out) {
   int64_t free_b = 0, total_b = 0, actual_b = 0;
   if (!read_nvml_mem(handle, target_pid, &free_b, &total_b, &actual_b)) {
     return false;
   }
-  int64_t cache_b = 0;  // reserved - allocated: cheap cap on the credit
-  try {
-    // getDeviceStats re-takes the device allocator lock; safe from every
-    // caller (recursive on the allocating thread inside Execute; briefly
-    // contended from the start_broker seed / pybind refresh).
-    const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
-        c10::cuda::current_device());
-    constexpr size_t kAgg = static_cast<size_t>(
-        c10::CachingDeviceAllocator::StatType::AGGREGATE);
-    cache_b = std::max<int64_t>(
-        0,
-        stats.reserved_bytes[kAgg].current -
-            stats.allocated_bytes[kAgg].current);
-  } catch (const std::exception& e) {
-    // Stats unavailable -> count the cache as used (conservative).
-    leto_log("getDeviceStats failed: %s", e.what());
-  }
-  int64_t releasable_b = 0;
-  if (cache_b > 0) {
-    const int64_t now = mono_ms();
-    if (exact_lb ||
-        now - g_lb_cached_at_ms.load(std::memory_order_relaxed) >= kLbTtlMs) {
+  int64_t req_charge = 0;
+  int64_t reuse_b = 0;
+  int64_t released_b = 0;
+  if (request_bytes > 0) {
+    const int64_t req_ub = request_physical_ub(request_bytes);
+    if (request_bytes >= kReuseWalkMinRequest) {
+      try {
+        const bool small_pool = request_bytes <= (int64_t{1} << 20);
+        reuse_b = tail_reuse_bytes(
+            c10::cuda::current_device(),
+            c10::cuda::getCurrentCUDAStream().stream(), small_pool);
+      } catch (const std::exception& e) {
+        // Snapshot unavailable -> no reuse credit (conservative).
+        leto_log("tail_reuse_bytes failed: %s", e.what());
+      }
+    }
+    req_charge = std::max<int64_t>(0, req_ub - reuse_b);
+    // Serve-path bound: when the charge exceeds physical free, the
+    // expansion's map_block FAILS and the allocator falls back to
+    // release_available/release_cached_blocks — it frees its OWN cache and
+    // maps into that. The request's net device consumption is therefore
+    // charge - released, never more than ~free while the cache covers the
+    // shortfall (used_after <= total: an estimate above device capacity is
+    // physically impossible — observed est=89,316 MiB on 2026-07-04, which
+    // made admission deny everything and the kill condition fire for ANY
+    // reserved > 0 for a whole publish window after each big miss). This
+    // prices only the active's own in-flight request against its own
+    // cache; it does NOT credit the cache to standby admission. The
+    // page-exact walk runs only in the charge > free boundary case;
+    // subtract the already-credited tail so the same pages aren't counted
+    // twice.
+    if (req_charge > free_b) {
+      int64_t releasable_b = 0;
       try {
         releasable_b = releasable_lower_bound(c10::cuda::current_device());
       } catch (const std::exception& e) {
-        // Snapshot unavailable -> count the cache as used (conservative).
+        // Walk unavailable -> assume nothing releasable (conservative).
         leto_log("releasable_lower_bound failed: %s", e.what());
       }
-      g_lb_cached.store(releasable_b, std::memory_order_relaxed);
-      g_lb_cached_at_ms.store(now, std::memory_order_relaxed);
-    } else {
-      // TTL reuse for the published (grant) estimate; never credit more
-      // than the cache currently holds.
-      releasable_b =
-          std::min(g_lb_cached.load(std::memory_order_relaxed), cache_b);
+      const int64_t coverable = std::max<int64_t>(0, releasable_b - reuse_b);
+      released_b = std::min<int64_t>(req_charge - free_b, coverable);
+      req_charge -= released_b;
     }
-  } else {
-    g_lb_cached.store(0, std::memory_order_relaxed);
   }
-  const int64_t inflight_b = g_inflight_bytes.load(std::memory_order_relaxed);
   const int64_t margin_b =
       static_cast<int64_t>(
           g_reservation_margin_mb.load(std::memory_order_relaxed)) *
       1024 * 1024;
   const int64_t used_excl_b =
-      std::max<int64_t>(0, total_b - free_b - actual_b - releasable_b);
-  g_used_estimate.store(used_excl_b + inflight_b + margin_b,
-                        std::memory_order_relaxed);
+      std::max<int64_t>(0, total_b - free_b - actual_b);
+  *est_out = used_excl_b + req_charge + margin_b;
+  // Publish the component snapshot for diagnostics (verbose fmcb line +
+  // broker staleness annotation). Relaxed: coherent enough for logging.
+  g_pub_total.store(total_b, std::memory_order_relaxed);
+  g_pub_free.store(free_b, std::memory_order_relaxed);
+  g_pub_actual.store(actual_b, std::memory_order_relaxed);
+  g_pub_request.store(request_bytes, std::memory_order_relaxed);
+  g_pub_req_charge.store(req_charge, std::memory_order_relaxed);
+  g_pub_reuse.store(reuse_b, std::memory_order_relaxed);
+  g_pub_released.store(released_b, std::memory_order_relaxed);
+  g_pub_queued.store(
+      std::max<int64_t>(
+          0,
+          g_inflight_bytes.load(std::memory_order_relaxed) -
+              (request_bytes > 0 ? request_physical_ub(request_bytes) : 0)),
+      std::memory_order_relaxed);
+  g_pub_margin.store(margin_b, std::memory_order_relaxed);
+  g_pub_at_ms.store(mono_ms(), std::memory_order_relaxed);
   if (free_b_out != nullptr) *free_b_out = free_b;
   if (total_b_out != nullptr) *total_b_out = total_b;
   if (standby_actual_out != nullptr) *standby_actual_out = actual_b;
@@ -688,10 +833,13 @@ static void broker_loop() {
     // its predecessor's requests (stale arms fired at freshly-rotated
     // groups and cascaded through 22 generations in ~4 min, 2026-07 run).
     if (epoch != g_standby_epoch_seen) {
-      g_granted.store(0, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        g_granted.store(0, std::memory_order_relaxed);
+        g_kill_armed.store(false, std::memory_order_relaxed);
+      }
       g_standby_epoch_seen = epoch;
-      g_kill_armed.store(false, std::memory_order_relaxed);
-      apply_reservation_budget();
+      apply_reservation_budget();  // outside the mutex (allocator lock)
     }
 
     // 2) Service a pending reservation request. `req_bytes` is the standby's
@@ -711,24 +859,47 @@ static void broker_loop() {
       // gate still requires standby_actual > 0 || reserved > 0.
       g_kill_armed.store(true, std::memory_order_relaxed);
       const int64_t req_bytes = resv_load_acq(&L->req_bytes);
-      const int64_t used_est =
-          g_used_estimate.load(std::memory_order_relaxed);
+      // Fallback seed — ONLY when nothing has ever been published (the
+      // start_broker seed failed, e.g. a transient NVML error): the broker
+      // may compute the estimate itself rather than deny forever. Never
+      // refreshes an already-published value — Execute() owns the estimate.
+      if (g_used_estimate.load(std::memory_order_relaxed) == INT64_MAX) {
+        nvmlDevice_t handle{};
+        int64_t est = 0, total_b = 0;
+        if (resolve_nvml_handle(&handle) &&
+            compute_used_estimate(handle, target_pid, /*request_bytes=*/0,
+                                  &est, nullptr, &total_b, nullptr)) {
+          std::lock_guard<std::mutex> lk(g_state_mutex);
+          g_used_estimate.store(est, std::memory_order_relaxed);
+          if (g_nvml_total_bytes.load(std::memory_order_relaxed) == 0) {
+            g_nvml_total_bytes.store(total_b, std::memory_order_relaxed);
+          }
+        }
+      }
       const int64_t capacity =
           g_nvml_total_bytes.load(std::memory_order_relaxed);
       int verdict = RESV_VERDICT_DENY;
-      const int64_t granted_before = g_granted.load(std::memory_order_relaxed);
-      int64_t granted_after = granted_before;
-      const int64_t needed = req_bytes - granted_before;
-      if (needed <= 0) {
-        verdict = RESV_VERDICT_GRANT;  // already covered; no change
-      } else if (capacity > 0 && used_est <= capacity - req_bytes) {
-        int64_t expected = granted_before;
-        if (g_granted.compare_exchange_strong(expected, req_bytes,
-                                              std::memory_order_relaxed)) {
+      int64_t used_est = 0, granted_before = 0, granted_after = 0;
+      {
+        // Admission critical section — arithmetic + the reserved update
+        // only (~ns; see g_state_mutex discipline). No ledger writes, no
+        // allocator APIs, no logging inside.
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        used_est = g_used_estimate.load(std::memory_order_relaxed);
+        granted_before = g_granted.load(std::memory_order_relaxed);
+        granted_after = granted_before;
+        const int64_t needed_lk = req_bytes - granted_before;
+        if (needed_lk <= 0) {
+          verdict = RESV_VERDICT_GRANT;  // already covered; no change
+        } else if (capacity > 0 && used_est <= capacity - req_bytes) {
+          g_granted.store(req_bytes, std::memory_order_relaxed);
           granted_after = req_bytes;
-          apply_reservation_budget();
           verdict = RESV_VERDICT_GRANT;
         }
+      }
+      const int64_t needed = req_bytes - granted_before;
+      if (granted_after != granted_before) {
+        apply_reservation_budget();  // outside the mutex (allocator lock)
       }
       resv_store_rel(&L->effective_free,
                      capacity > 0 ? std::max<int64_t>(0, capacity - used_est)
@@ -740,19 +911,26 @@ static void broker_loop() {
       // Diagnostic: DENYs and grant-raising decisions always; idempotent
       // re-grants (needed<=0, one per peer-denied unanimity round) only
       // with LETO_FMCB_VERBOSE=1.
-      if (verdict == RESV_VERDICT_DENY || needed > 0 || g_verbose_decisions)
+      if (verdict == RESV_VERDICT_DENY || needed > 0 || g_verbose_decisions) {
+        // est_age: how stale the consumed estimate is (published on this
+        // rank's LAST cache miss). Components of that publish are on the
+        // matching verbose fmcb line.
+        const int64_t est_age_ms =
+            mono_ms() - g_pub_at_ms.load(std::memory_order_relaxed);
         leto_log(
             "broker req_seq=%u request=%lld MiB -> %s | "
-            "used_est=%lld capacity=%lld granted_before=%lld needed=%lld "
-            "granted_after=%lld MiB",
+            "used_est=%lld (age=%lldms) capacity=%lld "
+            "granted_before=%lld needed=%lld granted_after=%lld MiB",
             req_seq,
             static_cast<long long>(req_bytes / (1024 * 1024)),
             verdict == RESV_VERDICT_GRANT ? "GRANT" : "DENY",
             static_cast<long long>(used_est / (1024 * 1024)),
+            static_cast<long long>(est_age_ms),
             static_cast<long long>(capacity / (1024 * 1024)),
             static_cast<long long>(granted_before / (1024 * 1024)),
             static_cast<long long>(needed / (1024 * 1024)),
             static_cast<long long>(granted_after / (1024 * 1024)));
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kBrokerTickMs));
   }
@@ -820,15 +998,18 @@ static bool start_broker(int margin_mb) {
   // Seed the estimate once (also captures NVML capacity, the constant the
   // broker admits against): the standby's first request may arrive before
   // the first post-install cache miss publishes anything, and the estimate
-  // starts at INT64_MAX (deny-until-published).
+  // starts at INT64_MAX (deny-until-published). request=0: no allocation
+  // is in flight on this (install) path.
   {
     nvmlDevice_t handle{};
-    int64_t total_b = 0;
+    int64_t est = 0, total_b = 0;
     const int target_pid = resv_load_acq(&g_ledger->standby_pid);
     g_standby_pid.store(target_pid, std::memory_order_relaxed);
     if (resolve_nvml_handle(&handle) &&
-        refresh_used_estimate(handle, target_pid, nullptr, &total_b,
-                              nullptr)) {
+        compute_used_estimate(handle, target_pid, /*request_bytes=*/0, &est,
+                              nullptr, &total_b, nullptr)) {
+      std::lock_guard<std::mutex> lk(g_state_mutex);
+      g_used_estimate.store(est, std::memory_order_relaxed);
       g_nvml_total_bytes.store(total_b, std::memory_order_relaxed);
     }
   }
@@ -852,12 +1033,15 @@ static void stop_broker() {
 }
 
 // Void the cumulative grant (e.g. after the standby is killed/activated).
-// Lock-free: callable from the kill callback, which runs inside the
-// FreeMemCallback deep in the allocator's malloc path. A concurrent broker
-// raise cannot clobber this zero (the raise is a CAS), and the budget
-// re-derives from the current value at apply time.
+// Callable from the kill callback, which runs inside the FreeMemCallback
+// deep in the allocator's malloc path — g_state_mutex is innermost there
+// (Execute holds no leto lock at kill-callback time), so taking it here is
+// safe; the budget re-derives from the current value at apply time.
 static void reset_granted() {
-  g_granted.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    g_granted.store(0, std::memory_order_relaxed);
+  }
   if (g_ledger != nullptr) resv_store_rel(&g_ledger->granted, int64_t{0});
   // Restore the allocator budget (kill path runs inside the malloc chain —
   // the device allocator lock is recursive, so re-entering is safe, and the
@@ -868,54 +1052,47 @@ static void reset_granted() {
 struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
   bool Execute() override {
     // Fires on every allocator cache miss, BEFORE the allocator tries
-    // cudaMalloc or releases its own cache. Does exactly one NVML read,
-    // publishes used_estimate for the broker, and decides keep/KILL.
-    // No leto lock is ever taken here — everything shared with the broker
-    // is a plain atomic.
+    // cudaMalloc or releases its own cache. Does exactly one NVML read
+    // (plus the tail-reuse walk for large requests) OUTSIDE g_state_mutex,
+    // then publishes the estimate and takes the keep/KILL decision in one
+    // short critical section so (est, reserved) stay mutually consistent
+    // with the broker's admission (see g_state_mutex discipline).
     if (!g_reservation_active.load(std::memory_order_acquire)) {
       return false;  // broker not installed: nothing to protect or reclaim
     }
-    const int request_mb =
-        static_cast<int>(g_request_bytes / (1024ULL * 1024ULL));
-    const int64_t reserved = g_granted.load(std::memory_order_relaxed);
+    const int64_t request_b = static_cast<int64_t>(g_request_bytes);
+    const int request_mb = static_cast<int>(request_b / (1024 * 1024));
     const int target_pid = g_standby_pid.load(std::memory_order_relaxed);
 
-    int64_t nvml_free = 0, total_b = 0, standby_actual = 0;
+    int64_t est = 0, nvml_free = 0, total_b = 0, standby_actual = 0;
     nvmlDevice_t handle{};
     if (!resolve_nvml_handle(&handle) ||
-        !refresh_used_estimate(handle, target_pid, &nvml_free, &total_b,
-                               &standby_actual)) {
+        !compute_used_estimate(handle, target_pid, request_b, &est,
+                               &nvml_free, &total_b, &standby_actual)) {
       // NVML unavailable: never kill blind (read_nvml_mem already logged);
       // PyTorch's native release-then-retry flow proceeds.
       return false;
     }
-    int64_t est =
-        g_used_estimate.load(std::memory_order_relaxed);  // just published
-    // The published estimate may credit the releasable cache from the TTL
-    // cache (see refresh_used_estimate) — fine for grant admission, but a
-    // keep/KILL decision must not ride on a stale credit in either
-    // direction (stale-high: wrong keep, the 2026-07 AWS OOM; stale-low:
-    // spurious kill against the one-shot latch). If even ZERO cache credit
-    // shows no pressure, keep is provably safe with any credit; otherwise
-    // re-refresh with a fresh page-exact walk and decide on that. This
-    // bounds the O(blocks) walk to boundary evaluations.
+
+    // Reclaim decision:
+    //   KILL iff used_estimate + reserved > capacity
+    // with something to take back (standby_actual > 0 or reserved > 0;
+    // firing with nothing held and nothing reserved is a futile kill: a
+    // SIGKILL'd mid-NCCL-init context lingers 10+ s on the GPU and can
+    // wedge the device), AND the kill latch is armed. Admission guarantees
+    // est + granted <= capacity at grant time, so this fires only when the
+    // active's physical footprint has grown into the reservation since —
+    // the collision the reservation exists to detect.
+    int64_t reserved = 0;
+    bool pressure = false, should_fire = false;
     {
-      const int64_t inflight_b =
-          g_inflight_bytes.load(std::memory_order_relaxed);
-      const int64_t margin_b =
-          static_cast<int64_t>(
-              g_reservation_margin_mb.load(std::memory_order_relaxed)) *
-          1024 * 1024;
-      const int64_t used_zero_credit =
-          std::max<int64_t>(0, total_b - nvml_free - standby_actual) +
-          inflight_b + margin_b;
-      if (used_zero_credit + reserved > total_b &&
-          (standby_actual > 0 || reserved > 0)) {
-        if (refresh_used_estimate(handle, target_pid, &nvml_free, &total_b,
-                                  &standby_actual, /*exact_lb=*/true)) {
-          est = g_used_estimate.load(std::memory_order_relaxed);
-        }
-      }
+      std::lock_guard<std::mutex> lk(g_state_mutex);
+      g_used_estimate.store(est, std::memory_order_relaxed);
+      reserved = g_granted.load(std::memory_order_relaxed);
+      pressure = (est + reserved > total_b) &&
+                 (standby_actual > 0 || reserved > 0);
+      should_fire =
+          pressure && g_kill_armed.exchange(false, std::memory_order_relaxed);
     }
 
     // (B) standby_actual <= reserved. A breach means the standby physically
@@ -930,42 +1107,69 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
                  static_cast<long long>(reserved / (1024 * 1024)));
       }
     }
-
-    // Reclaim decision:
-    //   KILL iff used_estimate + reserved > capacity
-    // with something to take back (standby_actual > 0 or reserved > 0;
-    // firing with nothing held and nothing reserved is a futile kill: a
-    // SIGKILL'd mid-NCCL-init context lingers 10+ s on the GPU and can
-    // wedge the device), AND the kill latch is armed. used_estimate counts
-    // the active's cache as used, so on a cache-full device this condition
-    // holds for most cache misses — the latch (one kill per standby
-    // generation, re-armed only when a standby requests a grant) is what
-    // bounds the reclaim rate instead of allocator introspection. After
-    // the kill the reservation is voided by the kill callback
-    // (reset_granted), and the replacement standby stays parked at zero
-    // GPU footprint until the device genuinely has room for a grant.
-    const bool pressure = (est + reserved > total_b) &&
-                          (standby_actual > 0 || reserved > 0);
-    const bool should_fire =
-        pressure && g_kill_armed.exchange(false, std::memory_order_relaxed);
     // Diagnostic: KILL decisions always; "keep" evaluations only with
     // LETO_FMCB_VERBOSE=1 (they dominate log volume ~40:1 and the fprintf
     // sits on the allocation path).
     if (should_fire || g_verbose_decisions) {
       // releasable = last page-exact walk (fresh whenever this evaluation
-      // was at the pressure boundary; TTL-aged otherwise).
+      // was at the pressure boundary; TTL-aged otherwise). Verbose lines
+      // additionally carry the allocator's own reserved/allocated and the
+      // latch/pressure state, so a full Execute() timeline (one line per
+      // cache miss) can prove whether the active ever trimmed its cache
+      // between a broker grant and the standby's allocation.
+      int64_t alloc_reserved_b = -1, alloc_alloc_b = -1;
+      if (g_verbose_decisions) {
+        try {
+          const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
+              c10::cuda::current_device());
+          constexpr size_t kAgg = static_cast<size_t>(
+              c10::CachingDeviceAllocator::StatType::AGGREGATE);
+          alloc_reserved_b = stats.reserved_bytes[kAgg].current;
+          alloc_alloc_b = stats.allocated_bytes[kAgg].current;
+        } catch (const std::exception&) {
+        }
+      }
+      // Full used_estimate equation (physical semantics):
+      //   est = (total - free - stdby) + req_charge + margin
+      //   req_charge = max(0, phys_ub(request) - reuse)
+      // `reuse` is the expandable-tail credit for Execute's own request;
+      // `queued` (other threads parked on the allocator lock) is logged for
+      // observability but NOT charged. These components are the snapshot of
+      // THIS Execute()'s publish — the value the broker consumes (with
+      // growing age) until this rank's next miss.
       leto_log(
-          "fmcb request=%d MiB -> %s | used_est=%lld "
-          "reserved=%lld standby_actual=%lld nvml_free=%lld "
-          "releasable=%lld capacity=%lld MiB",
+          "fmcb request=%d MiB -> %s | est=%lld = (total=%lld - free=%lld "
+          "- stdby=%lld) + req_charge=%lld[reuse=%lld,self_release=%lld] "
+          "+ margin=%lld (queued=%lld) | grant_reserved=%lld "
+          "alloc_reserved=%lld alloc_allocated=%lld armed=%d pressure=%d",
           request_mb, should_fire ? "KILL" : "keep",
           static_cast<long long>(est / (1024 * 1024)),
-          static_cast<long long>(reserved / (1024 * 1024)),
-          static_cast<long long>(standby_actual / (1024 * 1024)),
-          static_cast<long long>(nvml_free / (1024 * 1024)),
           static_cast<long long>(
-              g_lb_cached.load(std::memory_order_relaxed) / (1024 * 1024)),
-          static_cast<long long>(total_b / (1024 * 1024)));
+              g_pub_total.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_free.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_actual.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_req_charge.load(std::memory_order_relaxed) /
+              (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_reuse.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_released.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_margin.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(
+              g_pub_queued.load(std::memory_order_relaxed) / (1024 * 1024)),
+          static_cast<long long>(reserved / (1024 * 1024)),
+          static_cast<long long>(alloc_reserved_b >= 0
+                                     ? alloc_reserved_b / (1024 * 1024)
+                                     : -1),
+          static_cast<long long>(alloc_alloc_b >= 0
+                                     ? alloc_alloc_b / (1024 * 1024)
+                                     : -1),
+          g_kill_armed.load(std::memory_order_relaxed) ? 1 : 0,
+          pressure ? 1 : 0);
     }
     if (!should_fire) {
       return false;
@@ -1455,16 +1659,21 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
 
   // Tests/observability: force one fresh NVML read into used_estimate. In
   // production only Execute() (per cache miss) and the start_broker seed
-  // publish it, so an idle process's estimate ages by design.
+  // publish it, so an idle process's estimate ages by design. request=0:
+  // this path has no allocation in flight.
   m.def("refresh_used_estimate", []() {
     py::gil_scoped_release nogil;  // NVML driver call; no Python touched
     nvmlDevice_t handle{};
     if (!leto::resolve_nvml_handle(&handle)) return false;
-    // exact_lb: an explicit observability refresh wants the current truth,
-    // not a TTL-aged credit (tests assert against this value).
-    return leto::refresh_used_estimate(
-        handle, leto::g_standby_pid.load(std::memory_order_relaxed), nullptr,
-        nullptr, nullptr, /*exact_lb=*/true);
+    int64_t est = 0;
+    if (!leto::compute_used_estimate(
+            handle, leto::g_standby_pid.load(std::memory_order_relaxed),
+            /*request_bytes=*/0, &est, nullptr, nullptr, nullptr)) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lk(leto::g_state_mutex);
+    leto::g_used_estimate.store(est, std::memory_order_relaxed);
+    return true;
   });
 
   m.def("get_assert_b_violations", []() {
