@@ -1028,14 +1028,14 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       return false;
     }
 
-    // Decision ladder, per-miss fresh, on free_cap := capacity - est:
-    //   free_cap >= granted + pending  -> keep
-    //   free_cap in [granted, ..)      -> CANCEL the soft reservation (free:
-    //     nothing was allocated; the pending phase-2 GRANT gets denied and
-    //     the standby redoes both phases)
-    //   starved                        -> KILL: this allocation cannot
-    //     proceed without reclaimed memory — req_charge exceeds free minus
-    //     the standby's committed-but-unallocated remainder. Guarded by
+    // Decision ladder, per-miss fresh:
+    //   keep    — the device still backs everything
+    //   CANCEL  — the soft reservation is no longer backed: retract it
+    //     (free: nothing was allocated; the pending phase-2 GRANT gets
+    //     denied and the standby redoes both phases)
+    //   KILL    — req_charge + granted > free + standby_actual: the
+    //     active's need plus the standby's entitlement exceed the memory
+    //     available to the pair, so reclaim is the only remedy. Guarded by
     //     something-to-reclaim (a kill of a memoryless standby frees
     //     nothing and can wedge the device) and the per-generation latch.
     const int64_t free_phys = g_pub_free.load(std::memory_order_relaxed);
@@ -1055,12 +1055,9 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
         g_reserved_pending.store(0, std::memory_order_relaxed);
         canceled = true;
       }
-      const bool starved =
-          (free_cap < granted_now) &&
-          req_charge >
-              free_phys -
-                  std::max<int64_t>(0, granted_now - standby_actual);
-      pressure = starved && (standby_actual > 0 || granted_now > 0);
+      pressure =
+          req_charge > free_phys + standby_actual - granted_now &&
+          (standby_actual > 0 || granted_now > 0);
       should_fire =
           pressure &&
           g_kill_armed.exchange(false, std::memory_order_relaxed);
