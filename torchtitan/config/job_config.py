@@ -1109,7 +1109,7 @@ class Leto:
     """If True, standby advances through init tasks gated on the active's free-GPU
     signal (see init_profile/{mode}/solution.json). Requires enable_standby."""
 
-    progressive_reservation_margin_mb: int = 128
+    progressive_reservation_margin_mb: int = 512
     """Global safety headroom (MiB) the active's reservation broker keeps free,
     and the master switch for the whole reservation/reclaim mechanism under
     progressive_init + enable_standby:
@@ -1131,6 +1131,14 @@ class Leto:
 
     progressive_poll_interval_ms: int = 10
     """Standby poll interval (ms) while waiting for a reservation verdict."""
+
+    progressive_solution: str = "solver"
+    """Which init-task schedule the progressive standby follows:
+      "solver"        — the solver-optimized order (init_profile/<mode>/solution.json)
+      "no_reordering" — progressive gating with the baseline execution order
+                        (solution_no_reordering.json). A/B control that
+                        isolates the benefit of the solver's reordering; both
+                        files are written by the same profile_init run."""
 
     progressive_zero_delta_threshold_mb: float = 1.0
     """Tasks with delta_mb below this threshold are treated as CPU-only and

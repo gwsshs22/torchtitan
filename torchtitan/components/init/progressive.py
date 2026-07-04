@@ -242,9 +242,29 @@ def try_advance(
 # Schedule / profile loading
 # ---------------------------------------------------------------------------
 
-def load_solution(dump_folder: str, mode: str) -> list[str]:
-    """Return task names in the solver's scheduled order."""
-    path = Path(dump_folder) / "init_profile" / mode / "solution.json"
+_SOLUTION_FILES = {
+    "solver": "solution.json",
+    "no_reordering": "solution_no_reordering.json",
+}
+
+
+def load_solution(dump_folder: str, mode: str,
+                  variant: str = "solver") -> list[str]:
+    """Return task names in the scheduled order.
+
+    variant selects the schedule (leto.progressive_solution):
+      "solver"        — the solver-optimized order (solution.json)
+      "no_reordering" — progressive gating with the BASELINE execution order
+                        (solution_no_reordering.json); the A/B control that
+                        isolates the benefit of the solver's reordering.
+    """
+    filename = _SOLUTION_FILES.get(variant)
+    if filename is None:
+        raise ValueError(
+            f"leto.progressive_solution={variant!r}: expected one of "
+            f"{sorted(_SOLUTION_FILES)}"
+        )
+    path = Path(dump_folder) / "init_profile" / mode / filename
     if not path.exists():
         raise FileNotFoundError(
             f"progressive_init requires {path}. Run the profiling job first "

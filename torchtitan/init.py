@@ -1059,6 +1059,35 @@ def _get_gpu_mem_mb() -> float | None:
         return None
 
 
+def _device_free_mb() -> float | None:
+    """Physical device-free MiB of THIS rank's GPU via pynvml.
+
+    Deliberately avoids torch.cuda (a mem_get_info would create a ~400MiB
+    CUDA context on a standby that hasn't reached activate_cuda_device).
+    NVML indexes physical GPUs, so resolve through CUDA_VISIBLE_DEVICES +
+    LOCAL_RANK; falls back to LOCAL_RANK when unset. Returns None on any
+    failure (diagnostic only)."""
+    try:
+        from pynvml import (
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetMemoryInfo,
+            nvmlInit,
+        )
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cvd.strip():
+            visible = [int(d) for d in cvd.split(",") if d.strip()]
+            phys = visible[local_rank] if local_rank < len(visible) else local_rank
+        else:
+            phys = local_rank
+        nvmlInit()
+        mem = nvmlDeviceGetMemoryInfo(nvmlDeviceGetHandleByIndex(phys))
+        return mem.free / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _run_progressive_sequence(
     ctx: InitContext,
     sequence: list[Callable[[InitContext], None]],
@@ -1079,8 +1108,13 @@ def _run_progressive_sequence(
     rank = int(os.environ.get("RANK", "0"))
 
     name_to_fn = {fn.__name__: fn for fn in sequence}
-    logger.info(f"[progressive] rank={rank} loading solution + profile from {dump_folder}/init_profile/{mode}")
-    ordered_names = load_solution(dump_folder, mode)
+    solution_variant = str(job_config.leto.progressive_solution)
+    logger.info(
+        f"[progressive] rank={rank} loading solution "
+        f"(variant={solution_variant}) + profile from "
+        f"{dump_folder}/init_profile/{mode}"
+    )
+    ordered_names = load_solution(dump_folder, mode, solution_variant)
     deltas = load_rank_deltas(dump_folder, mode, rank)
     logger.info(f"[progressive] rank={rank} loaded: {len(ordered_names)} tasks")
 
@@ -1182,7 +1216,25 @@ def _run_progressive_sequence(
             logger.info(
                 f"[progressive] task={name} delta_mb={delta_mb:.1f} → running"
             )
+            # Diagnostic: physical device free at the instant the granted
+            # task starts allocating (pynvml — no CUDA-context side effect).
+            # A grant whose task then OOMs shows here as
+            # device_free < delta_mb at t0, i.e. the reservation was
+            # admitted but never physically backed (trim-lag).
+            free0 = _device_free_mb()
+            if free0 is not None:
+                logger.info(
+                    f"[progressive] rank={rank} task={name} pre-run "
+                    f"device_free={free0:.0f}MiB (delta_mb={delta_mb:.1f})"
+                )
         name_to_fn[name](ctx)
+        if not activated:
+            free1 = _device_free_mb()
+            if free1 is not None:
+                logger.info(
+                    f"[progressive] rank={rank} task={name} post-run "
+                    f"device_free={free1:.0f}MiB"
+                )
 
 
 def run_init_sequence(job_config: JobConfig) -> InitContext:
@@ -1279,20 +1331,42 @@ def run_init_sequence(job_config: JobConfig) -> InitContext:
             result = solve(path, time_limit=60)
             names = result["names"]
             durations = result["durations"]
-            solution_path = os.path.join(profile_dir, "solution.json")
-            with open(solution_path, "w") as f:
-                json.dump({
-                    "mode": mode,
-                    "solver_cost": result["cost"],
-                    "tasks": [
-                        {
-                            "name": names[i],
-                            "duration_s": durations[i],
-                        }
-                        for i in result["order"]
-                    ],
-                }, f, indent=2)
-            logger.info(f"Init schedule solution written to {solution_path}")
+            memories = result["memories"]
+
+            def _dump_solution(filename: str, order: list[int], cost: float,
+                               reordered: bool) -> None:
+                solution_path = os.path.join(profile_dir, filename)
+                with open(solution_path, "w") as f:
+                    json.dump({
+                        "mode": mode,
+                        "reordered": reordered,
+                        "solver_cost": cost,
+                        "tasks": [
+                            {
+                                "name": names[i],
+                                "duration_s": durations[i],
+                            }
+                            for i in order
+                        ],
+                    }, f, indent=2)
+                logger.info(
+                    f"Init schedule solution written to {solution_path} "
+                    f"(cost={cost:.1f})"
+                )
+
+            # solver-optimized order
+            _dump_solution("solution.json", result["order"], result["cost"],
+                           reordered=True)
+            # A/B control: progressive gating with the BASELINE ordering (the
+            # profile's recorded execution order) — isolates the benefit of
+            # the solver's reordering. Cost computed with the same
+            # prefix-memory objective for comparison.
+            no_cost, cum = 0.0, 0.0
+            for i in result["original_order"]:
+                cum += memories[i]
+                no_cost += cum * durations[i]
+            _dump_solution("solution_no_reordering.json",
+                           result["original_order"], no_cost, reordered=False)
 
     maybe_wait_for_resuming(ctx)
     return ctx
