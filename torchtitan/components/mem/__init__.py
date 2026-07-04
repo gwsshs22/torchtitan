@@ -272,4 +272,8 @@ def ledger_constants() -> dict:
         "OFF_GRANTED": int(m.OFF_GRANTED),
         "OFF_EFFECTIVE_FREE": int(m.OFF_EFFECTIVE_FREE),
         "OFF_STANDBY_ACTUAL": int(m.OFF_STANDBY_ACTUAL),
+        "OFF_REQ_TYPE": int(m.OFF_REQ_TYPE),
+        "REQ_RESERVE": int(m.REQ_RESERVE),
+        "REQ_GRANT": int(m.REQ_GRANT),
+        "REQ_ROLLBACK": int(m.REQ_ROLLBACK),
     }

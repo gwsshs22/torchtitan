@@ -50,9 +50,13 @@ OFF_RESP_VERDICT = 28
 OFF_GRANTED = 32
 OFF_EFFECTIVE_FREE = 40
 OFF_STANDBY_ACTUAL = 48
+OFF_REQ_TYPE = 56
 VERDICT_PENDING = -1
 VERDICT_DENY = 0
 VERDICT_GRANT = 1
+REQ_RESERVE = 1
+REQ_GRANT = 2
+REQ_ROLLBACK = 3
 
 _I32 = struct.Struct("<i")
 _U32 = struct.Struct("<I")
@@ -119,6 +123,10 @@ def assert_ledger_layout() -> None:
         "OFF_GRANTED": OFF_GRANTED,
         "OFF_EFFECTIVE_FREE": OFF_EFFECTIVE_FREE,
         "OFF_STANDBY_ACTUAL": OFF_STANDBY_ACTUAL,
+        "OFF_REQ_TYPE": OFF_REQ_TYPE,
+        "REQ_RESERVE": REQ_RESERVE,
+        "REQ_GRANT": REQ_GRANT,
+        "REQ_ROLLBACK": REQ_ROLLBACK,
     }
     for k, v in here.items():
         if c.get(k) != v:
@@ -148,14 +156,20 @@ def standby_register(rank: int, epoch: Optional[int] = None) -> None:
 StatusCheck = Callable[[], Optional[int]]
 
 
-def _reserve(
+def _request(
     rank: int,
+    req_type: int,
     cumulative_bytes: int,
     poll_interval_s: float,
     status_check: Optional[StatusCheck],
     status_interval_s: float = 1.0,
 ) -> Tuple[str, int]:
-    """Post a cumulative-target reservation and block for the broker's verdict.
+    """Post one two-phase-protocol request and block for the broker's verdict.
+
+    req_type: REQ_RESERVE (soft claim, cancellable by the active's callback
+    under pressure), REQ_GRANT (hard commit; allowed only while the
+    reservation is alive), or REQ_ROLLBACK (cumulative_bytes = the pre-task
+    cumulative to roll back to; always acked).
 
     Returns ("grant"|"deny", 0) or ("status", code) if status_check trips.
     """
@@ -165,6 +179,7 @@ def _reserve(
         seq = 1  # 0 is the ledger's initial resp_seq; never use it as a req
     _resv_seq[rank] = seq
     _I64.pack_into(mm, OFF_REQ_BYTES, int(cumulative_bytes))
+    _I32.pack_into(mm, OFF_REQ_TYPE, int(req_type))
     _U32.pack_into(mm, OFF_REQ_SEQ, seq)  # publish last → signals the request
     next_status = time.monotonic() + status_interval_s
     while True:
@@ -179,6 +194,36 @@ def _reserve(
         time.sleep(poll_interval_s)
 
 
+def _reserve(
+    rank: int,
+    cumulative_bytes: int,
+    poll_interval_s: float,
+    status_check: Optional[StatusCheck],
+    status_interval_s: float = 1.0,
+) -> Tuple[str, int]:
+    """Single-rank RESERVE+GRANT convenience (no cross-rank unanimity) for
+    callers that raise one rank's cumulative directly (test hooks). Returns
+    the final verdict; a phase-2 deny (reservation canceled between the two
+    requests) reports "deny" and leaves nothing committed."""
+    kind, code = _request(rank, REQ_RESERVE, cumulative_bytes,
+                          poll_interval_s, status_check, status_interval_s)
+    if kind != "grant":
+        return (kind, code)
+    return _request(rank, REQ_GRANT, cumulative_bytes,
+                    poll_interval_s, status_check, status_interval_s)
+
+
+def _reduce_status_ok(gloo_pg, local_status: int, local_ok: int):
+    """The status-carry reduce pair: every rank always enters both reduces
+    (a rank that returned early would hang its peers in gloo). Returns
+    (global_status, all_ok)."""
+    s = torch.tensor([local_status], dtype=torch.int32)
+    dist.all_reduce(s, op=dist.ReduceOp.MAX, group=gloo_pg)
+    t = torch.tensor([local_ok], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=gloo_pg)
+    return int(s.item()), int(t.item()) == 1
+
+
 def try_advance(
     gloo_pg,
     delta_mb: float,
@@ -187,55 +232,78 @@ def try_advance(
     poll_interval_s: float,
     status_check: Optional[StatusCheck] = None,
 ) -> Tuple[str, Optional[int]]:
-    """Decide, across all standby ranks, whether the next task can advance.
+    """Decide, across all standby ranks, whether the next task can advance —
+    TWO-PHASE: (1) every rank RESERVEs (soft, cancellable by the active's
+    callback under pressure); only if all ranks hold a reservation, (2) every
+    rank GRANTs (hard commit). A phase-2 deny means some rank's reservation
+    was canceled between the phases — every rank then ROLLBACKs to the
+    pre-task cumulative and the whole procedure is redone, so a unilateral
+    commit never lingers as phantom kill pressure on the ranks whose peers
+    denied (the useless-kill problem).
 
-    Tasks with `delta_mb < threshold_mb` allocate ~no GPU memory and skip the
-    reservation. Otherwise this rank reserves its `cumulative_mb` target and
-    joins the unanimous MIN all-reduce. Caller loops on "retry".
+    Tasks with `delta_mb < threshold_mb` (per-rank) allocate ~no GPU memory
+    and skip both phases locally, but still join every reduce. Caller loops
+    on "retry".
 
     Returns:
-      ("advance", None) — all ranks granted; run the task
-      ("retry",   None) — at least one rank denied; poll again
+      ("advance", None) — all ranks committed; run the task
+      ("retry",   None) — denied at some phase; poll again
       ("status",  code) — status_check tripped (ACTIVATE / TERMINATE)
     """
     rank = int(os.environ.get("RANK", "0"))
+    cum_bytes = int(cumulative_mb * 1024 * 1024)
+    prev_cum_bytes = max(0, int((cumulative_mb - delta_mb) * 1024 * 1024))
+    tiny = delta_mb < threshold_mb
 
-    local_status = 0
-    if delta_mb < threshold_mb:
-        local_ok = 1  # tiny / CPU-only task: no reservation needed
-    else:
-        kind, code = _reserve(
-            rank,
-            int(cumulative_mb * 1024 * 1024),
-            poll_interval_s,
-            status_check,
-        )
+    def _phase(req_type: int) -> Tuple[int, int]:
+        """Run one protocol phase locally; returns (local_status, local_ok)."""
+        if tiny:
+            return 0, 1  # tiny / CPU-only task: no reservation needed
+        kind, code = _request(rank, req_type, cum_bytes, poll_interval_s,
+                              status_check)
         if kind == "status":
-            # Don't return yet — every rank must enter the all_reduce below,
-            # else peers that already decided hang in gloo. Carry the status
-            # into the reduce and bail in unison.
-            local_status = int(code)
-            local_ok = 0
-        else:
-            local_ok = 1 if kind == "grant" else 0
-            # Per-attempt outcome is debug-only: with 1s retry pacing a
-            # starved task would still log once per rank per second, and the
-            # broker's DENY / grant-raising stderr line is the authoritative
-            # record of every decision.
-            logger.debug(
-                f"[progressive] rank={rank} cumulative_mb={cumulative_mb:.1f} "
-                f"→ {kind}"
-            )
+            return int(code), 0
+        logger.debug(
+            f"[progressive] rank={rank} cumulative_mb={cumulative_mb:.1f} "
+            f"type={req_type} → {kind}"
+        )
+        return 0, 1 if kind == "grant" else 0
 
-    s = torch.tensor([local_status], dtype=torch.int32)
-    dist.all_reduce(s, op=dist.ReduceOp.MAX, group=gloo_pg)
-    global_status = int(s.item())
+    # Phase 1 — RESERVE on every rank. A partial success leaves soft
+    # reservations behind on the granted ranks: harmless (nothing
+    # allocated) and self-cleaning (the callback cancels them under
+    # pressure); the retry re-RESERVEs idempotently.
+    local_status, local_ok = _phase(REQ_RESERVE)
+    global_status, all_ok = _reduce_status_ok(gloo_pg, local_status, local_ok)
     if global_status > 0:
         return ("status", global_status)
+    if not all_ok:
+        return ("retry", None)
 
-    t = torch.tensor([local_ok], dtype=torch.int32)
-    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=gloo_pg)
-    return ("advance" if t.item() == 1 else "retry", None)
+    # Phase 2 — GRANT on every rank (allowed only while the reservation is
+    # alive; a cancellation in between shows up as a deny here).
+    local_status, local_ok = _phase(REQ_GRANT)
+    global_status, all_ok = _reduce_status_ok(gloo_pg, local_status, local_ok)
+    if global_status > 0:
+        return ("status", global_status)
+    if all_ok:
+        return ("advance", None)
+
+    # Some rank's reservation was canceled between the phases: roll back
+    # EVERY rank to the pre-task cumulative (ranks that committed phase 2
+    # lower their grant; the rest just clear any leftover reservation), then
+    # redo the whole two-phase procedure. One extra status reduce keeps the
+    # collective count uniform if a promotion lands mid-rollback.
+    local_status = 0
+    if not tiny:
+        kind, code = _request(rank, REQ_ROLLBACK, prev_cum_bytes,
+                              poll_interval_s, status_check)
+        if kind == "status":
+            local_status = int(code)
+    global_status, _ = _reduce_status_ok(gloo_pg, local_status, 1)
+    if global_status > 0:
+        return ("status", global_status)
+    return ("retry", None)
 
 
 # ---------------------------------------------------------------------------

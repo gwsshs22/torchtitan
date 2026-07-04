@@ -321,18 +321,35 @@ constexpr int RESV_VERDICT_PENDING = -1;
 constexpr int RESV_VERDICT_DENY = 0;
 constexpr int RESV_VERDICT_GRANT = 1;
 
+// Two-phase request types (req_type). A task executes only after EVERY rank
+// passed both phases:
+//   RESERVE  — soft claim: admitted against est + granted + delta, held in
+//              g_reserved_pending, cancellable by Execute() under pressure
+//              at zero cost (nothing was allocated).
+//   GRANT    — hard commit: allowed iff the reservation is still alive;
+//              converts reserved -> granted (kill-protected, budget-capped).
+//   ROLLBACK — abort the round: lower granted back to the pre-task
+//              cumulative (req_bytes) and clear the reservation. Sent to
+//              every rank when any rank's phase-2 GRANT was denied, so a
+//              unilateral phase-2 commit never lingers as phantom pressure.
+constexpr int RESV_REQ_RESERVE = 1;
+constexpr int RESV_REQ_GRANT = 2;
+constexpr int RESV_REQ_ROLLBACK = 3;
+
 struct ReservationLedger {
   uint32_t magic;          // 0  : RESV_LEDGER_MAGIC once initialized
   int32_t standby_pid;     // 4  : standby-written; NVML proc to exclude (0=none)
   uint32_t standby_epoch;  // 8  : standby-written; bumped per new standby
   uint32_t req_seq;        // 12 : standby-written; bumped *last* to publish a req
-  int64_t req_bytes;       // 16 : standby-written; requested reservation
+  int64_t req_bytes;       // 16 : standby-written; cumulative target (RESERVE/
+                           //      GRANT) or rollback-to cumulative (ROLLBACK)
   uint32_t resp_seq;       // 24 : broker-written; bumped *last*; == req_seq when done
   int32_t resp_verdict;    // 28 : broker-written; GRANT/DENY
   int64_t granted;         // 32 : broker-published cumulative grant (observability)
   int64_t effective_free;  // 40 : broker-published grantable bytes (observability)
   int64_t standby_actual;  // 48 : layout-reserved; no longer written
-  int64_t pad;             // 56
+  int32_t req_type;        // 56 : standby-written; RESV_REQ_* (before req_seq)
+  int32_t pad;             // 60
 };
 static_assert(sizeof(ReservationLedger) == 64, "ledger layout/size mismatch");
 
@@ -351,7 +368,13 @@ static inline void resv_store_rel(T* p, T v) {
 // Every writer calls apply_reservation_budget() afterwards, which derives
 // the cap from the CURRENT value, so any interleaving converges.
 static std::atomic<bool> g_reservation_active{false};  // gates reservation path
-static std::atomic<int64_t> g_granted{0};  // == reserved_to_standby
+static std::atomic<int64_t> g_granted{0};  // == reserved_to_standby (committed)
+// Pending phase-1 reservation (delta bytes of the ONE outstanding task; 0 =
+// none). Soft: counted by RESERVE admission and by Execute's pressure
+// ladder, but NOT in the allocator budget — the active is allowed to grow
+// into it, which is exactly what triggers cancellation. Mutated only under
+// g_state_mutex (broker transitions, Execute's cancel, resets).
+static std::atomic<int64_t> g_reserved_pending{0};
 // Standby pid mirrored out of the shm ledger by the broker each tick, so
 // Execute() reads a plain atomic instead of touching the ledger.
 static std::atomic<int> g_standby_pid{0};
@@ -770,13 +793,17 @@ static bool compute_used_estimate(nvmlDevice_t handle, int target_pid,
       req_charge -= released_b;
     }
   }
+  // Pure measurement — NO margin baked in. The margin is policy and is
+  // applied separately where policy lives: RESERVE admission adds it
+  // explicitly; the budget cap subtracts it; the kill/cancel comparisons
+  // are margin-free by design.
   const int64_t margin_b =
       static_cast<int64_t>(
           g_reservation_margin_mb.load(std::memory_order_relaxed)) *
       1024 * 1024;
   const int64_t used_excl_b =
       std::max<int64_t>(0, total_b - free_b - actual_b);
-  *est_out = used_excl_b + req_charge + margin_b;
+  *est_out = used_excl_b + req_charge;
   // Publish the component snapshot for diagnostics (verbose fmcb line +
   // broker staleness annotation). Relaxed: coherent enough for logging.
   g_pub_total.store(total_b, std::memory_order_relaxed);
@@ -836,6 +863,7 @@ static void broker_loop() {
       {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         g_granted.store(0, std::memory_order_relaxed);
+        g_reserved_pending.store(0, std::memory_order_relaxed);
         g_kill_armed.store(false, std::memory_order_relaxed);
       }
       g_standby_epoch_seen = epoch;
@@ -878,24 +906,65 @@ static void broker_loop() {
       }
       const int64_t capacity =
           g_nvml_total_bytes.load(std::memory_order_relaxed);
+      const int req_type = resv_load_acq(&L->req_type);
       int verdict = RESV_VERDICT_DENY;
       int64_t used_est = 0, granted_before = 0, granted_after = 0;
+      int64_t reserved_after = 0;
       {
-        // Admission critical section — arithmetic + the reserved update
+        // Admission critical section — arithmetic + the state transition
         // only (~ns; see g_state_mutex discipline). No ledger writes, no
-        // allocator APIs, no logging inside.
+        // allocator APIs, no logging inside. The broker only READS the
+        // estimate; freshness policing is Execute()'s cancellation.
         std::lock_guard<std::mutex> lk(g_state_mutex);
         used_est = g_used_estimate.load(std::memory_order_relaxed);
         granted_before = g_granted.load(std::memory_order_relaxed);
         granted_after = granted_before;
-        const int64_t needed_lk = req_bytes - granted_before;
-        if (needed_lk <= 0) {
-          verdict = RESV_VERDICT_GRANT;  // already covered; no change
-        } else if (capacity > 0 && used_est <= capacity - req_bytes) {
-          g_granted.store(req_bytes, std::memory_order_relaxed);
-          granted_after = req_bytes;
+        const int64_t delta = req_bytes - granted_before;
+        if (req_type == RESV_REQ_ROLLBACK) {
+          // Abort the round: req_bytes = the pre-task cumulative. Lower a
+          // unilateral phase-2 commit back to it and clear the soft claim.
+          if (granted_before > req_bytes) {
+            g_granted.store(req_bytes, std::memory_order_relaxed);
+            granted_after = req_bytes;
+          }
+          g_reserved_pending.store(0, std::memory_order_relaxed);
+          verdict = RESV_VERDICT_GRANT;  // ack
+        } else if (delta <= 0) {
+          // Already covered by the committed cumulative (idempotent retry
+          // of an earlier task): nothing to reserve or convert.
+          if (req_type == RESV_REQ_GRANT) {
+            g_reserved_pending.store(0, std::memory_order_relaxed);
+          }
           verdict = RESV_VERDICT_GRANT;
+        } else if (req_type == RESV_REQ_RESERVE) {
+          // Phase 1 — soft claim, admitted against the physical estimate
+          // plus the EXPLICIT margin (est is a pure measurement; margin is
+          // policy and belongs to admission): est + margin + cum <= cap.
+          const int64_t margin_b =
+              static_cast<int64_t>(
+                  g_reservation_margin_mb.load(std::memory_order_relaxed)) *
+              1024 * 1024;
+          if (capacity > 0 && used_est + margin_b <= capacity - req_bytes) {
+            g_reserved_pending.store(delta, std::memory_order_relaxed);
+            verdict = RESV_VERDICT_GRANT;
+          } else {
+            g_reserved_pending.store(0, std::memory_order_relaxed);
+          }
+        } else if (req_type == RESV_REQ_GRANT) {
+          // Phase 2 — hard commit iff the reservation survived Execute's
+          // cancellation since phase 1. No re-check of the estimate: the
+          // cancel path is strictly fresher (per cache miss) than any
+          // broker-side test could be.
+          if (g_reserved_pending.load(std::memory_order_relaxed) >= delta) {
+            g_granted.store(req_bytes, std::memory_order_relaxed);
+            granted_after = req_bytes;
+            g_reserved_pending.store(0, std::memory_order_relaxed);
+            verdict = RESV_VERDICT_GRANT;
+          }
+          // else: DENY — reservation canceled (or never made); the standby
+          // rolls back every rank and redoes both phases.
         }
+        reserved_after = g_reserved_pending.load(std::memory_order_relaxed);
       }
       const int64_t needed = req_bytes - granted_before;
       if (granted_after != granted_before) {
@@ -908,8 +977,8 @@ static void broker_loop() {
       resv_store_rel(&L->resp_verdict, verdict);
       resv_store_rel(&L->resp_seq, req_seq);  // bump last → signals done
       last_req_seq = req_seq;
-      // Diagnostic: DENYs and grant-raising decisions always; idempotent
-      // re-grants (needed<=0, one per peer-denied unanimity round) only
+      // Diagnostic: DENYs and state-changing decisions always; idempotent
+      // re-acks (needed<=0, one per peer-denied unanimity round) only
       // with LETO_FMCB_VERBOSE=1.
       if (verdict == RESV_VERDICT_DENY || needed > 0 || g_verbose_decisions) {
         // est_age: how stale the consumed estimate is (published on this
@@ -917,19 +986,28 @@ static void broker_loop() {
         // matching verbose fmcb line.
         const int64_t est_age_ms =
             mono_ms() - g_pub_at_ms.load(std::memory_order_relaxed);
+        const char* type_name =
+            req_type == RESV_REQ_RESERVE
+                ? "RESERVE"
+                : (req_type == RESV_REQ_GRANT
+                       ? "GRANT"
+                       : (req_type == RESV_REQ_ROLLBACK ? "ROLLBACK"
+                                                        : "UNKNOWN"));
         leto_log(
-            "broker req_seq=%u request=%lld MiB -> %s | "
+            "broker req_seq=%u %s request=%lld MiB -> %s | "
             "used_est=%lld (age=%lldms) capacity=%lld "
-            "granted_before=%lld needed=%lld granted_after=%lld MiB",
-            req_seq,
+            "granted_before=%lld needed=%lld granted_after=%lld "
+            "reserved_after=%lld MiB",
+            req_seq, type_name,
             static_cast<long long>(req_bytes / (1024 * 1024)),
-            verdict == RESV_VERDICT_GRANT ? "GRANT" : "DENY",
+            verdict == RESV_VERDICT_GRANT ? "OK" : "DENY",
             static_cast<long long>(used_est / (1024 * 1024)),
             static_cast<long long>(est_age_ms),
             static_cast<long long>(capacity / (1024 * 1024)),
             static_cast<long long>(granted_before / (1024 * 1024)),
             static_cast<long long>(needed / (1024 * 1024)),
-            static_cast<long long>(granted_after / (1024 * 1024)));
+            static_cast<long long>(granted_after / (1024 * 1024)),
+            static_cast<long long>(reserved_after / (1024 * 1024)));
       }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kBrokerTickMs));
@@ -1041,6 +1119,7 @@ static void reset_granted() {
   {
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_granted.store(0, std::memory_order_relaxed);
+    g_reserved_pending.store(0, std::memory_order_relaxed);
   }
   if (g_ledger != nullptr) resv_store_rel(&g_ledger->granted, int64_t{0});
   // Restore the allocator budget (kill path runs inside the malloc chain —
@@ -1048,15 +1127,6 @@ static void reset_granted() {
   // retried allocation must not stay capped by the dead standby's grant).
   apply_reservation_budget();
 }
-
-// At most one background (async) standby kill in flight — the latch already
-// bounds kills to one per standby generation; this bounds detached threads
-// across generations.
-static std::atomic<bool> g_async_kill_inflight{false};
-// mono_ms() of the last async kill dispatch: follow-up allocations that
-// need the reclaimed memory wait for it (see Execute) only within this
-// kill's materialization window.
-static std::atomic<int64_t> g_last_async_kill_ms{-100000};
 
 // Wait (<=10s, 1ms poll) until the device shows at least `need_b` free
 // bytes via cudaMemGetInfo. Used to confirm a standby kill's reclaim:
@@ -1154,25 +1224,105 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       return false;
     }
 
-    // Reclaim decision:
-    //   KILL iff used_estimate + reserved > capacity
-    // with something to take back (standby_actual > 0 or reserved > 0;
-    // firing with nothing held and nothing reserved is a futile kill: a
-    // SIGKILL'd mid-NCCL-init context lingers 10+ s on the GPU and can
-    // wedge the device), AND the kill latch is armed. Admission guarantees
-    // est + granted <= capacity at grant time, so this fires only when the
-    // active's physical footprint has grown into the reservation since —
-    // the collision the reservation exists to detect.
+    // Reclaim ladder, on free := capacity - est (per-miss fresh):
+    //   free >= granted + reserved_pending  -> keep (no pressure)
+    //   granted <= free < granted+reserved  -> CANCEL the phase-1
+    //     reservation: a soft claim the device can no longer back is
+    //     retracted at zero cost (nothing was allocated); the broker
+    //     DENIES the pending phase-2 GRANT and the standby redoes both
+    //     phases. This is what used to be a useless kill: a rank that
+    //     granted a task its peers denied carried the claim as phantom
+    //     kill pressure forever.
+    //   free < granted                      -> KILL: collision with
+    //     COMMITTED memory (post-unanimity: the standby is entitled to be
+    //     allocating it right now). Gated as before: something to take
+    //     back (standby_actual > 0 or granted > 0 — a futile kill of a
+    //     memoryless standby can wedge the device) AND the armed latch.
+    const int64_t free_phys = g_pub_free.load(std::memory_order_relaxed);
+    const int64_t req_charge =
+        g_pub_req_charge.load(std::memory_order_relaxed);
+    // For the budget half of the starvation gate (outside g_state_mutex —
+    // allocator APIs are forbidden under it; recursive allocator lock on
+    // this thread makes the call safe here).
+    int64_t alloc_reserved_b = -1;
+    try {
+      const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
+          c10::cuda::current_device());
+      constexpr size_t kAgg = static_cast<size_t>(
+          c10::CachingDeviceAllocator::StatType::AGGREGATE);
+      alloc_reserved_b = stats.reserved_bytes[kAgg].current;
+    } catch (const std::exception&) {
+    }
+    const int64_t margin_b =
+        static_cast<int64_t>(
+            g_reservation_margin_mb.load(std::memory_order_relaxed)) *
+        1024 * 1024;
+    const int64_t released_b = g_pub_released.load(std::memory_order_relaxed);
     int64_t reserved = 0;
-    bool pressure = false, should_fire = false;
+    bool pressure = false, should_fire = false, canceled = false;
     {
       std::lock_guard<std::mutex> lk(g_state_mutex);
       g_used_estimate.store(est, std::memory_order_relaxed);
       reserved = g_granted.load(std::memory_order_relaxed);
-      pressure = (est + reserved > total_b) &&
+      const int64_t resv_pending =
+          g_reserved_pending.load(std::memory_order_relaxed);
+      const int64_t free_cap = total_b - est;
+      if (resv_pending > 0 && free_cap < reserved + resv_pending &&
+          free_cap >= reserved) {
+        g_reserved_pending.store(0, std::memory_order_relaxed);
+        canceled = true;
+      }
+      // Starvation-gated kill. Two independent ways THIS allocation can be
+      // unable to proceed because of the reservation:
+      //
+      //   PHYSICAL: req_charge exceeds physical free minus the standby's
+      //     committed-but-unallocated remainder (granted - actual) — memory
+      //     that is free on the device but off-limits to the active. Both
+      //     the estimate and this comparison are margin-free.
+      //
+      //   BUDGET: the allocation would breach the allocator cap that
+      //     apply_reservation_budget enforces (device_total - granted -
+      //     margin), even after the ladder releases the active's own cache
+      //     (released_b). Physical free may be plentiful (the adversary
+      //     test's shape); the cap failure IS a collision with the
+      //     reservation — the cap exists only because of it — and a kill
+      //     genuinely relieves it (reset_granted lifts the cap by granted
+      //     and restores the fraction). The margin term here is not slop
+      //     in a kill inequality: it reproduces the exact limit the
+      //     allocator is about to enforce.
+      //
+      // A parked standby (actual == granted) under a transient est spike
+      // triggers neither (observed false positive: a kill at
+      // req_charge=80MiB vs free=560MiB): the allocation that genuinely
+      // starves later fires the kill then, and a standby that loses a race
+      // OOMs and is watcher-relaunched — both now cheap. Order matters:
+      // the latch is consumed only when everything else passes (&&
+      // short-circuit), so a gated keep doesn't burn the generation's one
+      // kill.
+      const bool phys_starved =
+          (free_cap < reserved) &&
+          req_charge >
+              free_phys - std::max<int64_t>(0, reserved - standby_actual);
+      bool budget_starved = false;
+      if (reserved > 0 && alloc_reserved_b >= 0 && g_device_total_bytes > 0) {
+        budget_starved =
+            alloc_reserved_b - released_b + req_charge >
+            g_device_total_bytes - reserved - margin_b;
+      }
+      pressure = (phys_starved || budget_starved) &&
                  (standby_actual > 0 || reserved > 0);
       should_fire =
-          pressure && g_kill_armed.exchange(false, std::memory_order_relaxed);
+          pressure &&
+          g_kill_armed.exchange(false, std::memory_order_relaxed);
+    }
+    if (canceled) {
+      // Always logged: cancellations are rare and each one is a kill that
+      // didn't happen.
+      leto_log("fmcb CANCEL reservation: free=%lld MiB < granted=%lld + "
+               "pending reservation (est=%lld)",
+               static_cast<long long>((total_b - est) / (1024 * 1024)),
+               static_cast<long long>(reserved / (1024 * 1024)),
+               static_cast<long long>(est / (1024 * 1024)));
     }
 
     // (B) standby_actual <= reserved. A breach means the standby physically
@@ -1209,8 +1359,9 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
         } catch (const std::exception&) {
         }
       }
-      // Full used_estimate equation (physical semantics):
-      //   est = (total - free - stdby) + req_charge + margin
+      // Full used_estimate equation (pure measurement, no margin term —
+      // margin is applied separately at RESERVE admission / budget):
+      //   est = (total - free - stdby) + req_charge
       //   req_charge = max(0, phys_ub(request) - reuse)
       // `reuse` is the expandable-tail credit for Execute's own request;
       // `queued` (other threads parked on the allocator lock) is logged for
@@ -1220,7 +1371,7 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       leto_log(
           "fmcb request=%d MiB -> %s | est=%lld = (total=%lld - free=%lld "
           "- stdby=%lld) + req_charge=%lld[reuse=%lld,self_release=%lld] "
-          "+ margin=%lld (queued=%lld) | grant_reserved=%lld "
+          "(margin=%lld queued=%lld) | grant_reserved=%lld "
           "alloc_reserved=%lld alloc_allocated=%lld armed=%d pressure=%d",
           request_mb, should_fire ? "KILL" : "keep",
           static_cast<long long>(est / (1024 * 1024)),
@@ -1251,75 +1402,16 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
           g_kill_armed.load(std::memory_order_relaxed) ? 1 : 0,
           pressure ? 1 : 0);
     }
-    const int64_t free_now = g_pub_free.load(std::memory_order_relaxed);
-    const int64_t req_charge =
-        g_pub_req_charge.load(std::memory_order_relaxed);
-
     if (!should_fire) {
-      // An async kill dispatched moments ago may still be materializing
-      // (SIGKILL is instant; the driver's context teardown returns the
-      // memory 0.1-3s later). The latch is already consumed, so a
-      // follow-up allocation that genuinely needs that memory
-      // (req_charge > free) must WAIT for it here rather than fall
-      // through and OOM in the release ladder — the exact race the
-      // adversary test caught: balloon chunk N triggers the async kill,
-      // chunk N+1 arrives before the reclaim lands.
-      if (req_charge > free_now &&
-          mono_ms() - g_last_async_kill_ms.load(std::memory_order_relaxed) <
-              10000) {
-        return wait_for_free_at_least(req_charge);
-      }
       return false;
     }
     g_num_kill_standby_called.fetch_add(1, std::memory_order_relaxed);
 
-    // Kill dispatch. Two regimes, decided by whether THIS allocation
-    // actually needs the standby's memory:
-    //
-    //   req_charge <= free   — the request is self-servable (free plus the
-    //     active's own releasable cache covers it: the serve-path bound in
-    //     compute_used_estimate already folded the releasable credit into
-    //     req_charge). The kill only enforces the reservation invariant,
-    //     not this allocation — run it on a detached thread and return
-    //     false so the allocator proceeds with its normal release-retry.
-    //     This removes the multi-second kill stall from the training
-    //     thread entirely (every kill observed in the 2026-07 runs was of
-    //     this shape).
-    //
-    //   req_charge > free    — the allocation genuinely needs reclaimed
-    //     memory NOW: kill synchronously, then wait for the device to show
-    //     enough free (cudaMemGetInfo at 1ms — the memory is usable the
-    //     moment the driver tears down the context, well before the pid
-    //     leaves NVML's compute-process list, and each NVML enumeration
-    //     costs 10-50ms on top).
-    if (req_charge <= free_now) {
-      if (g_async_kill_inflight.exchange(true, std::memory_order_acq_rel)) {
-        leto_log("KILL(async) skipped: previous async kill still in flight");
-        return false;
-      }
-      g_last_async_kill_ms.store(mono_ms(), std::memory_order_relaxed);
-      leto_log("KILL(async): self-servable request (req_charge=%lld MiB <= "
-               "free=%lld MiB); reclaiming standby in background",
-               static_cast<long long>(req_charge / (1024 * 1024)),
-               static_cast<long long>(free_now / (1024 * 1024)));
-      // Void the reservation NOW, synchronously: the returning `false`
-      // sends THIS malloc straight to alloc_block, whose
-      // allowed_memory_maximum check still reflects the dead-standby-
-      // to-be's grant — physically-servable or not, the malloc would fail
-      // on the budget cap until the background callback's reset_granted
-      // runs. The reservation is semantically dead the moment the kill is
-      // decided; the callback's own reset is idempotent.
-      reset_granted();
-      std::thread([]() {
-        run_kill_callback();  // acquires the GIL itself
-        g_async_kill_inflight.store(false, std::memory_order_release);
-      }).detach();
-      return false;
-    }
-
-    // Blocking path: the retry cannot succeed until reclaimed memory
-    // lands. shortfall = what must appear beyond the (already-counted)
-    // free + own-releasable credit.
+    // The starvation gate above guarantees req_charge > free here: this
+    // malloc cannot proceed until reclaimed memory lands, so the kill is
+    // synchronous by nature (there is no async case left — a self-servable
+    // request never passes the gate) and Execute cannot race itself (it
+    // runs under the device allocator lock).
     bool memory_freed = false;
     unsigned int killed_pid = 0;
     if (!run_kill_callback(&memory_freed, &killed_pid)) {
@@ -1712,6 +1804,12 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
         leto::g_granted.load(std::memory_order_relaxed) / (1024 * 1024));
   });
 
+  m.def("get_reserved_pending_mb", []() {
+    return static_cast<int>(
+        leto::g_reserved_pending.load(std::memory_order_relaxed) /
+        (1024 * 1024));
+  });
+
   // Current used_estimate (MiB) — the value the broker grants against.
   // INT64_MAX/2^20 until the first publish (deny-until-published).
   m.def("get_used_estimate_mb", []() {
@@ -1772,4 +1870,9 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
       static_cast<int>(offsetof(leto::ReservationLedger, effective_free));
   m.attr("OFF_STANDBY_ACTUAL") =
       static_cast<int>(offsetof(leto::ReservationLedger, standby_actual));
+  m.attr("OFF_REQ_TYPE") =
+      static_cast<int>(offsetof(leto::ReservationLedger, req_type));
+  m.attr("REQ_RESERVE") = leto::RESV_REQ_RESERVE;
+  m.attr("REQ_GRANT") = leto::RESV_REQ_GRANT;
+  m.attr("REQ_ROLLBACK") = leto::RESV_REQ_ROLLBACK;
 }

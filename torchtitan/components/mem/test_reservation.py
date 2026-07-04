@@ -50,8 +50,17 @@ def _mk_ledger(m, path):
     return mm
 
 
-def _reserve(m, mm, seq, cumulative_bytes, timeout=5.0):
+_next_seq = 0
+
+
+def _request(m, mm, req_type, cumulative_bytes, timeout=5.0):
+    """Post one two-phase-protocol request and wait for the verdict.
+    Sequence numbers are allocated internally (monotonic per process)."""
+    global _next_seq
+    _next_seq += 1
+    seq = _next_seq
     _I64.pack_into(mm, m.OFF_REQ_BYTES, int(cumulative_bytes))
+    _I32.pack_into(mm, m.OFF_REQ_TYPE, int(req_type))
     _U32.pack_into(mm, m.OFF_REQ_SEQ, seq)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -59,6 +68,14 @@ def _reserve(m, mm, seq, cumulative_bytes, timeout=5.0):
             return _I32.unpack_from(mm, m.OFF_RESP_VERDICT)[0]
         time.sleep(0.002)
     raise TimeoutError("no broker response")
+
+
+def _reserve(m, mm, cumulative_bytes, timeout=5.0):
+    """Full two-phase RESERVE+GRANT; returns the final verdict."""
+    v = _request(m, mm, m.REQ_RESERVE, cumulative_bytes, timeout)
+    if v != m.VERDICT_GRANT:
+        return v
+    return _request(m, mm, m.REQ_GRANT, cumulative_bytes, timeout)
 
 
 def test_layout():
@@ -83,21 +100,37 @@ def test_broker_logic(m):
     est_mb = m.get_used_estimate_mb()
     assert est_mb < 10 ** 7, f"used_estimate not seeded (est={est_mb}MiB)"
 
-    assert _reserve(m, mm, 1, 8 * GB) == m.VERDICT_GRANT
+    assert _reserve(m, mm, 8 * GB) == m.VERDICT_GRANT
     assert 8000 <= m.get_granted_mb() <= 8400
     frac_8g = m.get_memory_fraction()
     assert frac_8g < 1.0, f"grant did not cap the allocator (frac={frac_8g})"
-    assert _reserve(m, mm, 2, 16 * GB) == m.VERDICT_GRANT  # raise target
+    assert _reserve(m, mm, 16 * GB) == m.VERDICT_GRANT  # raise target
     assert 16000 <= m.get_granted_mb() <= 16800
     assert m.get_memory_fraction() < frac_8g  # bigger grant, tighter budget
-    assert _reserve(m, mm, 3, 16 * GB) == m.VERDICT_GRANT  # idempotent retry
+    assert _reserve(m, mm, 16 * GB) == m.VERDICT_GRANT  # idempotent retry
     assert 16000 <= m.get_granted_mb() <= 16800
-    assert _reserve(m, mm, 4, 200 * GB) == m.VERDICT_DENY  # exceeds device
+    assert _reserve(m, mm, 200 * GB) == m.VERDICT_DENY  # exceeds device
     assert 16000 <= m.get_granted_mb() <= 16800
+
+    # Two-phase specifics: a GRANT with no live reservation must DENY
+    # (phase 2 is gated on phase 1 surviving the callback's cancellation).
+    assert _request(m, mm, m.REQ_GRANT, 24 * GB) == m.VERDICT_DENY
+    assert 16000 <= m.get_granted_mb() <= 16800
+    # RESERVE alone is a soft claim: pending, nothing committed.
+    assert _request(m, mm, m.REQ_RESERVE, 20 * GB) == m.VERDICT_GRANT
+    assert 16000 <= m.get_granted_mb() <= 16800
+    assert 3600 <= m.get_reserved_pending_mb() <= 4400  # ~4GB delta
+    # ROLLBACK clears the reservation (and would lower a unilateral commit).
+    assert _request(m, mm, m.REQ_ROLLBACK, 16 * GB) == m.VERDICT_GRANT
+    assert m.get_reserved_pending_mb() == 0
+    assert 16000 <= m.get_granted_mb() <= 16800
+    # ROLLBACK below the committed cumulative lowers it (phase-2 unwind).
+    assert _request(m, mm, m.REQ_ROLLBACK, 8 * GB) == m.VERDICT_GRANT
+    assert 8000 <= m.get_granted_mb() <= 8400
     m.reset_granted()
     assert m.get_granted_mb() == 0
     assert m.get_memory_fraction() >= 0.999  # budget restored on reset
-    assert _reserve(m, mm, 5, 4 * GB) == m.VERDICT_GRANT
+    assert _reserve(m, mm, 4 * GB) == m.VERDICT_GRANT
     _U32.pack_into(mm, m.OFF_STANDBY_EPOCH, 2)  # new standby instance
     deadline = time.time() + 2  # epoch reset lands on the next broker tick
     while time.time() < deadline and m.get_granted_mb() != 0:
@@ -141,7 +174,7 @@ def test_physical_admission(m):
     # Request more than physical free (but far less than free+cache):
     # must DENY under physical admission.
     req_b = int(free_b + 2 * GiB)
-    verdict = _reserve(m, mm, 1, req_b)
+    verdict = _reserve(m, mm, req_b)
     print(f"[2b] physical admission: free={free_b // 2**20}MiB "
           f"cache~{cache_b // 2**20}MiB est={est_mb}MiB "
           f"request={req_b // 2**20}MiB -> "
@@ -150,8 +183,32 @@ def test_physical_admission(m):
 
     # A request that fits physical free (minus margin) must still GRANT.
     req_ok_b = max(int(free_b - 2 * GiB), 1 << 30)
-    assert _reserve(m, mm, 2, req_ok_b) == m.VERDICT_GRANT
+    assert _reserve(m, mm, req_ok_b) == m.VERDICT_GRANT
     m.reset_granted()
+
+    # [2c] Cancellation: a live reservation whose physical backing then
+    # disappears is canceled by the callback on the active's next cache
+    # miss, and the phase-2 GRANT is denied — the case that used to be a
+    # useless kill (rank granted, peers denied, task never runs).
+    torch.cuda.empty_cache()
+    # The broker consumes the published estimate and never refreshes it
+    # itself; publish a fresh one so the reserve is admitted against the
+    # post-empty_cache reality.
+    assert m.refresh_used_estimate()
+    free2_b, _ = torch.cuda.mem_get_info()
+    req_c = int(free2_b * 0.7)
+    assert _request(m, mm, m.REQ_RESERVE, req_c) == m.VERDICT_GRANT
+    assert m.get_reserved_pending_mb() > 0
+    # Eat most of free: the allocation's own miss runs Execute, which sees
+    # free < granted(0) + reserved and cancels the soft claim.
+    eat = torch.empty(int(free2_b * 0.6), dtype=torch.uint8, device="cuda:0")
+    torch.cuda.synchronize()
+    assert m.get_reserved_pending_mb() == 0, "reservation not canceled"
+    assert _request(m, mm, m.REQ_GRANT, req_c) == m.VERDICT_DENY
+    assert m.get_granted_mb() == 0
+    del eat
+    print("[2c] reservation canceled under pressure; phase-2 GRANT denied")
+
     m.stop_broker()
     del hold
     torch.cuda.empty_cache()
@@ -167,7 +224,7 @@ def test_deadlock(m):
     path = "/dev/shm/leto_resvtest_deadlock"
     mm = _mk_ledger(m, path)
     assert m.attach_reservation_ledger(path)
-    m.set_reservation_margin_mb(10 ** 7)  # huge -> reclaim fires every miss
+    m.set_reservation_margin_mb(128)
     calls = {"n": 0}
 
     def kill_cb():
@@ -175,19 +232,26 @@ def test_deadlock(m):
         return (False, 0)
 
     m.set_kill_callback(kill_cb)
-    assert m.start_broker(10 ** 7)
+    assert m.start_broker(128)
     atexit.register(m.clear_kill_callback)
-    # Use our own pid as the "standby": the huge margin denies every grant
-    # (granted stays 0), and the reclaim gate only fires when there is
-    # something reclaimable (standby_actual > 0 or granted > 0). Our own
-    # GPU usage gives standby_actual > 0 so the reclaim path is exercised;
-    # this test only cares about concurrency (reclaim under the GIL vs the
-    # broker thread servicing grants), not reclaim semantics.
-    _I32.pack_into(mm, m.OFF_STANDBY_PID, os.getpid())
+    # Fake standby pid (actual=0): the reclaim gate needs something
+    # reclaimable, which the committed 4GB grant below provides. This test
+    # only cares about concurrency (reclaim under the GIL vs the broker
+    # thread servicing requests), not reclaim semantics.
+    _I32.pack_into(mm, m.OFF_STANDBY_PID, 999999)
     _U32.pack_into(mm, m.OFF_STANDBY_EPOCH, 1)
-    # The broker mirrors standby_pid out of the ledger once per tick (500ms);
-    # the reclaim gate needs it (standby_actual > 0), so let one tick pass.
-    time.sleep(0.7)
+    # Commit a real 4GB grant while the device is empty, then pin the
+    # device to ~1GB under the allocator budget. Each oversized allocation
+    # below is then genuinely starved (usable free = free - granted < 0
+    # after the pin) AND under pressure (free_cap < granted), so the kill
+    # path fires; the callback frees nothing, so the allocation OOMs —
+    # expected and caught.
+    GB = 1 << 30
+    assert _reserve(m, mm, 4 * GB) == m.VERDICT_GRANT
+    torch.cuda.empty_cache()
+    free_b, _ = torch.cuda.mem_get_info()
+    hold = torch.empty(max(free_b - 5 * GB - (1 << 28), GB),
+                       dtype=torch.uint8, device="cuda:0")
     stop = threading.Event()
 
     def requester():
@@ -195,20 +259,27 @@ def test_deadlock(m):
         while not stop.is_set():
             seq += 1
             _I64.pack_into(mm, m.OFF_REQ_BYTES, 4 * 1024 ** 3)
+            _I32.pack_into(mm, m.OFF_REQ_TYPE, m.REQ_RESERVE)
             _U32.pack_into(mm, m.OFF_REQ_SEQ, seq)
             time.sleep(0.003)
 
     t = threading.Thread(target=requester, daemon=True)
     t.start()
-    for i in range(60):
+    for i in range(30):
         torch.cuda.empty_cache()
-        x = torch.empty((5_000_000 + i * 137) % 50_000_000 + 1_000_000,
-                        dtype=torch.float32, device="cuda:0")
-        del x
+        try:
+            x = torch.empty((2 << 30) + i * 4096, dtype=torch.uint8,
+                            device="cuda:0")  # > usable free -> starved miss
+            del x
+        except torch.OutOfMemoryError:
+            pass
         torch.cuda.synchronize()
         time.sleep(0.05)
     stop.set()
     t.join(timeout=2)
+    del hold
+    torch.cuda.empty_cache()
+    m.reset_granted()
     # The kill latch limits fires to one per broker-serviced request
     # (500ms tick), so a few seconds of concurrent reclaim+grant cycles
     # yields a handful of fires — enough to exercise the interleaving.
@@ -463,6 +534,10 @@ def main():
     m = mem._load_module()
     torch.cuda.init()
     torch.empty(1, device="cuda:0")
+    # Production always installs the recording allocator (leto init); without
+    # it Execute() sees request=0 and the estimate never charges the
+    # in-flight allocation — [2c]'s cancellation depends on that charge.
+    assert m.install_recording_allocator()
 
     test_layout()
     test_broker_logic(m)
