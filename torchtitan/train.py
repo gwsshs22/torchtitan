@@ -1295,9 +1295,29 @@ def main(trainer_class: type[Trainer]) -> None:
         else:
             trainer.train()
     except Exception:
-        if trainer:
-            trainer.close()
-        raise
+        # Crash-style exit: log the failure and _exit WITHOUT graceful
+        # teardown. Attempting teardown here is what wedged post-OOM ranks
+        # (2026-07 hang forensics): trainer.close() blocks on in-flight
+        # gemini snapshot exchanges with dead peers (up to the ~30 min gloo
+        # PG timeout), and normal interpreter exit joins the non-daemon
+        # SnapshotContainer child, which polls CheckServiceAction forever
+        # because the controller answers WORKING until teardown. A rank
+        # wedged here never exits, torchrun never reports failure, and the
+        # launcher sees a healthy job indefinitely. os._exit makes a crash
+        # look like a crash: the SnapshotContainer is left alive as an
+        # orphan, exactly as after a SIGKILL, so the controller's
+        # PERSIST/CLOSE handshake still owns its lifecycle (gemini fatal
+        # recovery depends on that).
+        import sys
+        import traceback
+
+        logger.error(
+            "Training failed; exiting crash-style without graceful teardown:\n"
+            + traceback.format_exc()
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     else:
         trainer.close()
         if torch.distributed.is_initialized():
