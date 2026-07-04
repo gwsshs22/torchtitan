@@ -147,14 +147,6 @@ def is_recording_allocator_installed() -> bool:
     return bool(_module.is_recording_allocator_installed())
 
 
-def get_last_request_mb() -> int:
-    """Most recent allocation request (MiB) seen by the RecordingAllocator,
-    across all threads. Observability only."""
-    if _module is None:
-        return 0
-    return int(_module.get_last_request_mb())
-
-
 def get_num_kill_standby_called() -> int:
     """Number of times the C++ FreeMemoryCallback has invoked the
     Python kill callback since process start (or since
