@@ -362,6 +362,27 @@ static bool g_orig_fraction_saved = false;
 static std::mutex g_state_mutex;
 static std::atomic<int64_t> g_used_estimate{INT64_MAX};
 
+// Estimate-cache TTL (ms). A cache miss re-reads NVML (and walks the
+// allocator snapshot) only when the last published component snapshot is
+// older than this, or when a conservative screen of the cached snapshot
+// signals possible cancellation/pressure — CANCEL/KILL are never decided
+// from cached data. 0 disables the fast path (every miss reads fresh, the
+// pre-cache behavior). Rationale: at MoE cache-miss rates the two NVML
+// driver calls + walks per miss are a measurable per-step tax (+1-2%
+// steady-state, 2026-07-05 steady_* arms) while the estimate's consumers
+// tolerate multi-second staleness (the broker annotates age).
+static std::atomic<int64_t> g_est_ttl_ms{100};
+// Observability: Execute() invocations (= allocator cache misses) and how
+// many exited via the cached-snapshot fast path.
+static std::atomic<uint64_t> g_num_misses{0};
+static std::atomic<uint64_t> g_num_fast_exits{0};
+// Sum of req_ub for misses that fast-exited since the last full publish:
+// those allocations consume physical memory the cached free hasn't seen,
+// so the screen debits them from cached free. Reset on every publish.
+// (Standby movement needs no debit: it shifts free and standby_actual in
+// equal and opposite amounts, and the screen only uses their sum.)
+static std::atomic<int64_t> g_fast_debit{0};
+
 // Kill latch — at most ONE reclaim per standby generation. Armed whenever
 // the broker services a request (a live standby is asking); consumed by
 // Execute() on fire, and ONLY on fire (short-circuit order), so a gated
@@ -638,6 +659,7 @@ static bool compute_used_estimate(nvmlDevice_t handle, int target_pid,
   g_pub_req_charge.store(req_charge, std::memory_order_relaxed);
   g_pub_reuse.store(reuse_b, std::memory_order_relaxed);
   g_pub_released.store(released_b, std::memory_order_relaxed);
+  g_fast_debit.store(0, std::memory_order_relaxed);  // snapshot is fresh
   g_pub_at_ms.store(mono_ms(), std::memory_order_relaxed);
   if (free_b_out != nullptr) *free_b_out = free_b;
   if (total_b_out != nullptr) *total_b_out = total_b;
@@ -933,6 +955,13 @@ static void stop_broker() {
   g_reservation_active.store(false, std::memory_order_release);
   g_granted.store(0, std::memory_order_relaxed);
   apply_reservation_budget();  // restore the pre-install fraction
+  leto_log("fmcb stats: misses=%llu fast_exits=%llu (est_ttl_ms=%lld)",
+           static_cast<unsigned long long>(
+               g_num_misses.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(
+               g_num_fast_exits.load(std::memory_order_relaxed)),
+           static_cast<long long>(
+               g_est_ttl_ms.load(std::memory_order_relaxed)));
 }
 
 // Void the cumulative grant (e.g. after the standby is killed/activated).
@@ -1032,6 +1061,78 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     const int64_t request_b = static_cast<int64_t>(g_request_bytes);
     const int request_mb = static_cast<int>(request_b / (1024 * 1024));
     const int target_pid = g_standby_pid.load(std::memory_order_relaxed);
+
+    g_num_misses.fetch_add(1, std::memory_order_relaxed);
+    const int64_t ttl_ms = g_est_ttl_ms.load(std::memory_order_relaxed);
+    if (ttl_ms > 0) {
+      const int64_t age_ms =
+          mono_ms() - g_pub_at_ms.load(std::memory_order_relaxed);
+      if (age_ms >= 0 && age_ms <= ttl_ms) {
+        // Fast path: screen the cached component snapshot with NO driver
+        // calls and NO walks. req_ub takes no reuse/release credit, so it
+        // upper-bounds the full path's req_charge — every state the full
+        // path would act on (CANCEL / KILL) also trips this screen and
+        // falls through to the fresh read below. Cached free is debited by
+        // the fast-exited misses since the last publish (the one consumer
+        // the snapshot can't see). `covered` additionally sends any request
+        // the debited free cannot outright satisfy to the full path (the
+        // OOM-risky ones, which also need the release-ladder credits).
+        // The cap screen uses ALLOCATOR-LOCAL stats — always fresh — so
+        // budget starvation (plentiful physical free, cap-starved malloc;
+        // the adversary-test shape) can never fast-exit into an OOM.
+        // Publishes nothing: the broker keeps consuming the last real
+        // estimate with its age annotation.
+        const int64_t c_total = g_pub_total.load(std::memory_order_relaxed);
+        const int64_t c_free =
+            g_pub_free.load(std::memory_order_relaxed) -
+            g_fast_debit.load(std::memory_order_relaxed);
+        const int64_t c_actual = g_pub_actual.load(std::memory_order_relaxed);
+        const int64_t req_ub = request_physical_ub(request_b);
+        bool screened_ok = false;
+        {
+          std::lock_guard<std::mutex> lk(g_state_mutex);
+          const int64_t granted_now =
+              g_granted.load(std::memory_order_relaxed);
+          const int64_t resv_pending =
+              g_reserved_pending.load(std::memory_order_relaxed);
+          const int64_t est_fast =
+              std::max<int64_t>(0, c_total - c_free - c_actual) + req_ub;
+          const int64_t free_cap = c_total - est_fast;
+          const bool maybe_cancel =
+              resv_pending > 0 && free_cap < granted_now + resv_pending;
+          const bool maybe_pressure =
+              req_ub > c_free + c_actual - granted_now &&
+              (c_actual > 0 || granted_now > 0);
+          const bool covered = req_ub <= c_free;
+          screened_ok = !maybe_cancel && !maybe_pressure && covered;
+        }
+        if (screened_ok && g_granted.load(std::memory_order_relaxed) > 0 &&
+            g_device_total_bytes > 0) {
+          // Budget-starvation screen, fresh from the allocator itself
+          // (recursive device lock — Execute already holds it).
+          try {
+            const auto stats =
+                c10::cuda::CUDACachingAllocator::getDeviceStats(
+                    static_cast<c10::DeviceIndex>(g_broker_device));
+            constexpr size_t kAgg = static_cast<size_t>(
+                c10::CachingDeviceAllocator::StatType::AGGREGATE);
+            const int64_t cap_b =
+                g_device_total_bytes -
+                g_granted.load(std::memory_order_relaxed);
+            if (stats.reserved_bytes[kAgg].current + req_ub > cap_b) {
+              screened_ok = false;
+            }
+          } catch (const std::exception&) {
+            screened_ok = false;  // can't verify the cap: take the full path
+          }
+        }
+        if (screened_ok) {
+          g_fast_debit.fetch_add(req_ub, std::memory_order_relaxed);
+          g_num_fast_exits.fetch_add(1, std::memory_order_relaxed);
+          return false;
+        }
+      }
+    }
 
     int64_t est = 0, nvml_free = 0, total_b = 0, standby_actual = 0;
     nvmlDevice_t handle{};
@@ -1492,6 +1593,20 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
 
   m.def("get_reservation_margin_mb", []() {
     return leto::g_reservation_margin_mb.load(std::memory_order_relaxed);
+  });
+
+  m.def(
+      "set_est_ttl_ms",
+      [](int64_t ms) {
+        leto::g_est_ttl_ms.store(std::max<int64_t>(0, ms),
+                                 std::memory_order_relaxed);
+      },
+      py::arg("ms"));
+
+  m.def("get_fmcb_miss_stats", []() {
+    return py::make_tuple(
+        leto::g_num_misses.load(std::memory_order_relaxed),
+        leto::g_num_fast_exits.load(std::memory_order_relaxed));
   });
 
   // Ablation: single-phase protocol (GRANT commits directly, no reservation

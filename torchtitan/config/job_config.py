@@ -1154,6 +1154,15 @@ class Leto:
     """Tasks with delta_mb below this threshold are treated as CPU-only and
     bypass the gated wait under progressive_init."""
 
+    fmcb_est_ttl_ms: int = 100
+    """Estimate-cache TTL (ms) for the OOM-safeguard FreeMemoryCallback. An
+    allocator cache miss re-reads NVML (and walks the allocator snapshot)
+    only when the cached component snapshot is older than this, or when a
+    conservative screen of the cached values signals possible
+    cancellation/pressure — CANCEL/KILL always re-read fresh. 0 = read NVML
+    on every miss (the pre-cache behavior; costs ~1% steady-state at MoE
+    cache-miss rates)."""
+
     fault_injection_step_enabled: bool = False
     """Enable step-based fault injection (worker self-injects faults at specific steps)."""
 

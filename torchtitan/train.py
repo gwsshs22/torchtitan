@@ -995,7 +995,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"ledger={ledger_path}"
             )
             install_reservation_broker(
-                ledger_path, margin_mb, _on_oom, grant_only=_grant_only
+                ledger_path, margin_mb, _on_oom, grant_only=_grant_only,
+                est_ttl_ms=int(leto_cfg.fmcb_est_ttl_ms),
             )
 
             # RMP-server allocations (e.g. lazy gradient-persistence tensors
