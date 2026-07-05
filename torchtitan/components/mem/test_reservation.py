@@ -127,6 +127,13 @@ def test_broker_logic(m):
     # ROLLBACK below the committed cumulative lowers it (phase-2 unwind).
     assert _request(m, mm, m.REQ_ROLLBACK, 8 * GB) == m.VERDICT_GRANT
     assert 8000 <= m.get_granted_mb() <= 8400
+    # grant_only ablation: GRANT commits directly, no reservation needed;
+    # switching back restores the two-phase requirement.
+    m.set_grant_only(True)
+    assert _request(m, mm, m.REQ_GRANT, 12 * GB) == m.VERDICT_GRANT
+    assert 12000 <= m.get_granted_mb() <= 12600
+    m.set_grant_only(False)
+    assert _request(m, mm, m.REQ_GRANT, 16 * GB) == m.VERDICT_DENY
     m.reset_granted()
     assert m.get_granted_mb() == 0
     assert m.get_memory_fraction() >= 0.999  # budget restored on reset

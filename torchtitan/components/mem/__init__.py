@@ -173,6 +173,7 @@ def install_reservation_broker(
     ledger_path: str,
     margin_mb: int,
     kill_callback: Optional[Callable[[], tuple]] = None,
+    grant_only: bool = False,
 ) -> None:
     """Active-side setup for standby memory reservation.
 
@@ -206,6 +207,9 @@ def install_reservation_broker(
             f"{ledger_path}) failed"
         )
     m.set_reservation_margin_mb(int(margin_mb))
+    # Ablation (leto.progressive_protocol=grant_only): GRANT commits
+    # directly against the estimate, no reservation phase.
+    m.set_grant_only(bool(grant_only))
     if kill_callback is not None:
         m.set_kill_callback(kill_callback)
     if not m.start_broker(int(margin_mb)):

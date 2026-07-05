@@ -231,6 +231,7 @@ def try_advance(
     threshold_mb: float,
     poll_interval_s: float,
     status_check: Optional[StatusCheck] = None,
+    protocol: str = "two_phase",
 ) -> Tuple[str, Optional[int]]:
     """Decide, across all standby ranks, whether the next task can advance —
     TWO-PHASE: (1) every rank RESERVEs (soft, cancellable by the active's
@@ -268,6 +269,18 @@ def try_advance(
             f"type={req_type} → {kind}"
         )
         return 0, 1 if kind == "grant" else 0
+
+    # Ablation (leto.progressive_protocol=grant_only): single-phase — GRANT
+    # directly, one unanimity round, NO rollback, so a rank that committed
+    # while its peers denied keeps the phantom entitlement. This is the
+    # pre-two-phase behavior, kept to measure the protocol's impact.
+    if protocol == "grant_only":
+        local_status, local_ok = _phase(REQ_GRANT)
+        global_status, all_ok = _reduce_status_ok(gloo_pg, local_status,
+                                                  local_ok)
+        if global_status > 0:
+            return ("status", global_status)
+        return ("advance" if all_ok else "retry", None)
 
     # Phase 1 — RESERVE on every rank. A partial success leaves soft
     # reservations behind on the granted ranks: harmless (nothing

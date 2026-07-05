@@ -987,11 +987,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     reset_granted()
                 return (freed, pid)
 
+            _grant_only = str(leto_cfg.progressive_protocol) == "grant_only"
             logger.info(
                 f"Installing reservation broker: rank={_oom_rank} "
-                f"margin={margin_mb}MiB reclaim=on ledger={ledger_path}"
+                f"margin={margin_mb}MiB reclaim=on "
+                f"protocol={leto_cfg.progressive_protocol} "
+                f"ledger={ledger_path}"
             )
-            install_reservation_broker(ledger_path, margin_mb, _on_oom)
+            install_reservation_broker(
+                ledger_path, margin_mb, _on_oom, grant_only=_grant_only
+            )
 
             # RMP-server allocations (e.g. lazy gradient-persistence tensors
             # at the first backward) happen in a different process, so a CUDA

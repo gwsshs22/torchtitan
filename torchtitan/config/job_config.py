@@ -1132,6 +1132,16 @@ class Leto:
     progressive_poll_interval_ms: int = 10
     """Standby poll interval (ms) while waiting for a reservation verdict."""
 
+    progressive_protocol: str = "two_phase"
+    """Reservation protocol the standby's progressive init uses:
+      "two_phase"  — RESERVE (soft, cancellable) on all ranks, then GRANT
+                     (commit) on all ranks; any phase-2 denial rolls every
+                     rank back. Default.
+      "grant_only" — single-phase ablation: GRANT commits directly against
+                     the estimate, no reservation phase and no rollback (a
+                     rank that committed while peers denied keeps the
+                     phantom entitlement). For measuring two_phase's impact."""
+
     progressive_solution: str = "solver"
     """Which init-task schedule the progressive standby follows:
       "solver"        — the solver-optimized order (init_profile/<mode>/solution.json)

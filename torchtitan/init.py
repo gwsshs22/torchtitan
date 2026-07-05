@@ -1183,6 +1183,7 @@ def _run_progressive_sequence(
                     threshold_mb,
                     poll_s,
                     status_check=_status_check,
+                    protocol=str(ctx.job_config.leto.progressive_protocol),
                 )
                 if outcome == "advance":
                     break

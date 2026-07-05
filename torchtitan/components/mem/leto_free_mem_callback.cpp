@@ -317,6 +317,11 @@ static inline void resv_store_rel(T* p, T v) {
 }
 
 static std::atomic<bool> g_reservation_active{false};  // gates reservation path
+// Ablation knob (leto.progressive_protocol=grant_only): REQ_GRANT commits
+// directly against the estimate, skipping the reservation-alive check —
+// the pre-two-phase single-phase semantics, kept to measure the two-phase
+// protocol's impact.
+static std::atomic<bool> g_grant_only{false};
 // Committed cumulative grant. Writers (broker commit, resets) run under
 // g_state_mutex and call apply_reservation_budget() after, which derives the
 // cap from the CURRENT value, so interleavings converge.
@@ -762,17 +767,27 @@ static void broker_loop() {
           }
         } else if (req_type == RESV_REQ_GRANT) {
           // Phase 2 — hard commit iff the reservation survived Execute's
-          // cancellation since phase 1. No re-check of the estimate: the
-          // cancel path is strictly fresher (per cache miss) than any
-          // broker-side test could be.
-          if (g_reserved_pending.load(std::memory_order_relaxed) >= delta) {
+          // cancellation since phase 1 (no estimate re-check: the cancel
+          // path is strictly fresher). DENY sends the standby through
+          // rollback + both phases again. grant_only ablation: commit
+          // directly against the estimate instead (single-phase).
+          const bool admit =
+              g_grant_only.load(std::memory_order_relaxed)
+                  ? (capacity > 0 &&
+                     used_est +
+                             static_cast<int64_t>(
+                                 g_reservation_margin_mb.load(
+                                     std::memory_order_relaxed)) *
+                                 1024 * 1024 <=
+                         capacity - req_bytes)
+                  : g_reserved_pending.load(std::memory_order_relaxed) >=
+                        delta;
+          if (admit) {
             g_granted.store(req_bytes, std::memory_order_relaxed);
             granted_after = req_bytes;
             g_reserved_pending.store(0, std::memory_order_relaxed);
             verdict = RESV_VERDICT_GRANT;
           }
-          // else: DENY — reservation canceled (or never made); the standby
-          // rolls back every rank and redoes both phases.
         }
         reserved_after = g_reserved_pending.load(std::memory_order_relaxed);
       }
@@ -1478,6 +1493,13 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
   m.def("get_reservation_margin_mb", []() {
     return leto::g_reservation_margin_mb.load(std::memory_order_relaxed);
   });
+
+  // Ablation: single-phase protocol (GRANT commits directly, no reservation
+  // required). Default off = two-phase.
+  m.def(
+      "set_grant_only",
+      [](bool v) { leto::g_grant_only.store(v, std::memory_order_relaxed); },
+      py::arg("v"));
 
   m.def("is_broker_running", []() {
     return leto::g_broker_running.load(std::memory_order_acquire);
