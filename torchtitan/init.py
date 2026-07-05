@@ -875,6 +875,18 @@ def eager_init_nccl_loss(ctx: InitContext) -> None:
     _eager_init_mesh(ctx, "loss")
 
 def warmup_stages(ctx: InitContext) -> None:
+    # Stage warmup is a standby-side feature: it pre-warms allocator/kernels
+    # so a PROMOTED standby's first step is fast. The run's initial active is
+    # about to run real steps anyway — warming it up is ~13s of pure init
+    # cost. Skip it there, mirroring _nccl_eager_init_enabled; profile_init
+    # keeps today's behavior so the profiling environment is unchanged.
+    if (
+        _LETO_AVAILABLE
+        and not ctx.is_standby
+        and not ctx.job_config.leto.profile_init
+    ):
+        logger.info("[warmup] skipping stage warmup on non-standby active")
+        return
     maybe_warmup_stages(
         ctx.model_parts,
         ctx.job_config,
