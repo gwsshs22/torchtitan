@@ -1194,6 +1194,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 self._maybe_install_oom_safeguard()
 
+                # Miss-rate observability: the stop_broker atexit line never
+                # survives the crash-style exits real runs use, so surface
+                # the counters in-band (one line per rank every 32 steps).
+                if self._oom_safeguard_installed and self.step % 32 == 0:
+                    try:
+                        from torchtitan.components.mem import _module as _mem_mod
+                        if _mem_mod is not None:
+                            misses, fast = _mem_mod.get_fmcb_miss_stats()
+                            logger.info(
+                                f"fmcb stats step={self.step}: misses={misses} "
+                                f"fast_exits={fast}"
+                            )
+                    except Exception:
+                        pass
+
 
         # Wait for any pending checkpoint tracking to complete
         if hasattr(self, "checkpointer") and self.checkpointer:
