@@ -1176,6 +1176,25 @@ def _run_progressive_sequence(
     # test_reservation.py, not at runtime, so the standby stays pure-Python.)
     standby_register(rank)
 
+    # DIAGNOSTIC (env-gated, default off) for the standby steady-overhead
+    # investigation (awsexps/measure_mem/fix_overhead). LETO_STATE_NOPOLL: build
+    # all CPU (0-delta) init tasks unconditionally — same resident state as a
+    # margin-parked standby — then just SLEEP (no RESERVE / gloo / status poll).
+    # Isolates "held state" from "the try_advance polling machinery". Result:
+    # state-alone ≈ base; state + polling (any frequency) = +21ms. The run must
+    # have no fault (the standby is never promoted here).
+    if os.environ.get("LETO_STATE_NOPOLL"):
+        for name in ordered_names:
+            if deltas.get(name, 0.0) >= threshold_mb:
+                break  # stop at the first GPU task (no CUDA context built)
+            name_to_fn[name](ctx)
+        logger.info(
+            f"[progressive] rank={rank} STATE_NOPOLL: CPU state built, "
+            f"sleeping (no reservation handshake / gloo / status poll)"
+        )
+        while True:
+            time.sleep(30.0)
+
     activated = False
     cumulative_mb = 0.0  # running target footprint of reserved tasks so far
     for name in ordered_names:
@@ -1206,7 +1225,12 @@ def _run_progressive_sequence(
                     # negligible (immediate retries ran continuously during
                     # the 2026-07 AWS runs). Promotion stays responsive: the
                     # next _reserve poll runs status_check within ~1s.
-                    time.sleep(1.0)
+                    # DIAGNOSTIC (env-gated, default 1.0): LETO_PARK_RETRY_S
+                    # overrides the parked retry pacing. Used to show the
+                    # standby overhead is FREQUENCY-INDEPENDENT (10s retry gives
+                    # the same +21ms as 1s — verified via DENY-line spacing).
+                    # Longer = fewer wakeups but slower promotion.
+                    time.sleep(float(os.environ.get("LETO_PARK_RETRY_S", "1.0")))
                     continue
                 if outcome == "status":
                     if extra == STANDBY_ACTION_ACTIVATE:
