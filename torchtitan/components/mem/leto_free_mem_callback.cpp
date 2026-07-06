@@ -112,6 +112,74 @@ static int64_t request_physical_ub(int64_t req) {
   return std::max((r + page - 1) / page * page, kLargeBuffer);
 }
 
+// ---- fmcb timing instrumentation (leto.fmcb_timing) --------------------
+// Per-component wall-time + call counts for the OOM-safeguard callback, to
+// attribute the standby steady-state tax to a specific sub-op (NVML calls vs
+// the allocator-snapshot walks). ZERO overhead when off: every probe is
+// gated on g_fmcb_timing and skips the clock reads. Read as a group by
+// get_fmcb_timing(); Python logs the cumulative dict per step and an offline
+// script diffs consecutive steps and buckets by step%8 (the drain step is
+// step%8==2). Placed above the walk functions so it is in scope for them.
+static std::atomic<int64_t> g_fmcb_timing{0};        // 0=off 1=on
+
+static inline int64_t mono_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+static inline void atomic_max_i64(std::atomic<int64_t>& a, int64_t v) {
+  int64_t prev = a.load(std::memory_order_relaxed);
+  while (v > prev &&
+         !a.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {
+  }
+}
+
+// Cumulative ns sums (all training-thread work inside Execute()).
+static std::atomic<int64_t> g_t_exec_ns{0};          // whole Execute()
+static std::atomic<int64_t> g_t_meminfo_ns{0};       // nvmlDeviceGetMemoryInfo_v2
+static std::atomic<int64_t> g_t_procs_ns{0};         // nvmlDeviceGetComputeRunningProcesses
+static std::atomic<int64_t> g_t_reuse_ns{0};         // tail_reuse_bytes (whole)
+static std::atomic<int64_t> g_t_reuse_snap_ns{0};    //   its snapshot()
+static std::atomic<int64_t> g_t_release_ns{0};       // releasable_lower_bound (whole)
+static std::atomic<int64_t> g_t_release_snap_ns{0};  //   its snapshot()
+// Counts.
+static std::atomic<int64_t> g_n_full{0};             // full-path (fresh-read) Execute()s
+static std::atomic<int64_t> g_n_reuse{0};            // tail_reuse_bytes calls
+static std::atomic<int64_t> g_n_release{0};          // releasable_lower_bound calls
+static std::atomic<int64_t> g_n_req_zero{0};         // request_bytes == 0
+static std::atomic<int64_t> g_n_req_lt1{0};          // 0 < req < 1 MiB
+static std::atomic<int64_t> g_n_req_1_64{0};         // 1 MiB <= req < 64 MiB
+static std::atomic<int64_t> g_n_req_ge64{0};         // req >= 64 MiB (reuse-walk gate)
+// Maxima (worst single event).
+static std::atomic<int64_t> g_max_exec_ns{0};
+static std::atomic<int64_t> g_max_reuse_ns{0};
+static std::atomic<int64_t> g_max_req_bytes{0};
+
+// RAII total-Execute timer (covers every return path).
+struct ExecTimer {
+  bool on;
+  int64_t t0;
+  explicit ExecTimer(bool o) : on(o), t0(o ? mono_ns() : 0) {}
+  ~ExecTimer() {
+    if (on) {
+      const int64_t d = mono_ns() - t0;
+      g_t_exec_ns.fetch_add(d, std::memory_order_relaxed);
+      atomic_max_i64(g_max_exec_ns, d);
+    }
+  }
+};
+
+static void reset_fmcb_timing_counters() {
+  for (std::atomic<int64_t>* p :
+       {&g_t_exec_ns, &g_t_meminfo_ns, &g_t_procs_ns, &g_t_reuse_ns,
+        &g_t_reuse_snap_ns, &g_t_release_ns, &g_t_release_snap_ns, &g_n_full,
+        &g_n_reuse, &g_n_release, &g_n_req_zero, &g_n_req_lt1, &g_n_req_1_64,
+        &g_n_req_ge64, &g_max_exec_ns, &g_max_reuse_ns, &g_max_req_bytes}) {
+    p->store(0, std::memory_order_relaxed);
+  }
+}
+// ------------------------------------------------------------------------
+
 // Sound lower bound on the bytes release_cached_blocks()/emptyCache() can
 // return to the driver right now, replaying the allocator's release logic
 // over snapshot(): a non-expandable segment frees iff nothing in it is
@@ -123,7 +191,11 @@ static int64_t request_physical_ub(int64_t req) {
 // unreleasable, keeping this an under-estimate. snapshot() re-takes the
 // recursive device allocator lock — safe from every caller here.
 static int64_t releasable_lower_bound(c10::DeviceIndex device) {
+  const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+  const int64_t _ts = _tmg ? mono_ns() : 0;
   const auto snap = c10::cuda::CUDACachingAllocator::snapshot();
+  if (_tmg)
+    g_t_release_snap_ns.fetch_add(mono_ns() - _ts, std::memory_order_relaxed);
   const int64_t large_page = static_cast<int64_t>(
       c10::CachingAllocator::AcceleratorAllocatorConfig::large_segment_size());
   constexpr int64_t small_page = int64_t{2} << 20;  // kSmallBuffer
@@ -173,7 +245,11 @@ static int64_t releasable_lower_bound(c10::DeviceIndex device) {
 // (~1.8 ms at 18k blocks), paid only for requests >= kReuseWalkMinRequest.
 static int64_t tail_reuse_bytes(
     c10::DeviceIndex device, cudaStream_t stream, bool small_pool) {
+  const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+  const int64_t _ts = _tmg ? mono_ns() : 0;
   const auto snap = c10::cuda::CUDACachingAllocator::snapshot();
+  if (_tmg)
+    g_t_reuse_snap_ns.fetch_add(mono_ns() - _ts, std::memory_order_relaxed);
   const int64_t large_page = static_cast<int64_t>(
       c10::CachingAllocator::AcceleratorAllocatorConfig::large_segment_size());
   constexpr int64_t small_page = int64_t{2} << 20;  // kSmallBuffer
@@ -482,6 +558,8 @@ static bool resolve_nvml_handle(nvmlDevice_t* out) {
 static bool read_nvml_mem(nvmlDevice_t handle, int target_pid,
                           int64_t* free_b_out, int64_t* total_b_out,
                           int64_t* pid_used_b_out) {
+  const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+  const int64_t _tmi = _tmg ? mono_ns() : 0;
 #if defined(NVML_API_VERSION) && NVML_API_VERSION >= 12
   nvmlMemory_v2_t mem;
   mem.version = nvmlMemory_v2;
@@ -490,6 +568,8 @@ static bool read_nvml_mem(nvmlDevice_t handle, int target_pid,
   nvmlMemory_t mem;
   nvmlReturn_t nerr = nvmlDeviceGetMemoryInfo(handle, &mem);
 #endif
+  if (_tmg)
+    g_t_meminfo_ns.fetch_add(mono_ns() - _tmi, std::memory_order_relaxed);
   if (nerr != NVML_SUCCESS) {
     leto_log("broker nvmlDeviceGetMemoryInfo failed: %s",
              nvmlErrorString(nerr));
@@ -504,11 +584,14 @@ static bool read_nvml_mem(nvmlDevice_t handle, int target_pid,
     std::vector<nvmlProcessInfo_t> procs(16);
     unsigned int count = static_cast<unsigned int>(procs.size());
     nvmlReturn_t r;
+    const int64_t _tp = _tmg ? mono_ns() : 0;
     while ((r = nvmlDeviceGetComputeRunningProcesses(
                 handle, &count, procs.data())) ==
            NVML_ERROR_INSUFFICIENT_SIZE) {
       procs.resize(count);
     }
+    if (_tmg)
+      g_t_procs_ns.fetch_add(mono_ns() - _tp, std::memory_order_relaxed);
     if (r != NVML_SUCCESS) {
       leto_log("broker nvmlDeviceGetComputeRunningProcesses failed: %s",
                nvmlErrorString(r));
@@ -621,9 +704,17 @@ static bool compute_used_estimate(nvmlDevice_t handle, int target_pid,
     if (request_bytes >= kReuseWalkMinRequest) {
       try {
         const bool small_pool = request_bytes <= (int64_t{1} << 20);
+        const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+        const int64_t _tw = _tmg ? mono_ns() : 0;
         reuse_b = tail_reuse_bytes(
             c10::cuda::current_device(),
             c10::cuda::getCurrentCUDAStream().stream(), small_pool);
+        if (_tmg) {
+          const int64_t _d = mono_ns() - _tw;
+          g_t_reuse_ns.fetch_add(_d, std::memory_order_relaxed);
+          g_n_reuse.fetch_add(1, std::memory_order_relaxed);
+          atomic_max_i64(g_max_reuse_ns, _d);
+        }
       } catch (const std::exception& e) {
         // Snapshot unavailable -> no reuse credit (conservative).
         leto_log("tail_reuse_bytes failed: %s", e.what());
@@ -638,7 +729,13 @@ static bool compute_used_estimate(nvmlDevice_t handle, int target_pid,
     if (req_charge > free_b) {
       int64_t releasable_b = 0;
       try {
+        const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+        const int64_t _tr = _tmg ? mono_ns() : 0;
         releasable_b = releasable_lower_bound(c10::cuda::current_device());
+        if (_tmg) {
+          g_t_release_ns.fetch_add(mono_ns() - _tr, std::memory_order_relaxed);
+          g_n_release.fetch_add(1, std::memory_order_relaxed);
+        }
       } catch (const std::exception& e) {
         // Walk unavailable -> assume nothing releasable (conservative).
         leto_log("releasable_lower_bound failed: %s", e.what());
@@ -1063,6 +1160,19 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
     const int target_pid = g_standby_pid.load(std::memory_order_relaxed);
 
     g_num_misses.fetch_add(1, std::memory_order_relaxed);
+    const bool _tmg = g_fmcb_timing.load(std::memory_order_relaxed) != 0;
+    ExecTimer _exec_timer(_tmg);  // times the whole Execute() on any return
+    if (_tmg) {
+      if (request_b <= 0)
+        g_n_req_zero.fetch_add(1, std::memory_order_relaxed);
+      else if (request_b < (int64_t{1} << 20))
+        g_n_req_lt1.fetch_add(1, std::memory_order_relaxed);
+      else if (request_b < kReuseWalkMinRequest)
+        g_n_req_1_64.fetch_add(1, std::memory_order_relaxed);
+      else
+        g_n_req_ge64.fetch_add(1, std::memory_order_relaxed);
+      atomic_max_i64(g_max_req_bytes, request_b);
+    }
     const int64_t ttl_ms = g_est_ttl_ms.load(std::memory_order_relaxed);
     if (ttl_ms > 0) {
       const int64_t age_ms =
@@ -1134,6 +1244,7 @@ struct LetoFreeMemCallback final : public c10::FreeMemoryCallback {
       }
     }
 
+    if (_tmg) g_n_full.fetch_add(1, std::memory_order_relaxed);
     int64_t est = 0, nvml_free = 0, total_b = 0, standby_actual = 0;
     nvmlDevice_t handle{};
     if (!resolve_nvml_handle(&handle) ||
@@ -1607,6 +1718,46 @@ PYBIND11_MODULE(leto_free_mem_callback, m) {
     return py::make_tuple(
         leto::g_num_misses.load(std::memory_order_relaxed),
         leto::g_num_fast_exits.load(std::memory_order_relaxed));
+  });
+
+  // Per-component timing instrumentation (leto.fmcb_timing).
+  m.def(
+      "set_fmcb_timing",
+      [](bool on) {
+        leto::g_fmcb_timing.store(on ? 1 : 0, std::memory_order_relaxed);
+      },
+      py::arg("on"));
+  m.def("reset_fmcb_timing", []() { leto::reset_fmcb_timing_counters(); });
+  m.def("get_fmcb_timing", []() {
+    auto ld = [](std::atomic<int64_t>& a) {
+      return a.load(std::memory_order_relaxed);
+    };
+    py::dict d;
+    // counts
+    d["n_exec"] = static_cast<int64_t>(
+        leto::g_num_misses.load(std::memory_order_relaxed));
+    d["n_fast"] = static_cast<int64_t>(
+        leto::g_num_fast_exits.load(std::memory_order_relaxed));
+    d["n_full"] = ld(leto::g_n_full);
+    d["n_reuse"] = ld(leto::g_n_reuse);
+    d["n_release"] = ld(leto::g_n_release);
+    d["n_req_zero"] = ld(leto::g_n_req_zero);
+    d["n_req_lt1"] = ld(leto::g_n_req_lt1);
+    d["n_req_1_64"] = ld(leto::g_n_req_1_64);
+    d["n_req_ge64"] = ld(leto::g_n_req_ge64);
+    // ns sums
+    d["ns_exec"] = ld(leto::g_t_exec_ns);
+    d["ns_meminfo"] = ld(leto::g_t_meminfo_ns);
+    d["ns_procs"] = ld(leto::g_t_procs_ns);
+    d["ns_reuse"] = ld(leto::g_t_reuse_ns);
+    d["ns_reuse_snap"] = ld(leto::g_t_reuse_snap_ns);
+    d["ns_release"] = ld(leto::g_t_release_ns);
+    d["ns_release_snap"] = ld(leto::g_t_release_snap_ns);
+    // maxima
+    d["max_exec_ns"] = ld(leto::g_max_exec_ns);
+    d["max_reuse_ns"] = ld(leto::g_max_reuse_ns);
+    d["max_req_bytes"] = ld(leto::g_max_req_bytes);
+    return d;
   });
 
   // Ablation: single-phase protocol (GRANT commits directly, no reservation

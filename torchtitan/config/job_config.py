@@ -1154,14 +1154,36 @@ class Leto:
     """Tasks with delta_mb below this threshold are treated as CPU-only and
     bypass the gated wait under progressive_init."""
 
-    fmcb_est_ttl_ms: int = 100
+    fmcb_est_ttl_ms: int = 0
     """Estimate-cache TTL (ms) for the OOM-safeguard FreeMemoryCallback. An
     allocator cache miss re-reads NVML (and walks the allocator snapshot)
     only when the cached component snapshot is older than this, or when a
     conservative screen of the cached values signals possible
     cancellation/pressure — CANCEL/KILL always re-read fresh. 0 = read NVML
     on every miss (the pre-cache behavior; costs ~1% steady-state at MoE
-    cache-miss rates)."""
+    cache-miss rates).
+
+    DEFAULT DISABLED (0) pending the steady-state overhead breakdown: the
+    cache empirically removes ~86% of the parked-standby tax at ttl=60000,
+    but the breakdown showed the dominant cost is the allocator-snapshot
+    WALK inside the callback's full path (not the NVML read the cache was
+    named for), and that attribution is not yet fully confirmed. Keeping
+    the default at 0 means every run uses the original, understood per-miss
+    behavior; re-enable (e.g. 100) only once the breakdown is settled. The
+    fast-path code in leto_free_mem_callback.cpp is dormant while ttl=0."""
+
+    fmcb_timing: bool = False
+    """Enable per-component wall-time instrumentation inside the OOM-safeguard
+    FreeMemoryCallback (diagnostic; default off, zero overhead when off). When
+    on, the callback accumulates ns-sums and call-counts for each sub-op — the
+    two NVML calls (memoryinfo, computeprocs), each allocator-snapshot walk
+    (tail_reuse_bytes, releasable_lower_bound) and the snapshot() inside it —
+    plus a request-size histogram and the whole-Execute() total. train.py logs
+    the cumulative counters once per step (`fmcb_timing step=N {json}`);
+    awsexps/measure_mem/steady/analyze_fmcb_timing.py diffs consecutive steps
+    and buckets by step%8 to attribute the drain-step (step%8==2) overhead.
+    Pair with fmcb_est_ttl_ms=0 so every miss takes the full path (clean
+    sampling of the walk/NVML costs)."""
 
     fault_injection_step_enabled: bool = False
     """Enable step-based fault injection (worker self-injects faults at specific steps)."""

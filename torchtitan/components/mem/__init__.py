@@ -174,7 +174,8 @@ def install_reservation_broker(
     margin_mb: int,
     kill_callback: Optional[Callable[[], tuple]] = None,
     grant_only: bool = False,
-    est_ttl_ms: int = 100,
+    est_ttl_ms: int = 0,  # disabled by default; see Leto.fmcb_est_ttl_ms
+    timing: bool = False,  # per-component callback timing; see Leto.fmcb_timing
 ) -> None:
     """Active-side setup for standby memory reservation.
 
@@ -211,6 +212,11 @@ def install_reservation_broker(
     # Estimate-cache TTL for the per-miss FreeMemoryCallback (0 = read NVML
     # on every allocator cache miss, the pre-cache behavior).
     m.set_est_ttl_ms(int(est_ttl_ms))
+    # Per-component wall-time instrumentation for the callback (diagnostic;
+    # zero overhead when off). Reset counters so the run starts clean.
+    m.set_fmcb_timing(bool(timing))
+    if bool(timing):
+        m.reset_fmcb_timing()
     # Ablation (leto.progressive_protocol=grant_only): GRANT commits
     # directly against the estimate, no reservation phase.
     m.set_grant_only(bool(grant_only))

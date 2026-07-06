@@ -997,6 +997,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             install_reservation_broker(
                 ledger_path, margin_mb, _on_oom, grant_only=_grant_only,
                 est_ttl_ms=int(leto_cfg.fmcb_est_ttl_ms),
+                timing=bool(getattr(leto_cfg, "fmcb_timing", False)),
             )
 
             # RMP-server allocations (e.g. lazy gradient-persistence tensors
@@ -1205,6 +1206,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             logger.info(
                                 f"fmcb stats step={self.step}: misses={misses} "
                                 f"fast_exits={fast}"
+                            )
+                    except Exception:
+                        pass
+
+                # Per-component callback timing (leto.fmcb_timing): dump the
+                # cumulative counters every step so the offline analyzer can
+                # diff consecutive steps and bucket by step%8. Cheap (a few
+                # atomic loads); only active when fmcb_timing is set.
+                if (self._oom_safeguard_installed
+                        and getattr(self.job_config.leto, "fmcb_timing", False)):
+                    try:
+                        import json as _json
+                        from torchtitan.components.mem import _module as _mem_mod
+                        if _mem_mod is not None:
+                            _d = _mem_mod.get_fmcb_timing()
+                            try:
+                                _r = torch.distributed.get_rank()
+                            except Exception:
+                                _r = -1
+                            logger.info(
+                                f"fmcb_timing rank={_r} step={self.step} "
+                                f"{_json.dumps(_d, sort_keys=True)}"
                             )
                     except Exception:
                         pass
