@@ -60,6 +60,11 @@ static const char* leto_rank() {
 // Single-write log line "[leto r<rank> HH:MM:SS.mmm] <msg>" so concurrent
 // ranks' lines don't shear inside the shared stderr pipe.
 static void leto_log(const char* fmt, ...) {
+  // LETO_QUIET=1 mutes all broker/callback stderr logging (DENY/CANCEL/budget/
+  // fmcb-stats) — for measuring the standby's step-time overhead without the
+  // NFS-log-write confound. Read once (thread-safe static init).
+  static const bool quiet = (std::getenv("LETO_QUIET") != nullptr);
+  if (quiet) return;
   char msg[1024];
   va_list ap;
   va_start(ap, fmt);
