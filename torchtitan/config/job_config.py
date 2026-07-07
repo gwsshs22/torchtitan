@@ -1129,7 +1129,7 @@ class Leto:
     workspaces). Bump it if the active OOMs from un-brokered allocations the
     broker can't see."""
 
-    progressive_poll_interval_ms: int = 10
+    progressive_poll_interval_ms: int = 100
     """Standby poll interval (ms) while waiting for a reservation verdict."""
 
     progressive_protocol: str = "two_phase"
