@@ -1184,16 +1184,41 @@ def _run_progressive_sequence(
     # state-alone ≈ base; state + polling (any frequency) = +21ms. The run must
     # have no fault (the standby is never promoted here).
     if os.environ.get("LETO_STATE_NOPOLL"):
-        for name in ordered_names:
-            if deltas.get(name, 0.0) >= threshold_mb:
-                break  # stop at the first GPU task (no CUDA context built)
-            name_to_fn[name](ctx)
+        nostate = bool(os.environ.get("LETO_NOPOLL_NOSTATE"))
+        if not nostate:
+            for name in ordered_names:
+                if deltas.get(name, 0.0) >= threshold_mb:
+                    break  # stop at the first GPU task (no CUDA context built)
+                name_to_fn[name](ctx)
+        # ADDITIVE ISOLATION (env-gated) for the standby-overhead investigation
+        # (awsexps/measure_mem/fix_overhead). With the SAME resident CPU state as
+        # a margin-parked standby (unless LETO_NOPOLL_NOSTATE), drive exactly ONE
+        # component of the try_advance machinery in a loop, to see which flips the
+        # active's per-step overhead on. Complements statenopoll's pure sleep.
+        #   LETO_NOPOLL_MODE = sleep(default) | gloo | status | reserve
+        #   LETO_PARK_RETRY_S (existing) = loop cadence, default 1.0s
+        from torchtitan.components.init.progressive import (
+            _reduce_status_ok, _request, REQ_RESERVE,
+        )
+        nopoll_mode = os.environ.get("LETO_NOPOLL_MODE", "sleep")
+        cadence = float(os.environ.get("LETO_PARK_RETRY_S", "1.0"))
+        # cumulative footprint a real parked standby RESERVEs (its first GPU task)
+        cum_mb = next((deltas.get(n, 0.0) for n in ordered_names
+                       if deltas.get(n, 0.0) >= threshold_mb), 0.0)
+        cum_bytes = int(cum_mb * 1024 * 1024)
         logger.info(
-            f"[progressive] rank={rank} STATE_NOPOLL: CPU state built, "
-            f"sleeping (no reservation handshake / gloo / status poll)"
+            f"[progressive] rank={rank} STATE_NOPOLL mode={nopoll_mode} "
+            f"nostate={nostate} cadence={cadence}s cum_mb={cum_mb:.1f}: isolating"
         )
         while True:
-            time.sleep(30.0)
+            if nopoll_mode == "gloo":
+                _reduce_status_ok(ctx.standby_gloo_pg, 0, 1)  # 2 all_reduces
+            elif nopoll_mode == "status":
+                if _status_check() == STANDBY_ACTION_TERMINATE:
+                    os._exit(0)
+            elif nopoll_mode == "reserve":
+                _request(rank, REQ_RESERVE, cum_bytes, poll_s, status_check=None)
+            time.sleep(cadence)
 
     activated = False
     cumulative_mb = 0.0  # running target footprint of reserved tasks so far
