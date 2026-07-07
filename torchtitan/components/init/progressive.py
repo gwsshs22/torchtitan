@@ -232,8 +232,6 @@ def try_advance(
     poll_interval_s: float,
     status_check: Optional[StatusCheck] = None,
     protocol: str = "two_phase",
-    over_budget: bool = False,
-    request_cum_mb: Optional[float] = None,
 ) -> Tuple[str, Optional[int]]:
     """Decide, across all standby ranks, whether the next task can advance —
     TWO-PHASE: (1) every rank RESERVEs (soft, cancellable by the active's
@@ -248,25 +246,15 @@ def try_advance(
     and skip both phases locally, but still join every reduce. Caller loops
     on "retry".
 
-    Reconciliation (standby-overhead root-cause fix): `over_budget=True` means
-    this rank's MEASURED physical usage exceeds its broker grant (profiled
-    deltas under-count the CUDA context, and tasks profiled 0-delta in baseline
-    order allocate for real in solver order). An over-budget rank must NOT take
-    the tiny bypass — it runs the full two-phase protocol to legalize what it
-    already holds (a corrective grant), and a denial parks the whole group.
-    `request_cum_mb` overrides the cumulative the broker is asked for (the
-    honest measured+delta target rather than the profiled sum).
-
     Returns:
       ("advance", None) — all ranks committed; run the task
       ("retry",   None) — denied at some phase; poll again
       ("status",  code) — status_check tripped (ACTIVATE / TERMINATE)
     """
     rank = int(os.environ.get("RANK", "0"))
-    req_cum_mb = cumulative_mb if request_cum_mb is None else request_cum_mb
-    cum_bytes = int(req_cum_mb * 1024 * 1024)
-    prev_cum_bytes = max(0, int((req_cum_mb - delta_mb) * 1024 * 1024))
-    tiny = delta_mb < threshold_mb and not over_budget
+    cum_bytes = int(cumulative_mb * 1024 * 1024)
+    prev_cum_bytes = max(0, int((cumulative_mb - delta_mb) * 1024 * 1024))
+    tiny = delta_mb < threshold_mb
 
     # SUBTRACTIVE ABLATION (env-gated, default off) for the standby-overhead
     # root-cause (awsexps/measure_mem/fix_overhead). Remove ONE component from the
