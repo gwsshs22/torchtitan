@@ -256,12 +256,32 @@ def try_advance(
     prev_cum_bytes = max(0, int((cumulative_mb - delta_mb) * 1024 * 1024))
     tiny = delta_mb < threshold_mb
 
+    # SUBTRACTIVE ABLATION (env-gated, default off) for the standby-overhead
+    # root-cause (awsexps/measure_mem/fix_overhead). Remove ONE component from the
+    # FULL parked loop to see which removal kills the active's per-step tax:
+    #   LETO_ABLATE=nogloo    — skip the cross-rank gloo all_reduce (local vote only)
+    #   LETO_ABLATE=noreserve — skip the broker RESERVE handshake (behave as denied,
+    #                           so ranks reach the gloo with no RESERVE-latency spread)
+    #   LETO_ABLATE=nostatus  — skip the status gRPC inside the reserve wait
+    # (comma-separable). Default "" == unchanged behavior.
+    _ablate = os.environ.get("LETO_ABLATE", "")
+    _no_gloo = "nogloo" in _ablate
+    _no_resv = "noreserve" in _ablate
+    _no_stat = "nostatus" in _ablate
+
+    def _reduce(ls: int, lo: int) -> Tuple[int, bool]:
+        if _no_gloo:
+            return int(ls), int(lo) == 1  # skip the collective; local vote only
+        return _reduce_status_ok(gloo_pg, ls, lo)
+
     def _phase(req_type: int) -> Tuple[int, int]:
         """Run one protocol phase locally; returns (local_status, local_ok)."""
         if tiny:
             return 0, 1  # tiny / CPU-only task: no reservation needed
+        if _no_resv:
+            return 0, 0  # ablate broker handshake; behave as denied (no RESERVE lat)
         kind, code = _request(rank, req_type, cum_bytes, poll_interval_s,
-                              status_check)
+                              None if _no_stat else status_check)
         if kind == "status":
             return int(code), 0
         logger.debug(
@@ -276,8 +296,7 @@ def try_advance(
     # pre-two-phase behavior, kept to measure the protocol's impact.
     if protocol == "grant_only":
         local_status, local_ok = _phase(REQ_GRANT)
-        global_status, all_ok = _reduce_status_ok(gloo_pg, local_status,
-                                                  local_ok)
+        global_status, all_ok = _reduce(local_status, local_ok)
         if global_status > 0:
             return ("status", global_status)
         return ("advance" if all_ok else "retry", None)
@@ -287,7 +306,7 @@ def try_advance(
     # allocated) and self-cleaning (the callback cancels them under
     # pressure); the retry re-RESERVEs idempotently.
     local_status, local_ok = _phase(REQ_RESERVE)
-    global_status, all_ok = _reduce_status_ok(gloo_pg, local_status, local_ok)
+    global_status, all_ok = _reduce(local_status, local_ok)
     if global_status > 0:
         return ("status", global_status)
     if not all_ok:
@@ -296,7 +315,7 @@ def try_advance(
     # Phase 2 — GRANT on every rank (allowed only while the reservation is
     # alive; a cancellation in between shows up as a deny here).
     local_status, local_ok = _phase(REQ_GRANT)
-    global_status, all_ok = _reduce_status_ok(gloo_pg, local_status, local_ok)
+    global_status, all_ok = _reduce(local_status, local_ok)
     if global_status > 0:
         return ("status", global_status)
     if all_ok:
@@ -313,7 +332,7 @@ def try_advance(
                               poll_interval_s, status_check)
         if kind == "status":
             local_status = int(code)
-    global_status, _ = _reduce_status_ok(gloo_pg, local_status, 1)
+    global_status, _ = _reduce(local_status, 1)
     if global_status > 0:
         return ("status", global_status)
     return ("retry", None)
