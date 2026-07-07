@@ -1100,6 +1100,47 @@ def _device_free_mb() -> float | None:
         return None
 
 
+def _self_used_mb() -> float:
+    """ACTUAL physical MiB this process holds on its GPU, via pynvml per-pid
+    (0.0 if no CUDA context yet, or on any NVML failure).
+
+    This is the standby's reconciliation measurement: profiled deltas
+    systematically under-count the CUDA context (measured 791MiB actual vs 414
+    profiled) and tasks profiled as 0-delta in BASELINE order (eager_init_nccl_*)
+    allocate real memory in SOLVER order. Comparing this against the broker-
+    granted cumulative catches every such underestimate one task late, before
+    it can compound. Per-pid (not device-free) so the ACTIVE's concurrent
+    allocations can't contaminate the measurement."""
+    try:
+        from pynvml import (
+            nvmlDeviceGetComputeRunningProcesses,
+            nvmlDeviceGetHandleByIndex,
+            nvmlInit,
+        )
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cvd.strip():
+            visible = [int(d) for d in cvd.split(",") if d.strip()]
+            phys = visible[local_rank] if local_rank < len(visible) else local_rank
+        else:
+            phys = local_rank
+        nvmlInit()
+        me = os.getpid()
+        for p in nvmlDeviceGetComputeRunningProcesses(
+            nvmlDeviceGetHandleByIndex(phys)
+        ):
+            if int(p.pid) == me:
+                used = p.usedGpuMemory
+                # NVML reports (ull)-1 when per-process memory is unavailable.
+                if used is not None and used != 2**64 - 1:
+                    return used / (1024 * 1024)
+                return 0.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+
 def _run_progressive_sequence(
     ctx: InitContext,
     sequence: list[Callable[[InitContext], None]],
@@ -1222,26 +1263,65 @@ def _run_progressive_sequence(
 
     activated = False
     cumulative_mb = 0.0  # running target footprint of reserved tasks so far
+    # Reconciliation state (standby-overhead root-cause fix): granted_cum is
+    # the broker-granted cumulative for THIS rank; seen_gpu_task marks whether
+    # the CUDA context exists yet (the first gated task's effective delta gets
+    # the ctx floor). _RECON_SLACK_MB absorbs NVML rounding / tiny driver
+    # allocations so reconciliation only trips on real underestimates.
+    _RECON_SLACK_MB = 64.0
+    ctx_floor_mb = float(
+        getattr(job_config.leto, "progressive_cuda_ctx_floor_mb", 0) or 0
+    )
+    granted_cum = 0.0
+    seen_gpu_task = False
     for name in ordered_names:
         if not activated:
             delta_mb = deltas.get(name, 0.0)
-            if delta_mb >= threshold_mb:
+            gated = delta_mb >= threshold_mb
+            eff_delta = delta_mb
+            if gated and not seen_gpu_task and ctx_floor_mb > 0:
+                # First CUDA-boundary task: profiled delta misses the lazily
+                # created context (791 actual vs 414 profiled) — ask for the
+                # honest amount so the broker can't grant what the device
+                # can't afford.
+                eff_delta = max(delta_mb, ctx_floor_mb)
+            if gated:
                 cumulative_mb += delta_mb
             logger.info(
                 f"[progressive] rank={rank} next_task={name} "
                 f"delta_mb={delta_mb:.1f} cumulative_mb={cumulative_mb:.1f}"
             )
             while True:
+                # Reconcile MEASURED usage against the grant before EVERY task
+                # (tiny included): stale 0-delta tasks (eager_init_nccl_* in
+                # solver order) and ctx under-counts otherwise allocate past
+                # the broker unnoticed, and the resulting overdraft is what
+                # kills the standby / OOMs the active.
+                actual_mb = _self_used_mb()
+                over_budget = actual_mb > granted_cum + _RECON_SLACK_MB
+                base_mb = max(granted_cum, actual_mb)
+                request_cum = base_mb + (eff_delta if gated else 0.0)
+                if over_budget:
+                    logger.info(
+                        f"[progressive] rank={rank} over budget before "
+                        f"task={name}: actual={actual_mb:.0f}MiB > "
+                        f"granted={granted_cum:.0f}MiB; requesting corrective "
+                        f"grant of {request_cum:.0f}MiB"
+                    )
                 outcome, extra = try_advance(
                     ctx.standby_gloo_pg,
-                    delta_mb,
+                    eff_delta,
                     cumulative_mb,
                     threshold_mb,
                     poll_s,
                     status_check=_status_check,
                     protocol=str(ctx.job_config.leto.progressive_protocol),
+                    over_budget=over_budget,
+                    request_cum_mb=request_cum,
                 )
                 if outcome == "advance":
+                    granted_cum = request_cum
+                    seen_gpu_task = seen_gpu_task or gated
                     break
                 if outcome == "retry":
                     # A denied reservation cannot succeed until the active's

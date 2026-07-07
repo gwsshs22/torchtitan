@@ -1154,6 +1154,16 @@ class Leto:
     """Tasks with delta_mb below this threshold are treated as CPU-only and
     bypass the gated wait under progressive_init."""
 
+    progressive_cuda_ctx_floor_mb: int = 768
+    """Effective-delta floor (MiB) for the standby's FIRST gated GPU task
+    (the one that creates the CUDA context). Profiled deltas systematically
+    under-count the context (measured 791MiB actual vs 414 profiled on
+    A100-40GB), so admission at that boundary uses max(profiled_delta, floor).
+    Without this the broker grants a standby it cannot afford, the standby
+    allocates, and the active either OOMs or reclaim-kills it — a kill →
+    relaunch churn that costs the active +6..+230 ms/step (see
+    awsexps/measure_mem/fix_overhead/HANDOFF.md). 0 disables (legacy)."""
+
     fmcb_est_ttl_ms: int = 0
     """Estimate-cache TTL (ms) for the OOM-safeguard FreeMemoryCallback. An
     allocator cache miss re-reads NVML (and walks the allocator snapshot)
