@@ -1289,8 +1289,24 @@ def _run_progressive_sequence(
                 cumulative_mb += delta_mb
             logger.info(
                 f"[progressive] rank={rank} next_task={name} "
-                f"delta_mb={delta_mb:.1f} cumulative_mb={cumulative_mb:.1f}"
+                f"delta_mb={delta_mb:.1f} cumulative_mb={cumulative_mb:.1f} "
+                f"granted={granted_cum:.0f} actual={_self_used_mb():.0f}MiB"
             )
+            # NVML's per-pid accounting lags a fresh CUDA context by more than
+            # the gap between tasks (measured: a check 1ms after
+            # activate_cuda_device returned read 0 and let eager_init_nccl_pp
+            # through ungated). After a gated task runs, wait (bounded) for the
+            # pid to appear before trusting the measurement.
+            if seen_gpu_task:
+                for _ in range(10):
+                    if _self_used_mb() > 0:
+                        break
+                    time.sleep(0.2)
+                else:
+                    logger.warning(
+                        f"[progressive] rank={rank} NVML never reported this "
+                        f"pid after a GPU task; reconciliation is blind"
+                    )
             while True:
                 # Reconcile MEASURED usage against the grant before EVERY task
                 # (tiny included): stale 0-delta tasks (eager_init_nccl_* in
