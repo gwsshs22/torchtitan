@@ -292,6 +292,22 @@ class SnapshotContainer:
                 logger.info("Received CLOSE command")
                 break
 
+        # The container's work is done: on PERSIST, _dump_states() has already
+        # flushed every checkpoint file (torch.save + metadata json all closed)
+        # to mem_fs synchronously above; on CLOSE there is nothing to keep. A
+        # normal return would hand control to the multiprocessing-spawn wrapper
+        # whose interpreter teardown (gc of the attached shm pool view, torch
+        # atexit, etc.) measured ~1.8s per rank — and the promotion path waits
+        # for THIS process to die before activating the standby, so that 1.8s
+        # lands directly on fault-recovery latency. The data is already durable,
+        # so exit immediately and let the kernel reclaim the mappings.
+        for h in list(logging.getLogger().handlers):
+            try:
+                h.flush()
+            except Exception:
+                pass
+        os._exit(0)
+
     @staticmethod
     def _poll_worker_controller_until_done():
         """Training process is gone. Poll worker controller for instructions."""
