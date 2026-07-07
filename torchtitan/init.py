@@ -1263,15 +1263,11 @@ def _run_progressive_sequence(
 
     activated = False
     cumulative_mb = 0.0  # running target footprint of reserved tasks so far
-    # Reconciliation state (standby-overhead root-cause fix): granted_cum is
-    # the broker-granted cumulative for THIS rank; seen_gpu_task marks whether
-    # the CUDA context exists yet (the first gated task's effective delta gets
-    # the ctx floor). _RECON_SLACK_MB absorbs NVML rounding / tiny driver
-    # allocations so reconciliation only trips on real underestimates.
+    # Reconciliation state: granted_cum is the broker-granted cumulative for
+    # THIS rank; seen_gpu_task marks whether the CUDA context exists yet.
+    # _RECON_SLACK_MB absorbs NVML rounding / tiny driver allocations so
+    # reconciliation only trips on real underestimates.
     _RECON_SLACK_MB = 64.0
-    ctx_floor_mb = float(
-        getattr(job_config.leto, "progressive_cuda_ctx_floor_mb", 0) or 0
-    )
     granted_cum = 0.0
     seen_gpu_task = False
     for name in ordered_names:
@@ -1279,12 +1275,6 @@ def _run_progressive_sequence(
             delta_mb = deltas.get(name, 0.0)
             gated = delta_mb >= threshold_mb
             eff_delta = delta_mb
-            if gated and not seen_gpu_task and ctx_floor_mb > 0:
-                # First CUDA-boundary task: profiled delta misses the lazily
-                # created context (791 actual vs 414 profiled) — ask for the
-                # honest amount so the broker can't grant what the device
-                # can't afford.
-                eff_delta = max(delta_mb, ctx_floor_mb)
             if gated:
                 cumulative_mb += delta_mb
             logger.info(
