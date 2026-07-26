@@ -182,12 +182,56 @@ class SnapshotContainer:
         response = self.output_queue.get()
         assert response == ('COMMIT', state_id)
 
+    # Longest we will wait for a CLOSE ack from a container that is still
+    # alive. Only a wedged container reaches this; a healthy one acks in ms.
+    CLOSE_ACK_TIMEOUT_S = 30.0
+
     def close(self):
-        if not self.closed:
-            self.closed = True
-            self.input_queue.put(('CLOSE', {}))
-            response = self.output_queue.get()
-            assert response == 'CLOSE'
+        if self.closed:
+            return
+        self.closed = True
+        self.input_queue.put(('CLOSE', {}))
+
+        # The container may have ALREADY exited under us: its poll loop breaks
+        # and os._exit()s the moment the WorkerController hands it PERSIST or
+        # CLOSE (see _subprocess_main), which races this call and leaves nobody
+        # to ack. An unbounded get() here wedges the training process forever --
+        # observed as a rank stuck in close() with a zombie container child,
+        # holding up the whole run's teardown. So wait for the ack, but stop as
+        # soon as the child is gone or the timeout expires.
+        deadline = time.monotonic() + self.CLOSE_ACK_TIMEOUT_S
+        while True:
+            try:
+                response = self.output_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self.process.is_alive():
+                    # Exited on the controller's instruction. Drain once more in
+                    # case it acked just before dying, then stop waiting.
+                    try:
+                        self.output_queue.get(timeout=0.2)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "SnapshotContainer already exited (controller-driven "
+                        "PERSIST/CLOSE); no CLOSE ack to wait for"
+                    )
+                    return
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Timed out after %.0fs waiting for the SnapshotContainer "
+                        "CLOSE ack; container still alive (pid=%s). Continuing "
+                        "shutdown.", self.CLOSE_ACK_TIMEOUT_S, self.process.pid
+                    )
+                    return
+                continue
+            except (EOFError, OSError) as e:
+                logger.info("SnapshotContainer queue closed during CLOSE (%s)", e)
+                return
+            if response == 'CLOSE':
+                return
+            # A late ack for an earlier command (REGISTER/COMMIT/...); skip it
+            # and keep waiting for ours.
+            logger.warning("Ignoring unexpected response while closing: %r", response)
 
     @staticmethod
     def _subprocess_main(
