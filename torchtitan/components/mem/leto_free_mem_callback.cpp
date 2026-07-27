@@ -859,7 +859,18 @@ static void broker_loop() {
         granted_before = g_granted.load(std::memory_order_relaxed);
         granted_after = granted_before;
         const int64_t delta = req_bytes - granted_before;
-        if (req_type == RESV_REQ_ROLLBACK) {
+        // TEMP DIAGNOSTIC: LETO_FMCB_ALWAYS_DENY=1 denies every RESERVE
+        // and GRANT (ROLLBACK still acked) so the standby parks at its
+        // first gated task, running the full two-phase retry machinery
+        // with zero GPU footprint (no CUDA context).
+        static const bool always_deny = []() {
+          const char* e = std::getenv("LETO_FMCB_ALWAYS_DENY");
+          return e != nullptr && e[0] == '1';
+        }();
+        if (always_deny && req_type != RESV_REQ_ROLLBACK) {
+          g_reserved_pending.store(0, std::memory_order_relaxed);
+          // verdict stays RESV_VERDICT_DENY
+        } else if (req_type == RESV_REQ_ROLLBACK) {
           // Abort the round: req_bytes = the pre-task cumulative. Lower a
           // unilateral phase-2 commit back to it and clear the soft claim.
           if (granted_before > req_bytes) {
