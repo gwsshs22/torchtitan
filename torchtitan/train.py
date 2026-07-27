@@ -1012,6 +1012,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 pass
 
 
+    def _resume_vote_pg(self):
+        """CPU (gloo) group for the rmp resume vote. Collective-ordering-safe:
+        every rank on the rmp path calls this at the same point in train()."""
+        if getattr(self, "_vote_pg", None) is None:
+            self._vote_pg = dist.new_group(backend="gloo")
+        return self._vote_pg
+
     @record
     def train(self):
         job_config = self.job_config
@@ -1029,10 +1036,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             has_md = self.rmp_manager.has_committed_metadata()
             local_step = self._resilient_opt.get_step() if has_md else 0
             buf = torch.tensor(
-                [0 if has_md else 1, local_step],
-                dtype=torch.int64, device=self.device,
+                [0 if has_md else 1, local_step], dtype=torch.int64,
             )
-            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            # Vote over gloo: an all_reduce on the default PG would create an
+            # extra world-size NCCL communicator (the no-fault path never
+            # creates one), which measurably degrades forward-collective
+            # arrival timing for the rest of the run (~1.3% steady state).
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=self._resume_vote_pg())
             any_lacks = bool(buf[0].item())
             resume_step = int(buf[1].item())
 
@@ -1051,10 +1061,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             has_md = self.rmp_manager.has_committed_metadata()
             local_step = self.rmp_manager.latest_committed_step() or 0
             buf = torch.tensor(
-                [0 if has_md else 1, local_step],
-                dtype=torch.int64, device=self.device,
+                [0 if has_md else 1, local_step], dtype=torch.int64,
             )
-            dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=self._resume_vote_pg())
             any_lacks = bool(buf[0].item())
             resume_step = int(buf[1].item())
 
