@@ -855,7 +855,7 @@ class ResilientOptimizer:
         for entry in self._moe_entries:
             entry.tokens_per_expert.zero_()
 
-    def resync_after_external_load(self):
+    def resync_after_external_load(self, step: int | None = None):
         """Re-sync RMP-backed scalars to the just-loaded optimizer state.
 
         Step counter and marker are kept in RMP so they survive faults;
@@ -865,8 +865,18 @@ class ResilientOptimizer:
         the step counter would be ahead of params.step and the next AdamW
         update would use the wrong bias-correction step.  Must be called
         after bind().
+
+        ``step``: the trainer's restored global step. Under gemini every
+        param's restored Adam step equals it, so the legacy param-derived
+        fallback (``_all_params[0].step``) is identical — but under
+        moevement's sparse restore (plan §3.9) only the restored window's
+        first slot ops carry exact Adam steps (still-frozen params hold 0
+        until their replay activation), and _all_params[0] may be one of
+        them. train.py passes ``self.step`` explicitly.
         """
-        self._step_counter.fill_(int(self._all_params[0].step.item()))
+        if step is None:
+            step = int(self._all_params[0].step.item())
+        self._step_counter.fill_(int(step))
         self._marker.fill_(_MARKER_IDLE)
         torch.cuda.current_stream().synchronize()
         # Captured graphs reference the pre-load tensor addresses; while the

@@ -1019,6 +1019,90 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self._vote_pg = dist.new_group(backend="gloo")
         return self._vote_pg
 
+    def _moevement_replay_pending(self) -> bool:
+        """True when this rank's predecessor died MID-REPLAY (duck-typed;
+        only method=moevement defines the hook).
+
+        A moevement restore arms a replay spanning w_sparse-1 real training
+        steps; until save(S+w) the live — and therefore RMP-persisted —
+        params/optimizer state are a sparse-replay INTERMEDIATE: operators
+        that have not been activated yet hold their bf16 compute copy and
+        unrestored Adam moments. That state is bit-exact for the forward
+        (which casts to bf16 anyway) but wrong for the optimizer, so a
+        promoted standby that adopts it produces bit-identical losses for
+        the interrupted step and diverges from the NEXT one on (2026-07
+        gptoss_tp2fsdp4ep4 M8 full_ftft: transient at replayed step 23 →
+        step 24 loss 10.6507 vs 10.6925 baseline).
+
+        Voting it into ``has_md`` routes the whole world down the
+        checkpointer.load() fallback, which restores the window and replays
+        it from the top when the dump survived, and otherwise fresh-starts
+        via _fresh_start_reinit_from_seed — never a half-restored resume.
+        """
+        pending = getattr(self.checkpointer, "has_pending_replay", None)
+        if pending is None or not pending():
+            return False
+        logger.warning(
+            "[moevement] this rank's predecessor died mid-replay — voting "
+            "the RMP resume down; recovery falls back to checkpointer.load()"
+        )
+        return True
+
+    def _fresh_start_reinit_from_seed(self):
+        """True seed fresh start for a trainer attached to pre-existing RMP
+        GPU pools (rmp_restored=True) whose fallback load found no
+        checkpoint.
+
+        maybe_init() skips init_weights() when the pools were retrieved
+        rather than allocated, on the assumption that a recovery source will
+        overwrite them. When BOTH recovery sources come up empty — no
+        committed RMP metadata (the vote's any_lacks path) AND
+        checkpointer.load() returned False (e.g. moevement's
+        window-agreement vote said FRESH-START) — nothing ever overwrites
+        the pools, and the run would silently continue on whatever the dead
+        predecessor left in them (2026-07 gptoss_tp2fsdp4ep4 full_ftft
+        forensics: a standby promoted on a transient fault that hit before
+        the post-fatal active's first metadata commit trained the active's
+        half-restored step-22 weights with train_state reset to step 1).
+        Plan §3.9: a fresh start must never be RMP-sourced — so make it a
+        real one:
+
+        - reseed RNG exactly as the initial init sequence did, then re-run
+          init_weights() into the RMP-backed params/buffers (bit-identical
+          to a from-scratch start's weights);
+        - zero all optimizer state tensors (RMP pools are zero-filled on
+          allocation, so this reproduces fresh-alloc semantics);
+        - drop restored param gradients (restore_param_gradients may have
+          re-attached the predecessor's stale grads).
+
+        Every rank takes this path together: rmp_restored and the two vote
+        outcomes are world-uniform, so no collective divergence.
+        """
+        logger.warning(
+            "[fresh-start] RMP pools were retrieved but neither RMP metadata "
+            "nor the checkpointer had recoverable state — re-initializing "
+            "model/optimizer state from seed (plan §3.9: fresh start must "
+            "never be RMP-sourced)"
+        )
+        dist_utils.set_determinism(
+            self.parallel_dims,
+            self.device,
+            self.job_config.debug,
+            distinct_seed_mesh_dims=["pp"],
+        )
+        with torch.no_grad():
+            for model_part in self.model_parts:
+                model_part.init_weights(buffer_device=self.buffer_device)
+                model_part.train()
+            for optimizer in self.optimizers:
+                for param_state in optimizer.state.values():
+                    for value in param_state.values():
+                        if torch.is_tensor(value):
+                            value.zero_()
+        for model_part in self.model_parts:
+            for param in model_part.parameters():
+                param.grad = None
+
     @record
     def train(self):
         job_config = self.job_config
@@ -1031,12 +1115,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             #   buf[1] = _step_counter when this rank has metadata, else 0.
             #     After MAX, equals the global-max step counter (= resume
             #     step) when every rank has metadata; ignored otherwise.
+            #   buf[2] = 1 if this rank re-attached to pre-existing RMP
+            #     pools (rmp_restored). After MAX, world-uniform "any rank
+            #     holds a predecessor's pool state" — gates the stale-pool
+            #     fresh-start reinit below. Must be voted, not read locally:
+            #     a lone organically-relaunched RMP server would otherwise
+            #     split the decision (and set_determinism can broadcast).
 
 
-            has_md = self.rmp_manager.has_committed_metadata()
+            has_md = (
+                self.rmp_manager.has_committed_metadata()
+                and not self._moevement_replay_pending()
+            )
             local_step = self._resilient_opt.get_step() if has_md else 0
             buf = torch.tensor(
-                [0 if has_md else 1, local_step], dtype=torch.int64,
+                [0 if has_md else 1, local_step, 1 if self.rmp_restored else 0],
+                dtype=torch.int64,
             )
             # Vote over gloo: an all_reduce on the default PG would create an
             # extra world-size NCCL communicator (the no-fault path never
@@ -1045,27 +1139,56 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=self._resume_vote_pg())
             any_lacks = bool(buf[0].item())
             resume_step = int(buf[1].item())
+            any_retrieved = bool(buf[2].item())
 
             if not any_lacks:
                 self._resilient_opt_recover(resume_step)
+                # RMP recovery bypassed checkpointer.load() entirely — on
+                # the full-leto transient path the in-memory checkpoint
+                # state is NOT consulted (plan §3.9). method=moevement must
+                # still reseed its deferred window-start ring from the
+                # restored state and start a fresh sparse window (plan
+                # §8-R6); duck-typed — gemini defines no such hook.
+                notify = getattr(self.checkpointer, "notify_rmp_restored", None)
+                if notify is not None:
+                    notify(resume_step)
             else:
-                self.checkpointer.load(step=job_config.checkpoint.load_step)
+                loaded = self.checkpointer.load(step=job_config.checkpoint.load_step)
+                if not loaded and any_retrieved:
+                    # Retrieved pools + no recovery source anywhere: the
+                    # pools hold a dead predecessor's partial state. Reinit
+                    # BEFORE bind() so the resilient optimizer captures the
+                    # seed-fresh tensors.
+                    self._fresh_start_reinit_from_seed()
                 self._resilient_opt.bind()
-                self._resilient_opt.resync_after_external_load()
+                # Pass the trainer's restored step explicitly: under
+                # method=moevement's sparse restore only the window's first
+                # slot ops carry restored per-param Adam steps (still-frozen
+                # params hold 0 until their replay activation), so the
+                # param-derived fallback inside resync would be wrong. Under
+                # gemini/fresh-start self.step equals that fallback.
+                self._resilient_opt.resync_after_external_load(self.step)
         elif job_config.leto.enable_rmp_gpu and job_config.leto.disable_resilient_opt:
             # No ResilientOptimizer replay, but rmp_manager.maybe_commit has
             # been writing CPU-side metadata (step counter, dataloader, lr
             # scheduler) every step. Load that metadata so the restart
             # picks up where the last successful step left off; the
             # RMP-GPU-backed params/optim tensors are already correct.
-            has_md = self.rmp_manager.has_committed_metadata()
+            has_md = (
+                self.rmp_manager.has_committed_metadata()
+                and not self._moevement_replay_pending()
+            )
             local_step = self.rmp_manager.latest_committed_step() or 0
+            # Same 3-slot packing as the resilient-opt branch above; buf[2]
+            # makes the stale-pool fresh-start decision world-uniform.
             buf = torch.tensor(
-                [0 if has_md else 1, local_step], dtype=torch.int64,
+                [0 if has_md else 1, local_step, 1 if self.rmp_restored else 0],
+                dtype=torch.int64,
             )
             dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=self._resume_vote_pg())
             any_lacks = bool(buf[0].item())
             resume_step = int(buf[1].item())
+            any_retrieved = bool(buf[2].item())
 
             if not any_lacks:
                 self.rmp_manager.load_cpu_metadata(resume_step)
@@ -1077,8 +1200,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # _resilient_opt_recover does.
                 self.lr_schedulers.step()
                 self.step = resume_step
+                # Same duck-typed reseed as the resilient-opt branch above.
+                notify = getattr(self.checkpointer, "notify_rmp_restored", None)
+                if notify is not None:
+                    notify(resume_step)
             else:
-                self.checkpointer.load(step=job_config.checkpoint.load_step)
+                loaded = self.checkpointer.load(step=job_config.checkpoint.load_step)
+                if not loaded and any_retrieved:
+                    # Same stale-pool hazard as the resilient-opt branch.
+                    self._fresh_start_reinit_from_seed()
         else:
             self.checkpointer.load(step=job_config.checkpoint.load_step)
 

@@ -390,6 +390,28 @@ def pipeline_module_split(
     pp_rank = pp_mesh.get_local_rank()
     pp_degree = pp_mesh.size()
 
+    # MoEvement upstream logging (components/moevement/upstream_logger.py):
+    # build tee-instrumented stages so send payloads can be logged and replay
+    # recvs overridden. Gated so the plain PipelineStage is used (zero
+    # overhead) unless checkpoint.method=moevement with upstream logging on.
+    stage_cls = PipelineStage
+    if job_config is not None:
+        _ckpt = job_config.checkpoint
+        if (
+            _ckpt.enable
+            and _ckpt.resolved_method() == "moevement"
+            and _ckpt.moevement_upstream_logging
+        ):
+            from torchtitan.components.moevement.upstream_logger import (
+                UpstreamTeePipelineStage,
+            )
+
+            stage_cls = UpstreamTeePipelineStage
+            logger.info(
+                "PP rank %d: building UpstreamTeePipelineStage stages "
+                "(moevement upstream logging)", pp_rank
+            )
+
     def _build_stage_from_modules(
         stage_idx: int,
         module_names: list[str],
@@ -438,7 +460,7 @@ def pipeline_module_split(
                 # Replace with None
                 setattr(model, module_name, None)
 
-        stage = PipelineStage(
+        stage = stage_cls(
             model,
             stage_idx,
             num_stages,
@@ -447,6 +469,10 @@ def pipeline_module_split(
             input_args=input_args,
             output_args=output_args,
         )
+        # Stamp the true global virtual-stage id on the model chunk so the
+        # moevement checkpoint manager can verify its 'loop' stage-id mapping
+        # against how the parts were actually built (plan §9-M4 P1).
+        model._pp_virtual_stage_index = stage_idx
         return stage, model
 
     num_stages = len(module_names_per_stage)

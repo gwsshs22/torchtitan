@@ -658,7 +658,72 @@ class Checkpoint:
     without saving any during the training.
     """
 
+    method: Literal["dcp", "gemini", "moevement"] = "dcp"
+    """
+    Checkpointing implementation: "dcp" (torch distributed checkpoint, the
+    default), "gemini" (in-memory snapshots interleaved into FSDP comm gaps),
+    or "moevement" (sparse in-memory checkpointing ported from MoEvement).
+    The legacy use_gemini flag is honored as an alias for method="gemini".
+    """
+
     use_gemini: bool = False
+
+    def resolved_method(self) -> str:
+        """method, with the legacy use_gemini flag folded in."""
+        if self.use_gemini and self.method == "dcp":
+            return "gemini"
+        return self.method
+
+    moevement_mem_fs_folder: str = ""
+    """tmpfs folder for moevement's kill-survivable snapshot pools
+    (counterpart of gemini_mem_fs_folder)."""
+
+    moevement_pcie_bandwidth_gbs: float = 25.0
+    """Assumed effective D2H bandwidth (GiB/s) for moevement's window sizing:
+    each iteration's snapshot bytes are budgeted against
+    iter_time * bandwidth * moevement_snapshot_overlap_target."""
+
+    moevement_snapshot_overlap_target: float = 1.0
+    """Fraction of one iteration's PCIe budget the per-iteration sparse
+    snapshot may consume. 1.0 (default) is recovery-optimal (smallest
+    window); lower values trade a longer window for less D2H pressure."""
+
+    moevement_w_sparse_override: int = 0
+    """Pin the sparse window length to this many iterations instead of
+    deriving it from the PCIe budget. 0 (default) derives it. Also pins the
+    schedule cadence world-wide regardless of per-rank iteration timing."""
+
+    moevement_reorder_threshold: float = 0.10
+    """Relative shift in an expert's rolling popularity that counts it as
+    "changed" when deciding whether to regenerate the snapshot schedule."""
+
+    moevement_reorder_fraction: float = 0.25
+    """Fraction of experts that must have shifted by more than
+    moevement_reorder_threshold to trigger a schedule regeneration."""
+
+    moevement_activation_count_window_iters: int = 100
+    """Length (iterations) of the rolling window of per-expert token counts
+    driving popularity ordering and reorder detection."""
+
+    moevement_iter_time_window_iters: int = 50
+    """Effective length (iterations) of the wall-clock iteration-time EMA
+    that feeds window sizing."""
+
+    moevement_initial_iter_time_sec: float = 1.0
+    """Iteration-time seed for window sizing before any steps have been
+    measured."""
+
+    moevement_upstream_logging: bool = True
+    """Whether to log pipeline stage-boundary sends (forward outputs +
+    input-gradients, keyed by iteration/microbatch/virtual-stage/direction)
+    into a kill-survivable shm ring for log-fed replay. Effective only when
+    pipeline parallelism is enabled; at PP=1 the logger is not constructed."""
+
+    moevement_replication: bool = True
+    """Whether to replicate finalized windows to the pair rank
+    (rank + world/2) over a dedicated gloo group, enabling the uniform
+    faulty-rank peer-fetch recovery (plan §3.7). Auto-disabled (with a log
+    line) when the world is smaller than 2 or odd."""
 
     gemini_profile_comm_gaps: bool = False
     """Whether to profile communication gaps for Gemini checkpointing"""

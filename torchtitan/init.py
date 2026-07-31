@@ -35,6 +35,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTManager
 from torchtitan.components.fsdp_collective_manager import FsdpCollectiveManager
 from torchtitan.components.gemini.checkpoint import GeminiCheckpointManager
+from torchtitan.components.moevement.checkpoint import MoevementCheckpointManager
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor as _build_metrics_processor,
@@ -354,9 +355,18 @@ def build_train_context(ctx: InitContext) -> None:
 
 
 def init_gemini_checkpoint_partial(ctx: InitContext) -> None:
-    """Reordered mode: create partial GeminiCheckpointManager before standby poll."""
-    if ctx.job_config.checkpoint.use_gemini:
+    """Reordered mode: create the partial in-memory checkpoint manager
+    (gemini or moevement) before the standby poll."""
+    method = ctx.job_config.checkpoint.resolved_method()
+    if method == "gemini":
         ctx.checkpointer = GeminiCheckpointManager(
+            dataloader=ctx.dataloader,
+            states={"train_state": ctx},
+            checkpoint_config=ctx.job_config.checkpoint,
+            base_folder=ctx.job_config.job.dump_folder,
+        )
+    elif method == "moevement":
+        ctx.checkpointer = MoevementCheckpointManager(
             dataloader=ctx.dataloader,
             states={"train_state": ctx},
             checkpoint_config=ctx.job_config.checkpoint,
@@ -749,10 +759,11 @@ def init_collective_manager_and_checkpoint(ctx: InitContext) -> None:
 
     collective_manager = FsdpCollectiveManager()
 
-    if job_config.checkpoint.use_gemini:
-        # Gemini is decoupled from RMP: its CPU checkpoint pool is
-        # process-owned shm, so there's no RMP CPU allocation to wait on and
-        # no rmp_manager to hand down.
+    if job_config.checkpoint.resolved_method() in ("gemini", "moevement"):
+        # Gemini/moevement are decoupled from RMP: their CPU checkpoint pools
+        # are process-owned shm, so there's no RMP CPU allocation to wait on
+        # and no rmp_manager to hand down. (moevement's lazy_init accepts and
+        # ignores the collective_manager — no comm-gap interleaving.)
         ctx.checkpointer.lazy_init(
             model_parts=ctx.model_parts,
             optimizers=ctx.optimizers,

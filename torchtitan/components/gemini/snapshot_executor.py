@@ -25,6 +25,7 @@ try:
     from leto.launch.worker_controller_client import (
         report_duration,
         get_checkpoint_loading_type,
+        get_faulty_ranks,
         DURATION_CHECKPOINT_LOADING,
         DURATION_CHECKPOINT_ALLOC,
     )
@@ -39,6 +40,54 @@ REMOTE = 1
 # Double-buffer indices
 CURR = 0
 PREV = 1
+
+
+def read_checkpoint_metadata(metadata_path: str) -> list:
+    """Read a rank's checkpoint metadata; returns the index-aligned
+    version_steps list ([] when absent).
+
+    Tolerates a corrupt/truncated file (a container killed mid-PERSIST):
+    a broken claim degrades this rank to "no checkpoint" — its pair still
+    covers the step — instead of crashing every recovery attempt.
+    """
+    if not os.path.exists(metadata_path):
+        return []
+    try:
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        version_steps = metadata["version_steps"]
+    except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+        logger.error(
+            f"[Gemini] Corrupt checkpoint metadata at {metadata_path} "
+            f"({e!r}); treating as no checkpoint on this rank"
+        )
+        return []
+    return version_steps if isinstance(version_steps, list) else []
+
+
+def discard_checkpoint_files(mem_fs_folder: str, global_rank: int) -> list:
+    """Withdraw this rank's checkpoint claim: remove its metadata (first,
+    so the claim disappears before the payloads) and version files.
+
+    Called only on the election's fresh-start fallback: the surviving dumps
+    belong to a superseded world, and leaving them behind would let a LATER
+    fault elect a stale step against post-restart data. Returns the removed
+    file names.
+    """
+    names = [f"rank_{global_rank}_metadata.json"]
+    for version in (0, 1):
+        for locality in ("local", "remote"):
+            names.append(f"rank_{global_rank}_v{version}_{locality}.pt")
+    removed = []
+    for name in names:
+        path = os.path.join(mem_fs_folder, name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                removed.append(name)
+            except OSError as e:
+                logger.warning(f"[Gemini] Failed to remove stale {path}: {e}")
+    return removed
 
 class SnapshotExecutor:
 
@@ -208,11 +257,7 @@ class SnapshotExecutor:
 
     def _read_checkpoint_metadata(self) -> list:
         """Read checkpoint metadata. Returns list of committed steps."""
-        if not os.path.exists(self._metadata_path):
-            return []
-        with open(self._metadata_path) as f:
-            metadata = json.load(f)
-        return metadata["version_steps"]
+        return read_checkpoint_metadata(self._metadata_path)
 
     def _check_has_checkpoint(self) -> bool:
         return os.path.exists(self._metadata_path)
@@ -263,15 +308,35 @@ class SnapshotExecutor:
         available_steps = set(s for s in version_steps if s is not None) if self.has_checkpoint else set()
         version_for_step = {step: version for version, step in enumerate(version_steps) if step is not None}
 
-        # Find consistent step across all ranks via all-gather
+        # Find consistent step across all ranks via all-gather. The election
+        # chooses the step; when leto passed a faulty set, roles are
+        # faulty-rank-driven (plan §3.7 retrofit) with the election as a
+        # cross-check.
+        faulty_ranks = get_faulty_ranks() if _LETO_AVAILABLE else []
         t0 = time.monotonic()
-        target_step, load_action = self.snapshot_group.find_consistent_step_and_action(available_steps)
+        target_step, load_action = self.snapshot_group.find_consistent_step_and_action(
+            available_steps, faulty_ranks=faulty_ranks
+        )
         logger.info(
             f"[Gemini Load R{rank}] find_consistent_step_and_action: {time.monotonic() - t0:.3f}s, "
-            f"target_step={target_step}, action={load_action}, available={version_steps}"
+            f"target_step={target_step}, action={load_action}, available={version_steps}, "
+            f"faulty_ranks={faulty_ranks}"
         )
 
         if load_action == CheckpointLoadAction.NONE:
+            if available_steps:
+                # The election fell back to a fresh start (some pair lost
+                # both replicas) while this rank still holds dumps from the
+                # superseded world. Discard them so a later fault cannot
+                # elect a stale step against post-restart training state.
+                removed = discard_checkpoint_files(
+                    self.mem_fs_folder, self._global_rank
+                )
+                logger.error(
+                    f"[Gemini Load R{rank}] Fresh-start fallback: discarded "
+                    f"stale checkpoint files {removed} "
+                    f"(had steps {sorted(available_steps)})"
+                )
             return False
 
         if load_action in (CheckpointLoadAction.LOCAL, CheckpointLoadAction.SEND):

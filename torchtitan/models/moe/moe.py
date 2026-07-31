@@ -488,8 +488,24 @@ class MoE(nn.Module):
         # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert --
         #       first in the forward pass, and then in the backward pass. However, this has no
         #       effect on the expert bias update thanks to the torch.sign() operator.
-        with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+        #
+        # Only passes that are part of real training may contribute. Pipeline
+        # parallelism runs a SHAPE-INFERENCE forward on all-zeros input under
+        # `torch.no_grad()` (torch/distributed/pipelining/stage.py: "with
+        # torch.no_grad(): outputs = self.submod(*args)"); with zero input every
+        # token routes to the same experts, so its maximally-skewed counts would
+        # enter expert_bias through the optimizer pre-hook. That is invisible on
+        # a fresh run (it always happens at step 1) but NOT after a restore: the
+        # relaunched process runs shape inference again at the RESUME step, an
+        # update the original run never made, permanently shifting routing and
+        # breaking bit-identical recovery. Grad-enabled is the right test — the
+        # real forward and the activation-checkpoint recomputation both run with
+        # grad enabled (so the documented double-counting, and the compensating
+        # //2 in components/optimizer.py, are unchanged), while shape inference
+        # and eval/validation forwards do not.
+        if torch.is_grad_enabled():
+            with torch.no_grad():
+                self.tokens_per_expert.add_(num_tokens_per_expert)
 
         # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
