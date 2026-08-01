@@ -554,15 +554,26 @@ def clip_reduce_from_locals(
     pp_mesh: DeviceMesh | None = None,
     *,
     ep_enabled: bool,
+    pinned_total_norm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce per-rank locals (live or recovery-reconstructed) to
     ``(total_norm, clip_coef_clamped)``.
+
+    ``pinned_total_norm`` short-circuits the reduction entirely (no
+    collectives) and derives the clip coefficient from the supplied norm —
+    see ``clip_grad_norm_``'s parameter of the same name. World-uniform by
+    contract.
 
     The single reducer shared by the stock clip path, the resilient normal
     path, and the resilient recovery path. Bit-identity rests on
     deterministic collective replay over identical inputs (mesh, group, op,
     and persisted locals are all the same at normal and recovery time).
     """
+    if pinned_total_norm is not None:
+        clip_coef_clamped = torch.clamp(
+            max_norm / (pinned_total_norm + 1e-6), max=1.0
+        )
+        return pinned_total_norm, clip_coef_clamped
     if ep_enabled:
         assert len(locals_list) == 2
         return _reduce_clip_from_locals_ep(
@@ -584,6 +595,7 @@ def clip_grad_norm_(
     pp_mesh: DeviceMesh | None = None,
     ep_enabled: bool = False,
     compute_only: bool = False,
+    pinned_total_norm: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Clip the gradient norm of an iterable of parameters.
@@ -615,6 +627,16 @@ def clip_grad_norm_(
             its fault-recoverable chunked step (gradients are never mutated
             outside the replayable region). Default ``False`` keeps the
             original in-place behavior and single-tensor return.
+        pinned_total_norm: if given, use this pre-computed total norm instead
+            of deriving one from the gradients — the norm computation and
+            **all of its collectives** are skipped. Used by MoEvement's §3.3
+            frozen-skip replay: frozen operators produce no weight-gradients,
+            so a freshly computed norm would cover a smaller gradient set and
+            perturb the surviving operators' updates. The value is the norm
+            captured at the original iteration, so the clip coefficient (and
+            the logged ``grad_norm``) are bit-identical to the original run.
+            Every rank must pass it or none may — the skipped collectives are
+            collective.
 
     Returns:
         Total norm of the parameter gradients (viewed as a single vector).
@@ -631,6 +653,7 @@ def clip_grad_norm_(
             foreach,
             pp_mesh,
             compute_only,
+            pinned_total_norm,
         )
 
     if isinstance(parameters, torch.Tensor):
@@ -639,16 +662,20 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
 
-    # Split into compute-locals (no collective) -> reduce-from-locals
-    # (collective + clamp). Same two-phase contract the resilient path
-    # uses; keeps stock and resilient bit-identical by routing through
-    # the same reducer over the same locals.
-    clip_locals = clip_compute_locals(
-        parameters, norm_type, error_if_nonfinite, foreach, ep_enabled=False
-    )
-    total_norm, clip_coef_clamped = clip_reduce_from_locals(
-        clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=False
-    )
+    if pinned_total_norm is not None:
+        total_norm = pinned_total_norm
+        clip_coef_clamped = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    else:
+        # Split into compute-locals (no collective) -> reduce-from-locals
+        # (collective + clamp). Same two-phase contract the resilient path
+        # uses; keeps stock and resilient bit-identical by routing through
+        # the same reducer over the same locals.
+        clip_locals = clip_compute_locals(
+            parameters, norm_type, error_if_nonfinite, foreach, ep_enabled=False
+        )
+        total_norm, clip_coef_clamped = clip_reduce_from_locals(
+            clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=False
+        )
 
     if compute_only:
         # Do NOT scale grads here — the resilient chunked step does
@@ -669,17 +696,26 @@ def _clip_grad_norm_with_ep(
     foreach: bool | None,
     pp_mesh: DeviceMesh | None,
     compute_only: bool = False,
+    pinned_total_norm: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     # Split into compute-locals (no collective) -> reduce-from-locals
     # (collective + combine + clamp). The compute-locals helper also
     # returns the ep / non_ep param split used by the in-place scaling
     # below — so we do the split exactly once.
+    # NOTE: with a pinned norm the locals are discarded (only the ep /
+    # non_ep param split below is still needed). The foreach-norm they cost
+    # is negligible next to the backward this path exists to shorten, and
+    # keeping one code path keeps the split logic in exactly one place.
     clip_locals = clip_compute_locals(
         parameters, norm_type, error_if_nonfinite, foreach, ep_enabled=True
     )
-    total_norm, clip_coef_clamped = clip_reduce_from_locals(
-        clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=True
-    )
+    if pinned_total_norm is not None:
+        total_norm = pinned_total_norm
+        clip_coef_clamped = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+    else:
+        total_norm, clip_coef_clamped = clip_reduce_from_locals(
+            clip_locals.locals, max_norm, norm_type, pp_mesh, ep_enabled=True
+        )
 
     if compute_only:
         # Resilient path: defer scaling into ResilientOptimizer's chunk step.

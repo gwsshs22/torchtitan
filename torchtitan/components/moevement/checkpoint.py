@@ -26,9 +26,26 @@ from torchtitan.components.moevement.replication import (
     build_replicator,
     vote_constraint,
 )
-from torchtitan.components.moevement.operators import _layer_label, discover_operators
+from torchtitan.components.moevement.freeze import FrozenSkipController
+from torchtitan.components.moevement.operators import (
+    OperatorKind,
+    _layer_label,
+    discover_operators,
+)
+from torchtitan.components.moevement.policy_profile import (
+    build_payload,
+    build_provenance,
+    default_profile_path,
+    describe,
+    read_profile,
+    usable_w_sparse,
+    write_profile,
+)
 from torchtitan.components.moevement.scheduler import SparseCheckpointScheduler
-from torchtitan.components.moevement.snapshot_engine import MoevementSnapshotEngine
+from torchtitan.components.moevement.snapshot_engine import (
+    MoevementSnapshotEngine,
+    measure_d2h_bandwidth_gbs,
+)
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Checkpoint as CheckpointConfig
 from torchtitan.distributed import ParallelDims
@@ -41,6 +58,22 @@ try:
     _LETO_FAULTY_AVAILABLE = True
 except ImportError:
     _LETO_FAULTY_AVAILABLE = False
+
+
+def _agreement_device(model_parts: list) -> torch.device:
+    """Device for the frozen-skip agreement collective.
+
+    Taken from the model itself so the payload lands on the backend's device
+    (NCCL needs CUDA); falls back to CPU for gloo/single-process.
+    """
+    for part in model_parts:
+        for param in part.parameters():
+            if param.device.type == "cuda":
+                return param.device
+            break
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 class MoevementCheckpointManager:
@@ -80,6 +113,12 @@ class MoevementCheckpointManager:
         self.states[DATALOADER] = dataloader
         self._checkpoint_config = checkpoint_config
         self._base_folder = base_folder
+        # Only used for the policy profile's provenance (model name/flavor).
+        # Passed explicitly by init.py; the train_state fallback keeps the
+        # older two-arg construction (and the unit tests) working.
+        self._job_config = kwargs.get("job_config") or getattr(
+            states.get("train_state"), "job_config", None
+        )
         self._engine: MoevementSnapshotEngine | None = None
         self._replicator = None  # WindowReplicator (plan §3.7), or None
         self._upstream_logger = None  # constructed only when PP + logging on
@@ -89,6 +128,23 @@ class MoevementCheckpointManager:
         # "bundle": WindowBundle, "activated": set[str]}. None outside
         # replay; save(S+w) ends it.
         self._replay: dict[str, Any] | None = None
+        # Paper §3.3 frozen-skip (see freeze.py). The controller is built in
+        # lazy_init; `_frozen_skip` records the configured intent, and
+        # `_frozen_skip_live` whether the ARMED replay can actually use it
+        # (a window captured without clip-norm anchors cannot).
+        self._frozen_skip = bool(
+            getattr(checkpoint_config, "moevement_frozen_skip", False)
+        )
+        self._frozen_skip_live = False
+        self._freezer: FrozenSkipController | None = None
+        # Last iteration's pre-clip total grad norm, handed over by train.py
+        # (record_clip_total_norm) and captured with the iteration's bytes.
+        self._pending_clip_norm: torch.Tensor | None = None
+        # Warmup-only frozen-skip exercise (compile-cache priming).
+        self._frozen_skip_warmup = max(
+            0, int(getattr(checkpoint_config, "moevement_frozen_skip_warmup", 0))
+        )
+        self._warmup_freeze_active = False
 
         if checkpoint_config.interval != 1:
             # Sparse checkpointing is rolling: a scheduled operator subset is
@@ -143,9 +199,28 @@ class MoevementCheckpointManager:
         for op in self.operators:
             for _fqn, param, _expert_idx in op.param_entries:
                 self._param_claims.setdefault(id(param), []).append(op.name)
+        self._freezer = FrozenSkipController(
+            self.operators,
+            model_parts,
+            stage_ids,
+            enabled=self._frozen_skip,
+            # Same stage column as the popularity reduction, and for the same
+            # reason: it is the group over which every rank holds the same
+            # operator vector. A fully-frozen expert module makes FSDP2 skip
+            # that group's reduce-scatter, so the verdict must be world-agreed
+            # or ranks desynchronise.
+            agree_group=self._pop_group,
+            agree_device=_agreement_device(model_parts),
+        )
+        if self._frozen_skip:
+            logger.info(
+                "[moevement] frozen-skip (paper §3.3) ENABLED: %s",
+                self._freezer.describe(),
+            )
+        self._pcie_bandwidth_gbs = self._resolve_pcie_bandwidth_gbs(cfg)
         self._scheduler = SparseCheckpointScheduler(
             [op.schedulable() for op in self.operators],
-            pcie_bandwidth_gbs=cfg.moevement_pcie_bandwidth_gbs,
+            pcie_bandwidth_gbs=self._pcie_bandwidth_gbs,
             overlap_target=cfg.moevement_snapshot_overlap_target,
             w_sparse_override=cfg.moevement_w_sparse_override,
             reorder_threshold=cfg.moevement_reorder_threshold,
@@ -168,9 +243,15 @@ class MoevementCheckpointManager:
         self._global_counts_at_last_order: torch.Tensor | None = None
         self._init_popularity_tracking(model_parts, stage_ids)
 
-        # Identical inputs (seeded iter time, zero popularity, name
-        # tie-breaks) make the initial schedule world-identical without a
-        # collective.
+        # Cadence decision, once, before anything is sized against it.
+        # Precedence (plan §9-M11): explicit override > recorded policy
+        # profile whose provenance matches this run > live Algorithm 1
+        # (whose verdict is then RECORDED for the next run).
+        self._rank = int(os.environ.get("RANK", "0"))
+        self._resolve_cadence(cfg)
+
+        # Identical inputs (pinned cadence, zero popularity, name tie-breaks)
+        # make the initial schedule world-identical without a collective.
         self._schedule = self._scheduler.regenerate(self._iter_time_ema)
         self._slot_idx = 0
 
@@ -182,7 +263,6 @@ class MoevementCheckpointManager:
         )
 
         mem_fs_folder = cfg.moevement_mem_fs_folder
-        self._rank = int(os.environ.get("RANK", "0"))
         self._engine = self._build_engine(mem_fs_folder, self._rank)
 
         # Window replication + uniform faulty-rank recovery (plan §3.7).
@@ -231,6 +311,355 @@ class MoevementCheckpointManager:
                 "(retention %d iterations)",
                 attached, stage_ids, self._upstream_logger.capacity,
             )
+
+    def _probe_pcie_bandwidth_gbs(self) -> float:
+        """Bandwidth-probe seam (tests substitute a stub)."""
+        return measure_d2h_bandwidth_gbs()
+
+    def _resolve_pcie_bandwidth_gbs(self, cfg: CheckpointConfig) -> float:
+        """Algorithm 1's B_PCIe input: measured by default, config wins.
+
+        The paper profiles this; the reference hardcodes it. A positive
+        ``checkpoint.moevement_pcie_bandwidth_gbs`` is honored verbatim
+        (escape hatch / reproducibility); <= 0 means AUTO — profile the
+        device once, before the training loop, on the capture stream.
+        """
+        configured = cfg.moevement_pcie_bandwidth_gbs
+        if configured > 0:
+            logger.info(
+                "[moevement] B_PCIe = %.2f GiB/s (CONFIGURED via "
+                "checkpoint.moevement_pcie_bandwidth_gbs; set it <= 0 to "
+                "profile the device instead)",
+                configured,
+            )
+            return configured
+        t0 = time.perf_counter()
+        measured = self._probe_pcie_bandwidth_gbs()
+        logger.info(
+            "[moevement] B_PCIe = %.2f GiB/s AUTO-PROFILED in %.0f ms "
+            "(effective device->host on the snapshot capture stream, into a "
+            "pinned host buffer of the engine's kind); this is Algorithm 1's "
+            "bandwidth input",
+            measured,
+            1e3 * (time.perf_counter() - t0),
+        )
+        return measured
+
+    def _pin_policy_window_size(self) -> tuple[dict[str, Any], int]:
+        """Run Algorithm 1 once and pin its (world-aligned) verdict.
+
+        Returns ``(this rank's pre-pin policy report, the pinned w_sparse)``
+        so the caller can record both in the policy profile.
+
+        Two reasons the cadence cannot be left free per rank:
+
+        (a) Correctness. Every cross-rank protocol here is iteration-keyed
+            (window boundaries, the boundary barrier's collectives, peer
+            replication, the window-agreement vote), so a per-rank cadence
+            desyncs the world — which is exactly what
+            _boundary_should_regenerate's ``w_sparse diverged across ranks``
+            assert exists to catch. Rank-local inputs *do* differ: operator
+            sets differ across PP stages, the iteration-time EMA is wall
+            clock, and B_PCIe is now measured per device. Taking the WORLD
+            MAX keeps every rank's per-slot budget at most as tight as its
+            own choice would have been (ranks with fewer operators just get
+            trailing "rest" slots) — the reference's
+            _generate_schedule_world_aligned, same argument.
+
+        (b) Sizing. The engine's window pools are allocated once, against
+            scheduler.max_window_bytes(); with a free cadence that bound must
+            assume w_sparse == total_ops (~20x the realistic window at 266
+            operators, tens of GB of tmpfs per rank).
+        """
+        proposal = self._scheduler.policy_report(self._iter_time_ema)
+        w_local = proposal["proposed_w_sparse"]
+        w_world = w_local
+        if dist.is_available() and dist.is_initialized():
+            t = torch.tensor(
+                [w_local], dtype=torch.int64, device=self._collective_device()
+            )
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            w_world = int(t[0].item())
+        if w_world != w_local:
+            logger.info(
+                "[moevement] Algorithm 1 proposed w_sparse=%d locally; "
+                "aligning to the world MAX w_sparse=%d (operator-count / "
+                "iteration-time asymmetry — trailing slots stay empty on "
+                "this rank)",
+                w_local,
+                w_world,
+            )
+        self._scheduler.pin_window_size(
+            w_world,
+            reason="Algorithm 1 at init, world-aligned",
+            from_policy=True,
+        )
+        return proposal, w_world
+
+    # -- cadence precedence: override > recorded profile > live policy ------
+
+    def _collective_device(self) -> torch.device:
+        return (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+    def _world_min(self, value: int) -> int:
+        """all_reduce(MIN) of an int; identity when there is no world."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return int(value)
+        t = torch.tensor(
+            [int(value)], dtype=torch.int64, device=self._collective_device()
+        )
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t[0].item())
+
+    def _policy_provenance(self) -> dict[str, Any]:
+        job_config = self._job_config
+        model = getattr(job_config, "model", None) if job_config else None
+        world_size = (
+            self.parallel_dims.world_size
+            if self.parallel_dims is not None
+            else int(os.environ.get("WORLD_SIZE", "1"))
+        )
+        return build_provenance(
+            getattr(model, "name", ""),
+            getattr(model, "flavor", ""),
+            self.parallel_dims,
+            world_size,
+        )
+
+    def _resolve_cadence(self, cfg: CheckpointConfig) -> None:
+        """Decide who picks w_sparse, and say so.
+
+        Precedence, highest first:
+
+        1. ``checkpoint.moevement_w_sparse_override`` — explicit, always wins
+           (the scheduler is already pinned by it at construction).
+        2. A recorded policy profile (``moevement_policy_profile_path``,
+           default ``<dump_dir>/moevement_profile/policy.json``) whose
+           provenance matches this run's model, parallelism dims and world
+           size — the reuse path this repo already uses for progressive
+           init's ``solution.json``. ``--checkpoint.moevement_profile_policy``
+           forces the profile to be re-derived and rewritten instead.
+        3. Live Algorithm 1 (``_pin_policy_window_size``), whose verdict is
+           then recorded for the next run.
+
+        The accept/reject decision is made world-uniform by an
+        ``all_reduce(MIN)`` before it is acted on: the artifact lives on the
+        shared dump_dir, but a partially-visible or per-rank-stale file must
+        never leave some ranks on the recorded cadence and others on a live
+        one (every cross-rank protocol here is iteration-keyed).
+        """
+        self._policy_profile_path = (
+            cfg.moevement_policy_profile_path
+            or default_profile_path(self._base_folder)
+        )
+        self._cadence_provenance = self._policy_provenance()
+
+        if cfg.moevement_w_sparse_override > 0:
+            self._cadence_source = "override"
+            logger.info(
+                "[moevement] cadence source: OVERRIDE — w_sparse=%d from "
+                "checkpoint.moevement_w_sparse_override (no policy profile "
+                "read or written); Algorithm 1 is still evaluated and "
+                "reported at every schedule regeneration",
+                cfg.moevement_w_sparse_override,
+            )
+            return
+
+        forced = bool(getattr(cfg, "moevement_profile_policy", False))
+        if not self._policy_profile_path:
+            # No dump_dir and no explicit path: nowhere canonical to record
+            # the verdict, so the policy simply runs live every time.
+            logger.info(
+                "[moevement] policy-profile persistence is DISABLED (no "
+                "job.dump_folder and no checkpoint.moevement_policy_profile"
+                "_path); Algorithm 1 runs live on every start"
+            )
+            self._run_live_policy(cfg, record=False)
+            return
+        profile = None if forced else read_profile(self._policy_profile_path)
+        w_recorded, reasons = usable_w_sparse(
+            profile,
+            self._cadence_provenance,
+            self._rank,
+            local_total_ops=len(self.operators),
+        )
+        # World-uniform verdict: reuse only if EVERY rank can reuse it.
+        world_ok = bool(self._world_min(1 if w_recorded is not None else 0))
+
+        if world_ok and w_recorded is not None:
+            self._cadence_source = "profile"
+            self._scheduler.pin_window_size(
+                w_recorded,
+                reason=f"recorded policy profile {self._policy_profile_path}",
+                from_policy=True,
+            )
+            logger.info(
+                "[moevement] cadence source: RECORDED PROFILE — w_sparse=%d "
+                "from %s (%s). Algorithm 1 is NOT re-derived; it is still "
+                "evaluated every regeneration, so a DRIFTED line means the "
+                "recorded cadence no longer matches live conditions "
+                "(re-profile with --checkpoint.moevement_profile_policy)",
+                w_recorded,
+                self._policy_profile_path,
+                describe(profile),
+            )
+            return
+
+        if forced:
+            logger.info(
+                "[moevement] re-profiling the sparse-checkpointing policy "
+                "(--checkpoint.moevement_profile_policy): any artifact at %s "
+                "will be overwritten with this run's verdict",
+                self._policy_profile_path,
+            )
+        elif reasons and reasons != ["no recorded profile"]:
+            logger.warning(
+                "[moevement] IGNORING the recorded policy profile at %s — %s; "
+                "falling back to live Algorithm 1 (and rewriting the profile)",
+                self._policy_profile_path,
+                "; ".join(reasons),
+            )
+        elif w_recorded is not None:
+            logger.warning(
+                "[moevement] the recorded policy profile at %s is usable on "
+                "this rank but was REJECTED by another rank; falling back to "
+                "live Algorithm 1 world-wide",
+                self._policy_profile_path,
+            )
+
+        self._run_live_policy(cfg, record=True)
+
+    def _run_live_policy(self, cfg: CheckpointConfig, record: bool) -> None:
+        """Precedence level 3: derive the cadence now, and say where from."""
+        proposal, w_world = self._pin_policy_window_size()
+        self._cadence_source = "policy"
+        logger.info(
+            "[moevement] cadence source: LIVE POLICY (paper Algorithm 1) — "
+            "w_sparse=%d (world MAX of the per-rank proposals; this rank "
+            "proposed %d from B_PCIe=%.2f GiB/s, T_iter=%.4f s, %d operators)",
+            w_world,
+            proposal["proposed_w_sparse"],
+            proposal["pcie_bandwidth_gbs"],
+            proposal["iter_time_sec"],
+            proposal["total_ops"],
+        )
+        if record:
+            self._record_policy_profile(cfg, proposal, w_world)
+
+    # Fields of the per-rank policy row, in the order they ride the
+    # all_gather tensor. float64 holds every one of these exactly (byte
+    # counts stay far below 2**53).
+    _POLICY_ROW_FIELDS = (
+        "rank",
+        "total_ops",
+        "pcie_bandwidth_gbs",
+        "iter_time_sec",
+        "budget_bytes",
+        "proposed_w_sparse",
+        "proposed_num_active",
+        "proposed_worst_slot_bytes",
+        "num_active",
+        "worst_slot_bytes",
+        "max_window_bytes",
+    )
+    _POLICY_ROW_INTS = frozenset(
+        {
+            "rank",
+            "total_ops",
+            "budget_bytes",
+            "proposed_w_sparse",
+            "proposed_num_active",
+            "proposed_worst_slot_bytes",
+            "num_active",
+            "worst_slot_bytes",
+            "max_window_bytes",
+        }
+    )
+
+    def _gather_policy_rows(self, applied: dict[str, Any]) -> list[dict[str, Any]]:
+        """All-gather every rank's policy report.
+
+        Operator counts differ per pipeline stage, so the artifact records a
+        rank-keyed dict rather than pretending the numbers are uniform. Only
+        w_sparse is world-uniform (that is what the MAX all_reduce buys).
+        """
+        local = {"rank": self._rank, **applied}
+        row = [float(local[name]) for name in self._POLICY_ROW_FIELDS]
+        if not (dist.is_available() and dist.is_initialized()):
+            return [self._policy_row_to_dict(row)]
+
+        t = torch.tensor(row, dtype=torch.float64, device=self._collective_device())
+        gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, t)
+        return [self._policy_row_to_dict(g.tolist()) for g in gathered]
+
+    def _policy_row_to_dict(self, row) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name, value in zip(self._POLICY_ROW_FIELDS, row):
+            out[name] = int(round(value)) if name in self._POLICY_ROW_INTS else value
+        return out
+
+    def _record_policy_profile(
+        self, cfg: CheckpointConfig, proposal: dict[str, Any], w_world: int
+    ) -> None:
+        """Persist the live policy verdict for reuse by later runs."""
+        applied = self._scheduler.policy_report(self._iter_time_ema)
+        # Keep the pre-pin proposal (what THIS rank wanted) alongside the
+        # post-pin applied numbers (what the world cadence costs it).
+        applied["proposed_w_sparse"] = proposal["proposed_w_sparse"]
+        applied["proposed_num_active"] = proposal["proposed_num_active"]
+        applied["proposed_worst_slot_bytes"] = proposal["proposed_worst_slot_bytes"]
+        rows = self._gather_policy_rows(applied)
+        for row in rows:
+            row["won_world_max"] = row["proposed_w_sparse"] == int(w_world)
+
+        configured_bw = cfg.moevement_pcie_bandwidth_gbs
+        payload = build_payload(
+            w_sparse=int(w_world),
+            provenance=self._cadence_provenance,
+            policy_inputs={
+                "overlap_target": cfg.moevement_snapshot_overlap_target,
+                "iter_time_sec": self._iter_time_ema,
+                # The pin happens in lazy_init, before any step has been
+                # timed, so this is the configured SEED, not a measurement —
+                # recorded honestly (plan §9-M9 (d)3).
+                "iter_time_source": (
+                    "seeded (checkpoint.moevement_initial_iter_time_sec; the "
+                    "cadence is pinned at init, before any step is timed)"
+                ),
+                "iter_time_measured_steps": 0,
+                "pcie_bandwidth_source": (
+                    "configured" if configured_bw > 0 else "auto-profiled"
+                ),
+                "pcie_bandwidth_gbs_configured": configured_bw,
+            },
+            rank_rows=rows,
+        )
+        if self._rank != 0:
+            return
+        try:
+            write_profile(self._policy_profile_path, payload)
+        except OSError as exc:
+            logger.warning(
+                "[moevement] could not record the policy profile at %s: %s "
+                "(this run is unaffected; later runs will re-derive it)",
+                self._policy_profile_path,
+                exc,
+            )
+            return
+        logger.info(
+            "[moevement] policy profile written to %s (w_sparse=%d, "
+            "%d rank entries, winning_ranks=%s) — later runs of this "
+            "workload reuse it instead of re-deriving Algorithm 1",
+            self._policy_profile_path,
+            payload["w_sparse"],
+            len(payload["ranks"]),
+            payload["winning_ranks"],
+        )
 
     def _ensure_storage(self) -> None:
         """Deferred pool allocation (M7 structural fix).
@@ -435,6 +864,17 @@ class MoevementCheckpointManager:
     @torch.no_grad()
     def begin_step(self, curr_step: int, last_step: bool = False) -> None:
         self._step_t0 = time.perf_counter()
+        self._pending_clip_norm = None
+        if self._replay is not None and self._frozen_skip_live:
+            # Paper §3.3: freeze not-yet-activated operators BEFORE the
+            # forward, so the backward computes their input-gradients only.
+            stats = self._freezer.apply(self._replay["activated"])
+            logger.info(
+                "[moevement] replay step %d frozen-skip: %s",
+                curr_step, stats.summary() if stats.applied else "deferred",
+            )
+        elif self._frozen_skip_warmup:
+            self._apply_warmup_freeze(curr_step)
         if self._replay is not None and curr_step > self._replay["S"] + 2:
             # Replay step I consumes the RNG stream the baseline's step I
             # saw = the post-step-(I-1) capture. S+2's stream was already
@@ -453,12 +893,27 @@ class MoevementCheckpointManager:
             return
         if self._step_t0 is not None:
             measured = time.perf_counter() - self._step_t0
+            self._last_step_wall = measured
             self._iter_time_ema += self._iter_time_alpha * (
                 measured - self._iter_time_ema
             )
             self._step_t0 = None
         if self._replay is not None:
             self._replay_save(curr_step)
+            return
+        if self._warmup_freeze_active:
+            # Frozen-skip compile warmup freezes EVERY operator, so no
+            # parameter receives a gradient and the optimizer never
+            # materializes Adam state — capture would raise "no Adam state
+            # found for a scheduled parameter". These steps are throwaway by
+            # construction (their numerics are perturbed on purpose); their
+            # only job is to land the frozen-skip compiled variants in the
+            # caches, so skip capture entirely rather than snapshotting state
+            # that no run will ever restore.
+            logger.info(
+                "[moevement] step %d: frozen-skip warmup active — skipping "
+                "capture (warmup steps are not snapshotted)", curr_step,
+            )
             return
         # Deferred-allocation backstop (see _ensure_storage): the normal
         # paths allocated inside load()/notify_rmp_restored; a run that
@@ -473,8 +928,18 @@ class MoevementCheckpointManager:
             self._upstream_logger.finish_iteration(curr_step)
         slot = self._schedule[self._slot_idx]
         self._engine.capture_iteration(
-            curr_step, slot, self._operators_by_name, self.optimizers
+            curr_step,
+            slot,
+            self._operators_by_name,
+            self.optimizers,
+            # Frozen-skip replay anchor (plan §3.3): captured only when the
+            # feature is configured, so every pinned baseline's capture
+            # payload and metadata are byte-for-byte unchanged without it.
+            clip_total_norm=(
+                self._pending_clip_norm if self._frozen_skip else None
+            ),
         )
+        self._pending_clip_norm = None
         self._slot_idx += 1
         if self._slot_idx >= len(self._schedule):
             self._finish_window(curr_step)
@@ -490,6 +955,17 @@ class MoevementCheckpointManager:
             f"replay save at step {curr_step}, expected "
             f"{rp['S'] + 2}..{rp['last']}"
         )
+        # Per-replayed-iteration wall clock, for the §3.3 measurement: the
+        # EMA update in save() already measured this step.
+        logger.info(
+            "[moevement] REPLAY_STEP step=%d wall=%.4fs frozen_skip=%s "
+            "frozen_ops=%d frozen_numel=%d",
+            curr_step, getattr(self, "_last_step_wall", -1.0),
+            self._frozen_skip_live,
+            self._freezer.stats.frozen_ops if self._freezer is not None else 0,
+            self._freezer.stats.frozen_param_numel
+            if self._freezer is not None else 0,
+        )
         apply_iteration(
             rp["bundle"],
             curr_step,
@@ -503,11 +979,24 @@ class MoevementCheckpointManager:
             # capture with a fresh window whose START state is exactly now.
             restore_rng(rp["bundle"].rng[curr_step])
             self._verify_all_activated(rp["activated"])
+            if self._freezer is not None:
+                # Full trainability restored before the first normal step.
+                self._freezer.clear()
+            self._frozen_skip_live = False
             self._replay = None
             self._slot_idx = 0
             self._window_start_entry = self._capture_boundary_entry(curr_step)
             self._clear_replay_pending()
             if self._upstream_logger is not None:
+                # The whole point of receive-side logging: this rank fed its
+                # own boundary recvs instead of waiting on a neighbour.
+                logger.info(
+                    "[moevement] LOG_FED_REPLAY log_fed=%s fill_hits=%d "
+                    "fill_misses=%d",
+                    self._upstream_logger.replay_active,
+                    self._upstream_logger.fill_hits,
+                    self._upstream_logger.fill_misses,
+                )
                 # Drop the reloaded log store; normal logging resumes next
                 # step into a fresh ring (retention rebuilds over 2*w_sparse
                 # iterations, like the engine's fresh window).
@@ -661,6 +1150,10 @@ class MoevementCheckpointManager:
         if flat is None or flat.numel() == 0:
             return False
         if self._global_counts_at_last_order is None:
+            logger.info(
+                "[moevement] reorder trigger FIRED: first window boundary "
+                "since the ordering was last built (no baseline counts yet)"
+            )
             return True
         old = self._global_counts_at_last_order
         rel = (flat - old).abs() / old.clamp_min(1e-9)
@@ -668,7 +1161,21 @@ class MoevementCheckpointManager:
         changed_fraction = (
             (rel > cfg.moevement_reorder_threshold).float().mean().item()
         )
-        return changed_fraction >= cfg.moevement_reorder_fraction
+        fired = changed_fraction >= cfg.moevement_reorder_fraction
+        # Both outcomes are logged: a schedule that regenerates at EVERY
+        # boundary and one that never regenerates look identical from the
+        # outside otherwise (semantics unchanged — this is reporting only).
+        logger.info(
+            "[moevement] reorder trigger %s: %.1f%% of %d expert counters "
+            "moved by more than %.0f%% since the last ordering (fires at "
+            ">= %.0f%%)",
+            "FIRED" if fired else "SUPPRESSED",
+            100.0 * changed_fraction,
+            flat.numel(),
+            100.0 * cfg.moevement_reorder_threshold,
+            100.0 * cfg.moevement_reorder_fraction,
+        )
+        return fired
 
     def _boundary_should_regenerate(self) -> bool:
         """World-aligned regen decision (pinned P2 boundary alignment).
@@ -705,6 +1212,11 @@ class MoevementCheckpointManager:
             f"w_sparse diverged across ranks: local {self._scheduler.w_sparse}"
             f" vs world max {reduced_w}"
         )
+        if reduced_verdict != verdict:
+            logger.info(
+                "[moevement] reorder trigger raised to FIRED by the world "
+                "(this rank's local verdict was SUPPRESSED)"
+            )
         return bool(reduced_verdict)
 
     @torch.no_grad()
@@ -917,6 +1429,24 @@ class MoevementCheckpointManager:
         self._slot_idx = 0
         self._window_start_entry = self._capture_boundary_entry(start)
 
+        # The upstream-log ring is dumped as rank_{r}_moevement_logs.pt —
+        # which _sweep_stale_dumps' rank_{r}_moevement_* glob matches — so it
+        # MUST be read into RAM before the sweep below, exactly like the
+        # bundle. (Regression note: the sweep was moved ahead of the pool
+        # allocation in M7 for the tmpfs-peak fix, which silently started
+        # deleting the log dump before the reload; invisible until
+        # receive-side keying made the reload actually matter. Observed live
+        # as "upstream-log replay store: 0 keys".)
+        log_store: dict = {}
+        if self._upstream_logger is not None and start < last and not fetched:
+            from torchtitan.components.moevement.upstream_logger import (
+                load_persisted_logs,
+            )
+
+            log_store = load_persisted_logs(
+                self._checkpoint_config.moevement_mem_fs_folder, self._rank
+            )
+
         # M7 structural ordering: the consumed dump generation is fully in
         # process RAM by now (torch.load materializes into RAM — no
         # mmap/lazy references back to the files; a peer-fetched bundle
@@ -950,41 +1480,14 @@ class MoevementCheckpointManager:
                 "bundle": bundle,
                 "activated": activated,
             }
+            self._arm_frozen_skip(bundle, start, last)
             # Cross-process durability marker (see has_pending_replay): from
             # here until save(last) this rank's live params/optimizer state
             # are a sparse-replay INTERMEDIATE, not a dense training state,
             # so no RMP-sourced resume may adopt them.
             self._set_replay_pending(last)
-            if self._upstream_logger is not None and fetched:
-                # Upstream logs are NOT replicated (plan §3.7): a faulty
-                # rank proceeds without them — its replay recvs fall back to
-                # live p2p (whole-cluster replay makes that correct).
-                logger.info(
-                    "[moevement] fetched restore: skipping upstream-log "
-                    "reload (logs are not replicated); replay uses live p2p"
-                )
-            if self._upstream_logger is not None and not fetched:
-                # Log-fed replay (plan §3.5/§9-M4): reload this rank's own
-                # persisted upstream-log ring; during replay the tee stages
-                # override boundary recvs from it where the SENDING stage is
-                # local to this rank, falling back to live p2p elsewhere
-                # (correct under whole-cluster replay; cross-rank log
-                # exchange is M5+).
-                from torchtitan.components.moevement.upstream_logger import (
-                    load_persisted_logs,
-                )
-
-                store = load_persisted_logs(
-                    self._checkpoint_config.moevement_mem_fs_folder,
-                    self._rank,
-                )
-                self._upstream_logger.arm_replay(store)
-                logger.info(
-                    "[moevement] upstream-log replay store: %d keys over "
-                    "iterations %s",
-                    len(store),
-                    sorted({k[0] for k in store}) if store else [],
-                )
+            if self._upstream_logger is not None:
+                self._arm_log_fed_replay(start, last, fetched, log_store)
         else:  # w == 1: the whole window is applied here; no replay steps
             self._verify_all_activated(activated)
         logger.info(
@@ -993,6 +1496,84 @@ class MoevementCheckpointManager:
             bundle.key, start + 1, max(0, last - start), last,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Log-fed replay arming (plan §3.5; receive-side logging)
+    # ------------------------------------------------------------------
+
+    def _arm_log_fed_replay(
+        self, start: int, last: int, fetched: bool, store: dict
+    ) -> None:
+        """Settle the world's log-fed vector over this rank's own
+        RECEIVE-side upstream logs (already read into RAM by the caller,
+        before the dump sweep).
+
+        Receive-side logging makes a rank self-sufficient: the boundary
+        tensors it needs during replay are the ones IT received, so they are
+        in its own ring — no survivor and no cross-rank exchange required.
+        Two ranks can still disagree about whether they have them (a faulty
+        rank peer-fetched its window and its logs died with its mem_fs —
+        logs are deliberately NOT replicated, plan §3.7), and a skipped recv
+        must never leave an unmatched send, so the per-rank bit is
+        all-gathered and BOTH ends of every boundary read the same vector:
+        a transfer happens iff its receiver is not log-fed.
+
+        Collective safety: every rank reaches this point together — the
+        window vote is world-agreed, `start < last` is a function of the
+        world-uniform w_sparse, and the logger exists on all ranks or none
+        (PP + config gated).
+        """
+        if fetched:
+            # Faulty rank: its mem_fs (fatal) or its dump (ignored by design)
+            # holds nothing usable. It replays over live p2p.
+            logger.info(
+                "[moevement] fetched restore: no upstream-log reload (logs "
+                "are not replicated); this rank replays over live p2p"
+            )
+        # The trainer replays steps start+1 .. last (start itself is applied
+        # from the bundle, never re-executed).
+        required = range(start + 1, last + 1)
+        self_sufficient = self._upstream_logger.arm_replay(
+            store, required_iterations=required
+        )
+        flags = self._all_gather_flag(self_sufficient)
+        log_fed = [r for r, on in enumerate(flags) if on]
+        self._upstream_logger.set_log_fed_ranks(log_fed)
+        logger.info(
+            "[moevement] upstream-log replay store: %d keys over iterations "
+            "%s; needs %s -> self_sufficient=%s; world log-fed ranks %s "
+            "(%d/%d)",
+            len(store),
+            sorted({k[0] for k in store}) if store else [],
+            list(required),
+            self_sufficient,
+            log_fed,
+            len(log_fed),
+            len(flags),
+        )
+        if not self_sufficient and store:
+            logger.warning(
+                "[moevement] rank %d holds upstream logs but not for every "
+                "replayed iteration (missing %s) — falling back to live p2p "
+                "on this rank",
+                self._rank, self._upstream_logger.missing_iterations,
+            )
+
+    def _all_gather_flag(self, flag: bool) -> list[bool]:
+        """All-gather one boolean per GLOBAL rank (identity without a world)."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return [bool(flag)]
+        world = dist.get_world_size()
+        out = torch.zeros(
+            world, dtype=torch.int64, device=self._collective_device()
+        )
+        src = torch.tensor(
+            [1 if flag else 0],
+            dtype=torch.int64,
+            device=self._collective_device(),
+        )
+        dist.all_gather_into_tensor(out, src)
+        return [bool(v) for v in out.tolist()]
 
     # ------------------------------------------------------------------
     # Replay-pending marker (plan §3.9; 2026-07 gptoss_tp2fsdp4ep4 M8 bug)
@@ -1144,6 +1725,184 @@ class MoevementCheckpointManager:
         # own batch_generator (built after load()) resumes at S+2's batches.
         dataloader.load_state_dict(dataloader.state_dict())
 
+    # ------------------------------------------------------------------
+    # Paper §3.3: frozen operators do forward + input-gradient only
+    # ------------------------------------------------------------------
+
+    def _arm_frozen_skip(self, bundle, start: int, last: int) -> None:
+        """Decide whether the armed replay may skip frozen weight-gradients.
+
+        Gate: every replayed step (start+1 .. last) must carry a captured
+        pre-clip total gradient norm. Skipping the frozen wgrads shrinks the
+        gradient set ``training.max_norm`` is computed over, which would
+        change the clip coefficient — and therefore the ALREADY-ACTIVATED
+        operators' updates — so the coefficient is pinned to the original
+        run's norm instead. A window captured by an older build (or with the
+        feature off) has no anchors; the replay then falls back to the exact
+        full-backward + grad-masking path, loudly.
+        """
+        self._frozen_skip_live = False
+        if not self._frozen_skip or self._freezer is None:
+            return
+        needed = list(range(start + 1, last + 1))
+        # A total gradient norm of exactly 0 (or a non-finite one) never
+        # occurs in real training: it means the anchor never made it into
+        # the pool. Treat it as missing rather than pinning a coefficient of
+        # 1.0 and silently un-clipping the replayed steps — the exact
+        # failure a capture-stream lifetime bug produced once.
+        def _bad(step: int) -> bool:
+            anchor = bundle.clip_norms.get(step)
+            if anchor is None:
+                return True
+            value = anchor[0]
+            return not (value > 0.0) or value != value or value == float("inf")
+
+        missing = [step for step in needed if _bad(step)]
+        if missing:
+            logger.warning(
+                "[moevement] frozen-skip requested but window %s has no "
+                "usable clip-norm anchor for step(s) %s (captured without "
+                "checkpoint.moevement_frozen_skip, or the anchor was lost); "
+                "replaying with the exact full-backward + grad-masking path "
+                "instead",
+                bundle.key, missing[:4],
+            )
+            return
+        self._frozen_skip_live = True
+        self._freezer.arm(self.model_parts)
+        logger.info(
+            "[moevement] frozen-skip ARMED for replay steps %d..%d "
+            "(clip norms pinned from the captured window)",
+            start + 1, last,
+        )
+
+    def replay_clip_total_norm(self, step: int) -> torch.Tensor | None:
+        """train.py hook (duck-typed): the pre-clip total gradient norm this
+        step must use, or None to compute it normally.
+
+        Non-None only while a frozen-skip replay is live, where the live
+        gradient set is deliberately smaller than the original run's."""
+        if not self._frozen_skip_live or self._replay is None:
+            return None
+        anchor = self._replay["bundle"].clip_norms.get(step)
+        if anchor is None:
+            return None
+        value, dtype_name = anchor
+        dtype = getattr(torch, dtype_name, torch.float32)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        return torch.tensor(value, dtype=dtype, device=device)
+
+    def record_clip_total_norm(self, grad_norm) -> None:
+        """train.py hook (duck-typed): stash this step's pre-clip total
+        gradient norm so save() can capture it alongside the weight bytes.
+
+        Kept as the live device tensor — the D2H rides the capture stream
+        and is read by the committer after its event, so the trainer never
+        synchronizes."""
+        if not self._frozen_skip or self._replay is not None:
+            return
+        if isinstance(grad_norm, torch.Tensor):
+            # Normally already a plain tensor (the reducers full_tensor() it);
+            # _to_local_tensor keeps a DTensor-shaped corner case D2H-able.
+            self._pending_clip_norm = _to_local_tensor(grad_norm.detach())
+
+    def _resilient_opt_active(self) -> bool:
+        # train.py assigns the Trainer itself as states["train_state"], so
+        # this reaches Trainer._resilient_opt (see train.py:154).
+        return (
+            getattr(self.states.get("train_state"), "_resilient_opt", None)
+            is not None
+        )
+
+    def _fill_frozen_grads_for_resilient(self) -> None:
+        """Resilient-optimizer compatibility for the frozen skip.
+
+        ``ResilientOptimizer`` precomputes a chunk schedule over EVERY
+        parameter that has optimizer state and re-resolves ``param.grad`` by
+        reference inside each chunk (resilient_opt.py ``_step_chunk``), so a
+        ``None`` grad is fatal there — which is exactly why the old masking
+        path was skipped under RMP (plan §9-M6 claim (3)). The wgrad skip
+        removes the gradient at its source, so instead of masking we
+        materialise a ZERO gradient for the skipped parameters just before
+        the step. The FLOP saving (the wgrad matmuls and the FSDP2
+        reduce-scatter) is fully preserved — only the optimizer's own
+        elementwise work is paid — and the resulting update is the same
+        harmless, later-overwritten one the unmasked RMP path already
+        performed: every still-frozen operator is bf16-refreshed by
+        ``_replay_save`` on the same iteration and gets exact moments at its
+        activation."""
+        if self._freezer is None:
+            return
+        for param in self._freezer.frozen_params_without_grad():
+            param.grad = torch.zeros_like(param)
+
+    def _apply_warmup_freeze(self, curr_step: int) -> None:
+        """Throwaway-warmup only: cycle the frozen-skip graph variants during
+        the first ``moevement_frozen_skip_warmup`` steps so torch.compile /
+        inductor caches every variant a real replay will need, and a replay's
+        first step pays a cache lookup instead of a fresh compile.
+
+        Perturbs those steps' numerics by construction (frozen operators do
+        not update), so it is gated behind its own config knob and belongs
+        only in warmup / profiling jobs."""
+        if self._freezer is None or not self._freezer.enabled:
+            return
+        if curr_step > self._frozen_skip_warmup:
+            if self._warmup_freeze_active:
+                self._freezer.clear()
+                self._warmup_freeze_active = False
+                logger.info(
+                    "[moevement] frozen-skip compile warmup finished at step "
+                    "%d; full trainability restored", curr_step,
+                )
+            return
+        if not self._warmup_freeze_active:
+            self._freezer.arm(self.model_parts)
+            self._warmup_freeze_active = True
+        # ALTERNATE two activation patterns, because one does not reach both
+        # graph variants:
+        #   odd steps  — activate one expert operator per part. Safety rule 1
+        #                then does NOT fire, so `non_expert` and every `gate`
+        #                really do go requires_grad=False: this is what warms
+        #                the compiled dense submodules' frozen variant, which
+        #                is the one a real replay uses (a replay's experts are
+        #                activated first by the popularity ordering).
+        #   even steps — activate nothing. Rule 1 keeps each part's backbone
+        #                trainable, and every expert module is fully frozen:
+        #                this warms the detached grouped-mm variant.
+        # `moevement_frozen_skip_warmup >= 2` therefore covers both.
+        if curr_step % 2 == 1:
+            activated = {
+                op.name
+                for stage in {o.stage for o in self.operators}
+                for op in [
+                    next(
+                        (
+                            o
+                            for o in self.operators
+                            if o.stage == stage
+                            and o.kind is OperatorKind.EXPERT
+                        ),
+                        None,
+                    )
+                ]
+                if op is not None
+            }
+        else:
+            activated = set()
+        stats = self._freezer.apply(activated)
+        logger.info(
+            "[moevement] frozen-skip compile warmup step %d/%d "
+            "(pattern=%s): %s",
+            curr_step, self._frozen_skip_warmup,
+            "expert-active" if curr_step % 2 == 1 else "all-frozen",
+            stats.summary() if stats.applied else "deferred",
+        )
+
     def _mask_frozen_grads(self) -> None:
         """Replay mode: stop optimizer updates for not-yet-activated
         operators by dropping their grads to None (plan §3.6 frozen-op
@@ -1166,8 +1925,7 @@ class MoevementCheckpointManager:
         per-op-claims partial coverage safe: every still-frozen op's
         params are refreshed by _replay_save each replayed iteration, and
         its moments + Adam step are exactly restored at activation."""
-        train_state = self.states.get("train_state")
-        if getattr(train_state, "_resilient_opt", None) is not None:
+        if self._resilient_opt_active():
             return
         activated = self._replay["activated"]
         for op in self.operators:
@@ -1185,9 +1943,21 @@ class MoevementCheckpointManager:
             # No capture is in flight during replay; this slot instead masks
             # frozen grads (post-clip by call position). Popularity still
             # accumulates: the replayed counts bit-match the baseline's.
+            # Under frozen-skip most of these grads were never computed
+            # (paper §3.3); masking still covers what the skip could NOT —
+            # partially-frozen grouped expert tensors and the parts kept
+            # trainable by safety rule 1.
             self._mask_frozen_grads()
+            if self._frozen_skip_live and self._resilient_opt_active():
+                # ...and then the chunked step's per-parameter grad
+                # requirement is satisfied with zeros (see the method).
+                self._fill_frozen_grads_for_resilient()
             self._accumulate_popularity()
             return
+        if self._warmup_freeze_active and self._resilient_opt_active():
+            # Compile-warmup steps freeze operators outside a replay; the
+            # resilient optimizer still needs every parameter's grad.
+            self._fill_frozen_grads_for_resilient()
         # GPU-side wait on the last capture's D2H event: only optimizer.step
         # (the next writer of the captured tensors) orders after the drain —
         # no CPU sync (reference sparse_snapshot.py:373-434).
@@ -1200,6 +1970,8 @@ class MoevementCheckpointManager:
         return
 
     def close(self):
+        if self._freezer is not None:
+            self._freezer.clear()
         if self._replicator is not None:
             self._replicator.close()
             self._replicator = None

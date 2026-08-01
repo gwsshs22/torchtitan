@@ -678,10 +678,13 @@ class Checkpoint:
     """tmpfs folder for moevement's kill-survivable snapshot pools
     (counterpart of gemini_mem_fs_folder)."""
 
-    moevement_pcie_bandwidth_gbs: float = 25.0
-    """Assumed effective D2H bandwidth (GiB/s) for moevement's window sizing:
-    each iteration's snapshot bytes are budgeted against
-    iter_time * bandwidth * moevement_snapshot_overlap_target."""
+    moevement_pcie_bandwidth_gbs: float = 0.0
+    """Effective device->host bandwidth (GiB/s) for moevement's window sizing
+    — Algorithm 1's B_PCIe input: each iteration's snapshot bytes are budgeted
+    against iter_time * bandwidth * moevement_snapshot_overlap_target.
+    0 (the default) means AUTO: profile the device once at init, on the
+    snapshot capture stream, with a few 256 MiB pinned D2H transfers (median).
+    Any positive value overrides the measurement verbatim."""
 
     moevement_snapshot_overlap_target: float = 1.0
     """Fraction of one iteration's PCIe budget the per-iteration sparse
@@ -692,6 +695,22 @@ class Checkpoint:
     """Pin the sparse window length to this many iterations instead of
     deriving it from the PCIe budget. 0 (default) derives it. Also pins the
     schedule cadence world-wide regardless of per-rank iteration timing."""
+
+    moevement_profile_policy: bool = False
+    """Force Algorithm 1 to run live and (re)write the policy profile at
+    moevement_policy_profile_path, ignoring any artifact already there.
+
+    This is the moevement analogue of --leto.profile_init: a dedicated,
+    short profiling run (see awsexps/common/run_init.sh) produces
+    <dump_dir>/moevement_profile/policy.json, and every later run of that
+    workload reuses the recorded w_sparse instead of re-deriving it. Without
+    this flag a run reuses an existing matching profile and only falls back
+    to the live policy when there is none (or its provenance does not match).
+    Ignored under checkpoint.moevement_w_sparse_override, which always wins."""
+
+    moevement_policy_profile_path: str = ""
+    """Where the recorded policy profile lives. Empty (default) means
+    <job.dump_folder>/moevement_profile/policy.json."""
 
     moevement_reorder_threshold: float = 0.10
     """Relative shift in an expert's rolling popularity that counts it as
@@ -714,10 +733,46 @@ class Checkpoint:
     measured."""
 
     moevement_upstream_logging: bool = True
-    """Whether to log pipeline stage-boundary sends (forward outputs +
-    input-gradients, keyed by iteration/microbatch/virtual-stage/direction)
-    into a kill-survivable shm ring for log-fed replay. Effective only when
-    pipeline parallelism is enabled; at PP=1 the logger is not constructed."""
+    """Whether to log pipeline stage-boundary RECEIVES (forward activations
+    arriving from the previous stage + gradients arriving from the next,
+    keyed by iteration/microbatch/PRODUCING-virtual-stage/direction) into a
+    kill-survivable shm ring for log-fed replay. Receive-side (not the
+    paper's send-side) because leto kills every rank: logging what you
+    receive makes each rank self-sufficient after relaunch, with identical
+    storage and copies. Effective only when pipeline parallelism is enabled;
+    at PP=1 the logger is not constructed."""
+
+    moevement_frozen_skip: bool = False
+    """Paper §3.3: during sparse->dense REPLAY, run frozen operators
+    forward + input-gradient ONLY — skip their weight-gradient computation
+    and their optimizer update instead of computing the full backward and
+    dropping the grads afterwards (the default, numerically equivalent but
+    zero-FLOP-saving behaviour).
+
+    Mechanism: whole-tensor operators (non_expert, gate) get
+    ``requires_grad_(False)``; grouped expert tensors are per-SLICE, so a
+    layer's experts are skipped only when EVERY EP-local expert of that
+    layer is frozen (the weights are then handed to the compiled grouped-mm
+    detached, which drops the wgrad matmul from the AOTAutograd backward
+    graph). Partially-frozen expert tensors keep the full backward and fall
+    back to grad masking, as do model parts that would otherwise be left
+    with no trainable parameter at all.
+
+    Requires the replayed window to carry per-iteration clip-norm anchors
+    (captured only when this flag is on): the total grad norm feeding
+    ``training.max_norm`` is otherwise computed over a smaller grad set and
+    the surviving operators' updates would drift. A window captured without
+    the flag disables the skip on restore, loudly."""
+
+    moevement_frozen_skip_warmup: int = 0
+    """Warmup-only: exercise the frozen-skip path for this many steps at the
+    start of the run (steps 1..N) so torch.compile/inductor caches every
+    graph variant a real replay will need. Two activation patterns alternate
+    (odd steps freeze the dense backbone + routers, even steps freeze every
+    expert module), so **use N >= 2** to cover both. Numerics for those steps
+    are intentionally perturbed (frozen operators do not update), so this is
+    for THROWAWAY warmup/profiling jobs only — never for a measured run. 0
+    (default) disables it."""
 
     moevement_replication: bool = True
     """Whether to replicate finalized windows to the pair rank

@@ -840,6 +840,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self._expert_dist_tracker is not None:
             self._expert_dist_tracker.end_step(self.step)
 
+        # MoEvement §3.3 frozen-skip replay (duck-typed; gemini/dcp define
+        # neither hook): a replayed step whose frozen operators skipped their
+        # weight-gradients has a SMALLER gradient set than the original run,
+        # so the total norm feeding training.max_norm is pinned to the value
+        # captured at that iteration — the clip coefficient and the logged
+        # grad_norm then stay bit-identical. None on every other step.
+        _replay_clip_norm = getattr(
+            self.checkpointer, "replay_clip_total_norm", None
+        )
+        pinned_total_norm = (
+            _replay_clip_norm(self.step) if _replay_clip_norm is not None else None
+        )
+
         if self._resilient_opt is not None:
             # Defer the in-place grad scaling AND persist the pre-reduction
             # local norm so a mid-step fault is fully recoverable:
@@ -870,6 +883,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 norm_type=2.0,
                 pp_mesh=pp_mesh,
                 ep_enabled=parallel_dims.ep_enabled,
+                pinned_total_norm=pinned_total_norm,
             )
             self._resilient_opt.set_clip_coef(clip_coef)
         else:
@@ -879,7 +893,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 foreach=True,
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
+                pinned_total_norm=pinned_total_norm,
             )
+        _record_clip_norm = getattr(
+            self.checkpointer, "record_clip_total_norm", None
+        )
+        if _record_clip_norm is not None:
+            _record_clip_norm(grad_norm)
         self.checkpointer.maybe_wait_for_staging()
 
         fault_triggered = self.maybe_inject_fault()

@@ -371,6 +371,9 @@ def init_gemini_checkpoint_partial(ctx: InitContext) -> None:
             states={"train_state": ctx},
             checkpoint_config=ctx.job_config.checkpoint,
             base_folder=ctx.job_config.job.dump_folder,
+            # Provenance for the persisted Algorithm-1 profile
+            # (<dump_dir>/moevement_profile/policy.json): model name/flavor.
+            job_config=ctx.job_config,
         )
 
 

@@ -141,6 +141,14 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.use_grouped_mm = use_grouped_mm
+        # MoEvement §3.3 frozen-skip: when True the expert weights are handed
+        # to the (compiled) grouped-mm DETACHED, so the backward computes the
+        # input-gradient only and the weight-gradient matmul is dropped from
+        # the graph. Toggled per replayed iteration by
+        # components/moevement/freeze.py; a plain Python attribute, so the
+        # branch below lives outside every compiled region (the compiled
+        # callee sees one extra requires_grad variant, and only one).
+        self._moevement_freeze_wgrad = False
 
     def forward(
         self,
@@ -159,6 +167,9 @@ class GroupedExperts(nn.Module):
             w1 = self.w1
             w2 = self.w2
             w3 = self.w3
+
+        if getattr(self, "_moevement_freeze_wgrad", False):
+            w1, w2, w3 = w1.detach(), w2.detach(), w3.detach()
 
         if self.use_grouped_mm:
             # NOTE: If EP is not used, we need to pad the indices

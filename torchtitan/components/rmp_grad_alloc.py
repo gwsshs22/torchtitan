@@ -21,12 +21,31 @@ from torchtitan.tools.logging import logger
 class _PerGroupAllocState:
     """Per-param-group allocator state."""
 
-    __slots__ = ("is_input", "cached_output", "key")
+    __slots__ = ("is_input", "cached_output", "key", "grad_fsdp_params")
 
-    def __init__(self, cached_output: torch.Tensor | None = None, key: str = ""):
+    def __init__(
+        self,
+        cached_output: torch.Tensor | None = None,
+        key: str = "",
+        grad_fsdp_params: tuple = (),
+    ):
         self.is_input: bool = True  # toggles between input/output
         self.cached_output: torch.Tensor | None = cached_output
         self.key = key
+        # The FSDP params that carried a gradient when this group was
+        # registered. The persistent RMP buffer is sized and laid out for
+        # exactly this set -- see is_dense().
+        self.grad_fsdp_params = grad_fsdp_params
+
+    def is_dense(self) -> bool:
+        """True when every baseline-trainable param still carries a gradient.
+
+        FSDP2 sizes both reduce-scatter buffers from the *live* gradient set on
+        every backward, so anything that clears ``requires_grad`` mid-run makes
+        the requested size shrink. This is the exact predicate for "the request
+        matches what the persistent buffer was built for".
+        """
+        return all(fp.sharded_param.requires_grad for fp in self.grad_fsdp_params)
 
 
 class RmpGradientAllocator:
@@ -39,6 +58,14 @@ class RmpGradientAllocator:
 
     Tensors are keyed by stable group index on the RMP server, so restart
     correctly matches tensors to groups regardless of allocation order.
+
+    Invariant: the persistent RS output buffer is always sized and packed for
+    the group's *full* trainable set. FSDP2 derives both RS buffer sizes from
+    the live-gradient set on every backward, so a step that freezes part of a
+    group asks for a smaller buffer; such steps are served from a transient
+    allocation instead. Without this, a buffer minted during a partially-frozen
+    replay step is later handed to a full-size reduce-scatter, which fails with
+    "input tensor must be the same size as output size times world size".
     """
 
     def __init__(self, rmp_client: RmpClient, device: torch.device, allocated: bool):
@@ -156,7 +183,18 @@ class RmpGradientAllocator:
                 if self._prefetched is not None:
                     cached = self._prefetched.get(key)
 
-                pg_state = _PerGroupAllocState(cached_output=cached, key=key)
+                # Snapshot the trainable set now, while nothing is frozen:
+                # register() runs during init, before any replay arms a freeze.
+                grad_fsdp_params = tuple(
+                    p
+                    for p in param_group.fsdp_params
+                    if p.sharded_param.requires_grad
+                )
+                pg_state = _PerGroupAllocState(
+                    cached_output=cached,
+                    key=key,
+                    grad_fsdp_params=grad_fsdp_params,
+                )
                 allocate_fn = self._make_allocate_fn(pg_state)
                 collective_manager.set_reduce_scatter_allocate(module, allocate_fn)
                 registered += 1
@@ -189,8 +227,32 @@ class RmpGradientAllocator:
                 # must not register anything on the RMP server during warmup.
                 if detect_fake_mode() is not None:
                     return torch.empty(*size, dtype=dtype, device=device)
-                if pg_state.cached_output is not None:
-                    return pg_state.cached_output
+
+                # MoEvement's frozen-skip (--checkpoint.moevement_frozen_skip)
+                # clears requires_grad on frozen operators for the duration of a
+                # replay, so FSDP reduce-scatters only the surviving subset and
+                # asks for a SMALLER output buffer. The persistent RMP tensor is
+                # sized for the full set, and restore_param_gradients() slices it
+                # at cumulative per-param offsets, so a partially-frozen step
+                # must neither mint it (wrong size, wrong packing) nor be served
+                # from it. Hand back a transient buffer for those steps.
+                if not pg_state.is_dense():
+                    return torch.empty(*size, dtype=dtype, device=device)
+
+                want = 1
+                for s in size:
+                    want *= int(s)
+                cached = pg_state.cached_output
+                if cached is not None:
+                    if cached.numel() != want or cached.dtype != dtype:
+                        raise RuntimeError(
+                            f"[RmpGradAlloc] '{pg_state.key}' persistent RS output "
+                            f"buffer is numel={cached.numel()} dtype={cached.dtype} "
+                            f"but FSDP requested numel={want} dtype={dtype}. It was "
+                            f"minted for a different live-gradient set; serving it "
+                            f"would corrupt the reduce-scatter."
+                        )
+                    return cached
 
                 shape = tuple(int(s) for s in size)
                 device_idx = device.index if hasattr(device, 'index') else 0

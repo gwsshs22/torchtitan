@@ -197,6 +197,8 @@ class GptOssGroupedExperts(nn.Module):
             torch.empty((num_experts, dim, hidden_dim))
         )  # (num_experts, out_dim, in_dim)
         self.mlp2_bias = nn.Parameter(torch.empty((num_experts, dim)))
+        # See GroupedExperts._moevement_freeze_wgrad (models/moe/moe.py).
+        self._moevement_freeze_wgrad = False
 
     def forward(
         self,
@@ -218,6 +220,12 @@ class GptOssGroupedExperts(nn.Module):
             mlp1_bias = self.mlp1_bias
             mlp2_weight = self.mlp2_weight
             mlp2_bias = self.mlp2_bias
+
+        if getattr(self, "_moevement_freeze_wgrad", False):
+            mlp1_weight = mlp1_weight.detach()
+            mlp1_bias = mlp1_bias.detach()
+            mlp2_weight = mlp2_weight.detach()
+            mlp2_bias = mlp2_bias.detach()
 
         # Determine tp_degree from device mesh if available
         tp_degree = 1

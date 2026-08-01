@@ -55,6 +55,11 @@ _ALIGNMENT = 64
 # max_window_bytes does not price.
 _PER_ITER_ALLOWANCE = 16 * 1024
 _HEADROOM = 1.05
+# Slots in the pinned clip-norm ring (plan §3.3). A slot is reused only
+# after the committer has consumed it; the committer is at most one window
+# behind (the boundary barrier), and a window is at most `total_ops`
+# iterations, so this bounds every configuration we run with ~4x margin.
+_CLIP_NORM_RING = 1024
 # Bound on the once-per-window boundary barrier; normally ~0 (the finalized
 # window's last D2H event fired during the previous iteration).
 _FINAL_COMMIT_TIMEOUT_S = 300.0
@@ -386,7 +391,7 @@ class CudaTransferBackend:
 
     def record_event_on_current_stream(self):
         """Event on the CURRENT stream (upstream-logger tee copies are
-        compute-stream-ordered; see upstream_logger.log_send)."""
+        compute-stream-ordered; see upstream_logger.log_recv)."""
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.device))
         return event
@@ -406,6 +411,8 @@ class CpuTransferBackend:
     """Synchronous seam for CPU-only tests: same call surface as
     CudaTransferBackend, immediate copies, always-fired events, unpinned
     pools."""
+
+    device = torch.device("cpu")
 
     def alloc_pool(self, path: str, nbytes: int) -> torch.UntypedStorage:
         if os.path.lexists(path):
@@ -442,6 +449,90 @@ class CpuTransferBackend:
         return {"torch_cpu": torch.get_rng_state()}
 
 
+# ---------------------------------------------------------------------------
+# B_PCIe profiling (Algorithm 1's bandwidth input)
+# ---------------------------------------------------------------------------
+#
+# The paper PROFILES the device->host bandwidth that its window-sizing
+# budget is denominated in; the reference left it a config constant
+# (MoEvementConfig.pcie_bandwidth_bytes_per_sec, whose own docstring says
+# "re-tune ... if measured"). Measuring it costs ~130 ms once per process and
+# is strictly better than a guess: it folds in the real link width and the
+# host's pinned-page behavior.
+#
+# CAVEAT, measured on this cluster (docs/moevement_port_plan.md §9-M9):
+# quiescent, all 8 GPUs report 24.2-24.3 GiB/s (48.4 GiB/s aggregate per
+# host — the two links are independent), but run INSIDE lazy_init the same
+# probe returns 14.7-24.1 GiB/s depending on what other init work is in
+# flight. The reading is therefore a snapshot of init-time conditions, not a
+# constant. That is safe by direction: a low reading proposes a LARGER
+# w_sparse, and the manager pins the world all_reduce(MAX) of the proposals,
+# so the most pessimistic rank sets the cadence.
+
+_D2H_PROBE_NBYTES = 256 * 1024 * 1024
+_D2H_PROBE_REPS = 5
+# Per-process cache: the probe is a property of the box, not of the caller.
+_measured_d2h_gbs: float | None = None
+
+
+def measure_d2h_bandwidth_gbs(
+    backend=None,
+    nbytes: int = _D2H_PROBE_NBYTES,
+    reps: int = _D2H_PROBE_REPS,
+    use_cache: bool = True,
+) -> float:
+    """Profile effective device->host bandwidth in GiB/s (Algorithm 1's
+    B_PCIe input).
+
+    Runs the ENGINE's own transfer path rather than a synthetic best case:
+    the side ("capture") stream ordered after compute by capture_context(),
+    a pinned host destination of exactly the kind alloc_host() hands out,
+    and one flat async D2H per rep — so the number reflects what the
+    snapshot engine can actually sustain. One warm rep is discarded (first
+    touch of the pinned buffer, stream/context setup), then ``reps`` timed
+    reps; the MEDIAN is returned so a single scheduling hiccup cannot skew
+    the budget. Both probe buffers are freed before returning.
+
+    Cached per process (``use_cache``) — every rank measures its own device
+    once, at init, off the training critical path.
+    """
+    global _measured_d2h_gbs
+    if use_cache and _measured_d2h_gbs is not None:
+        return _measured_d2h_gbs
+    if backend is None:
+        backend = (
+            CudaTransferBackend()
+            if torch.cuda.is_available()
+            else CpuTransferBackend()
+        )
+    src = torch.empty(nbytes, dtype=torch.uint8, device=backend.device)
+    dst = backend.alloc_host(nbytes, torch.uint8)
+    samples: list[float] = []
+    try:
+        for rep in range(reps + 1):
+            t0 = time.perf_counter()
+            with backend.capture_context():
+                dst.copy_(src, non_blocking=True)
+                event = backend.record_event()
+            event.synchronize()
+            elapsed = time.perf_counter() - t0
+            if rep:  # rep 0 is the warm-up
+                samples.append(elapsed)
+    finally:
+        # Free the probe buffers before training allocates anything: the
+        # device staging goes back to the caching allocator and the pinned
+        # host page-locked range back to the driver.
+        del src, dst
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+    samples.sort()
+    median = max(samples[len(samples) // 2], 1e-9)
+    gbs = nbytes / median / (1024**3)
+    if use_cache:
+        _measured_d2h_gbs = gbs
+    return gbs
+
+
 @dataclass
 class _IterRecord:
     window_key: str
@@ -451,6 +542,14 @@ class _IterRecord:
     header: dict[str, Any]
     rng: dict[str, torch.Tensor]
     staging: list = field(default_factory=list)
+    # Slot in the engine's persistent pinned clip-norm ring holding this
+    # iteration's pre-clip total gradient norm (frozen-skip replay anchor,
+    # plan §3.3), plus the source dtype so the replay rebuilds a
+    # bit-identical clip coefficient. Read by the committer AFTER
+    # event.synchronize(), so the trainer never syncs. None when the
+    # feature is off.
+    clip_norm_slot: int | None = None
+    clip_norm_dtype: str | None = None
 
 
 @dataclass
@@ -520,6 +619,13 @@ class MoevementSnapshotEngine:
         # bundle-in-RAM, never dumps + pools.
         self._mem_fs_folder = mem_fs_folder
         self._pools: list[torch.UntypedStorage] = []
+        # Persistent pinned ring for the per-iteration clip-norm anchors
+        # (frozen-skip, plan §3.3): allocated ONCE behind ensure_storage's
+        # full-sync fence, never per step (the M4 caveat forbids unfenced
+        # mid-training host pinning, and a per-step pinned alloc would be
+        # pure overhead). float64 so any source dtype round-trips exactly.
+        self._clip_norm_ring: torch.Tensor | None = None
+        self._clip_norm_cursor = 0
 
         self._curr_pool = 0
         # Committed window key whose bytes a pool still holds (None while the
@@ -555,8 +661,13 @@ class MoevementSnapshotEngine:
         # the per-iter allowance is priced at the worst-case window length
         # (w_sparse <= total_ops since num_active >= 1, or the override).
         base = scheduler.max_window_bytes()
-        if scheduler.w_sparse_override > 0:
-            max_iters = scheduler.w_sparse_override
+        # The pinned cadence is either the config override or the manager's
+        # world-aligned Algorithm-1 decision (pinned BEFORE this engine is
+        # constructed); 0 only while the cadence is genuinely free, where the
+        # worst case is w_sparse == total_ops.
+        pinned = scheduler.pinned_w_sparse()
+        if pinned > 0:
+            max_iters = pinned
         else:
             max_iters = max(1, len(scheduler.ops))
         nbytes = int((base + max_iters * _PER_ITER_ALLOWANCE) * _HEADROOM)
@@ -579,6 +690,11 @@ class MoevementSnapshotEngine:
         if self._pools:
             return
         self._backend.full_sync()
+        if self._clip_norm_ring is None:
+            self._clip_norm_ring = self._backend.alloc_host(
+                _CLIP_NORM_RING, torch.float64
+            )
+            self._clip_norm_ring.zero_()
         for idx in range(2):
             # gemini's register->unlink pattern (in_mem_state.py): PID in the
             # name so active and standby groups on one host never collide;
@@ -611,14 +727,24 @@ class MoevementSnapshotEngine:
         slot: CheckpointSchedule,
         operators_by_name: dict[str, Operator],
         optimizers,
+        clip_total_norm: torch.Tensor | None = None,
     ):
-        """Capture one iteration's scheduled subset; returns the D2H event."""
+        """Capture one iteration's scheduled subset; returns the D2H event.
+
+        ``clip_total_norm`` (when frozen-skip capture is on) is the
+        iteration's pre-clip total gradient norm; it rides the same capture
+        stream + event as the weight bytes, so reading it costs the trainer
+        no synchronization — the committer picks it up from pinned host
+        memory once the event has fired.
+        """
         self._raise_committer_error()
         self.ensure_storage()
         if self._window_key is None:
             self._begin_window(step)
         header: dict[str, Any] = {}
         staging: list = []
+        clip_norm_slot: int | None = None
+        clip_norm_dtype: str | None = None
         with self._backend.capture_context():
             for name in slot.active:
                 entries = self._active_entries(operators_by_name[name], optimizers)
@@ -626,6 +752,24 @@ class MoevementSnapshotEngine:
             for name in slot.frozen:
                 entries = self._frozen_entries(operators_by_name[name])
                 self._write_runs(name, False, entries, header, staging)
+            if clip_total_norm is not None:
+                source = clip_total_norm.detach().reshape(1)
+                clip_norm_slot = self._clip_norm_cursor % _CLIP_NORM_RING
+                self._clip_norm_cursor += 1
+                clip_norm_dtype = str(source.dtype).removeprefix("torch.")
+                self._clip_norm_ring[
+                    clip_norm_slot : clip_norm_slot + 1
+                ].copy_(source, non_blocking=True)
+                # The async D2H reads `source` on the CAPTURE stream while the
+                # allocator only tracks the compute stream that produced it —
+                # dropping the last Python reference here would let a later
+                # compute-stream allocation reuse the block before the copy
+                # runs (observed: a replayed step's pinned norm read back as
+                # 0.0, so the clip coefficient silently became 1.0). Hold it
+                # in `staging`, which the committer clears only after
+                # event.synchronize() — the same contract the GPU staging
+                # flats use.
+                staging.append(source)
         event = self._backend.record_event()
         rng = self._backend.capture_rng()
         self._pending_event = event
@@ -638,6 +782,8 @@ class MoevementSnapshotEngine:
                 header=header,
                 rng=rng,
                 staging=staging,
+                clip_norm_slot=clip_norm_slot,
+                clip_norm_dtype=clip_norm_dtype,
             )
         )
         return event
@@ -990,13 +1136,21 @@ class MoevementSnapshotEngine:
                             "iters": [],
                         },
                     )
-                    meta["iters"].append(
-                        {
-                            "step": record.step,
-                            "header": record.header,
-                            "rng": record.rng,
-                        }
-                    )
+                    iter_meta = {
+                        "step": record.step,
+                        "header": record.header,
+                        "rng": record.rng,
+                    }
+                    if record.clip_norm_slot is not None:
+                        # Event-confirmed above, so the pinned copy has
+                        # landed; float() of a float32 is exact in float64,
+                        # and the dtype rides along so the replay rebuilds
+                        # a bit-identical clip coefficient.
+                        iter_meta["clip_norm"] = float(
+                            self._clip_norm_ring[record.clip_norm_slot]
+                        )
+                        iter_meta["clip_norm_dtype"] = record.clip_norm_dtype
+                    meta["iters"].append(iter_meta)
                     with self._container_lock:
                         self._container.commit(record.window_key, meta)
                     if self._replicator is not None:

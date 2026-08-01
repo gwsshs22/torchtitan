@@ -64,6 +64,11 @@ class WindowBundle:
     # Window-START state: {"dataloader": ..., "train_state": {...},
     # "lr_scheduler": ...} — post-S, i.e. before the window's first step.
     ring: dict[str, Any]
+    # step -> (pre-clip total gradient norm, dtype name). Present only for
+    # windows captured with checkpoint.moevement_frozen_skip on; the §3.3
+    # frozen-skip replay pins the clip coefficient to these anchors and is
+    # disabled (loudly) when they are missing.
+    clip_norms: dict[int, tuple[float, str]] = field(default_factory=dict)
     schedule: Any = None
     # Keeps the dumped pool bytes (the storage every view aliases) alive.
     pool_bytes: torch.Tensor = field(default=None, repr=False)
@@ -125,6 +130,7 @@ def _build_bundle(key: str, meta: dict[str, Any], pool_bytes) -> WindowBundle:
     headers: dict[int, dict[str, Any]] = {}
     tensors: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
     rng: dict[int, dict[str, torch.Tensor]] = {}
+    clip_norms: dict[int, tuple[float, str]] = {}
     for entry in iters:
         step = entry["step"]
         header = entry.get("header")
@@ -146,6 +152,11 @@ def _build_bundle(key: str, meta: dict[str, Any], pool_bytes) -> WindowBundle:
         headers[step] = header
         tensors[step] = step_tensors
         rng[step] = step_rng
+        if entry.get("clip_norm") is not None:
+            clip_norms[step] = (
+                float(entry["clip_norm"]),
+                entry.get("clip_norm_dtype", "float32"),
+            )
     return WindowBundle(
         key=key,
         window_start=window_start,
@@ -154,6 +165,7 @@ def _build_bundle(key: str, meta: dict[str, Any], pool_bytes) -> WindowBundle:
         tensors=tensors,
         rng=rng,
         ring=ring,
+        clip_norms=clip_norms,
         schedule=meta.get("schedule"),
         pool_bytes=pool_bytes,
         raw_meta=meta,
